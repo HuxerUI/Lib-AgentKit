@@ -1,0 +1,12 @@
+{
+  "sections": [
+    {
+      "title": "Verification evidence",
+      "purpose": "State the tests that ran and what the reported results demonstrate."
+    },
+    {
+      "title": "Release decision",
+      "purpose": "State the proposed release decision and any remaining checks or caveats."
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+#pragma once
+
+#include <cstdint>
+#include <string_view>
+
+namespace agentkit_preview::release_skill_data {
+
+inline constexpr std::uint64_t revision = 0x@revision@ULL;
+inline constexpr std::string_view name = "@name@";
+inline constexpr std::string_view description = R"release_skill(@description@)release_skill";
+inline constexpr std::string_view instructions = R"release_skill(@instructions@)release_skill";
+inline constexpr std::string_view outline = R"release_skill(@template@)release_skill";
+
+} // namespace agentkit_preview::release_skill_data

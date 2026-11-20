@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=AgentKit Preview
+Exec=example_agent_kit
+Icon=example_agent_kit
+Categories=Utility;
+Terminal=false

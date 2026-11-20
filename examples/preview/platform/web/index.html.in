@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <link rel="icon" type="image/svg+xml" href="./@HUXERUI_WEB_FAVICON_FILE@">
+  <link rel="apple-touch-icon" href="./@HUXERUI_WEB_APPLE_TOUCH_ICON_FILE@">
+  <title>AgentKit Preview</title>
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+    }
+
+    #huxerui-root {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div id="huxerui-root"></div>
+  <script type="module">
+    import createHuxerUIApp from "./@HUXERUI_WEB_MODULE_FILE@";
+
+    function resolveModelEndpoint(profile) {
+      if (!profile || typeof profile.base_url !== "string" || !profile.base_url.trim()) return;
+      try {
+        const url = new URL(profile.base_url, import.meta.url);
+        if ((url.protocol === "https:" || url.protocol === "http:") &&
+            !url.username && !url.password && !url.href.includes("?") && !url.href.includes("#")) {
+          profile.base_url = url.href;
+          return;
+        }
+      } catch {
+        // The host displays a configuration error for an invalid base URL.
+      }
+      profile.base_url = null;
+    }
+
+    async function readModelConfiguration() {
+      const deadline = new AbortController();
+      const timer = setTimeout(() => deadline.abort(), 5000);
+      try {
+        const response = await fetch(new URL("./agentkit-models.json", import.meta.url), {
+          cache: "no-store",
+          mode: "same-origin",
+          redirect: "error",
+          signal: deadline.signal,
+        });
+        if (response.status === 404) return "{}";
+        if (!response.ok) return JSON.stringify({ error: "Could not load agentkit-models.json." });
+        const settings = await response.json();
+        if (Array.isArray(settings?.profiles)) settings.profiles.forEach(resolveModelEndpoint);
+        resolveModelEndpoint(settings?.reviewer);
+        return JSON.stringify(settings);
+      } catch {
+        return JSON.stringify({ error: "Could not read agentkit-models.json." });
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    const module = await createHuxerUIApp({
+      huxeruiStorageKey: "@HUXERUI_WEB_STORAGE_KEY@",
+      agentkitModelConfiguration: await readModelConfiguration(),
+    });
+    await document.fonts.ready;
+    const session = module.mountHuxerUI("#huxerui-root");
+    if (!session) {
+      throw new Error("HuxerUI Web session could not be mounted");
+    }
+  </script>
+</body>
+</html>
