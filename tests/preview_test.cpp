@@ -305,14 +305,20 @@ void SelectHistoryText(UiTest& preview, const UiNodeQuery& message, TextRange ra
 void CheckCTestDisclosure(UiTest& preview, std::string_view message) {
   auto output = preview.Find(UiSelector::Key("ctest-output"));
   if (output.Exists()) throw std::runtime_error("CTest output expanded before it was requested");
-  TapFormButton(preview, "Show test output");
+  const auto label = ShowsText(preview, "Run workspace tests · Completed") ?
+      "Run workspace tests · Completed" : "Run workspace tests · Failed";
+  const auto step = UiSelector::Text(label);
+  const auto toggle = [&] {
+    TapControl(preview, step, "CTest activity was not visible", "agent-chat-history", -96.0F);
+  };
+  toggle();
   Wait(preview, [&] {
     return output.Exists() && std::ranges::any_of(output.Find(UiSelector::Type<Text>()).All(), [&](const auto& entry) {
       return entry.text && entry.text->find(message) != std::string::npos && entry.text->find('\x1b') == std::string::npos &&
           entry.text->find("[HANDLER_OUTPUT]") == std::string::npos && entry.text->find("[ERROR_MESSAGE]") == std::string::npos;
     });
   }, "CTest output did not display the readable diagnostic");
-  TapFormButton(preview, "Hide test output");
+  toggle();
   Wait(preview, [&] { return !output.Exists(); }, "CTest output did not collapse");
 }
 
@@ -1046,8 +1052,8 @@ const kit::JsonValue::Object& LiveForm(const kit::InteractionSnapshot& item) {
   return std::get<kit::JsonValue::Object>(std::get<kit::FormRequest>(item.body).presentation.value);
 }
 
-Task<void> LiveRunCompleted(const std::shared_ptr<kit::Conversation>& session) {
-  const auto end = std::chrono::steady_clock::now() + 30s;
+Task<void> LiveRunCompleted(const std::shared_ptr<kit::Conversation>& session, std::chrono::seconds timeout = 30s) {
+  const auto end = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < end) {
     if (auto snapshot = session->Snapshot(); snapshot && !snapshot->summary.active_run && !snapshot->runs.empty()) {
       const auto& run = snapshot->runs.back();
@@ -6535,14 +6541,17 @@ void VerifyReleaseCompletionRevision(const File& root, bool complete_automatical
 constexpr auto code_activity_prompt =
     "Set mode=enabled in config.txt and replace Disabled with Enabled in settings.html only.";
 constexpr auto code_activity_conclusion = "Workspace changes applied and tested";
+constexpr auto timeline_layout_prompt = "Inspect the workspace for the transcript layout check.";
 
 class WorkspaceToolStream final : public kit::ModelTurnStream {
 public:
-  explicit WorkspaceToolStream(std::vector<kit::ModelEvent> events) : events_(std::move(events)) {}
+  explicit WorkspaceToolStream(std::vector<kit::ModelEvent> events, std::shared_ptr<std::atomic<int>> released = {})
+      : events_(std::move(events)), released_(std::move(released)) {}
 
   kit::Async<std::optional<kit::ModelEvent>> ReadAsync() override {
     using Result = kit::AgentResult<std::optional<kit::ModelEvent>>;
     if (index_ == events_.size()) co_return Result::Success(std::nullopt);
+    while (released_ && static_cast<std::size_t>(released_->load()) < index_) co_await Delay(2ms);
     co_return Result::Success(std::move(events_[index_++]));
   }
 
@@ -6552,11 +6561,14 @@ public:
 
 private:
   std::vector<kit::ModelEvent> events_;
+  std::shared_ptr<std::atomic<int>> released_;
   std::size_t index_ = 0;
 };
 
 class WorkspaceToolModel final : public kit::ModelProvider {
 public:
+  explicit WorkspaceToolModel(std::shared_ptr<std::atomic<int>> released = {}) : released_(std::move(released)) {}
+
   kit::ModelCapabilities Capabilities() const override {
     return {.text_stream = true, .tool_calls = true, .structured_output = true};
   }
@@ -6567,6 +6579,7 @@ public:
     using agentkit_preview::DecodeJson;
     using agentkit_preview::EncodeJson;
     std::vector<kit::ModelEvent> events;
+    std::shared_ptr<std::atomic<int>> gate;
     auto finish = kit::ModelFinishReason::Completed;
     if (request.output_schema) {
       events.emplace_back(kit::ModelStructuredOutput{DecodeJson({{"route", "answer"}})});
@@ -6597,19 +6610,37 @@ public:
           co_return Result::Failure({.code = kit::ErrorCode::InvalidState, .message = "Unexpected workspace tool result"});
         ++index;
       }
-      if (index < names.size()) {
+      const bool layout = released_ && std::ranges::any_of(request.items, [](const auto& item) {
+        const auto* message = std::get_if<kit::ModelContent>(&item);
+        const auto* text = message ? std::get_if<std::string>(&message->body) : nullptr;
+        return text && *text == timeline_layout_prompt;
+      });
+      if (index < (layout ? 3 : names.size())) {
         const auto call = "workspace-" + std::to_string(index);
         events.emplace_back(kit::ModelToolStarted{call, names[index]});
         events.emplace_back(kit::ModelToolArguments{call, arguments[index].dump()});
         events.emplace_back(kit::ModelToolFinished{call});
         finish = kit::ModelFinishReason::ToolCalls;
+      } else if (layout) {
+        events.emplace_back(kit::ModelTextDelta{"## Workspace overview\n\nThe workspace contains a mode setting."});
+        for (int chunk = 1; chunk <= 2; ++chunk) {
+          std::string body;
+          for (int paragraph = 0; paragraph < 12; ++paragraph)
+            body += "\n\nThe workspace setting is checked before entering the application.";
+          body += "\n\nStream checkpoint " + std::to_string(chunk) + ".";
+          events.emplace_back(kit::ModelTextDelta{std::move(body)});
+        }
+        gate = released_;
       } else {
         events.emplace_back(kit::ModelTextDelta{"Workspace changes verified."});
       }
     }
     events.emplace_back(kit::ModelFinished{finish, {}});
-    co_return Result::Success(std::make_unique<WorkspaceToolStream>(std::move(events)));
+    co_return Result::Success(std::make_unique<WorkspaceToolStream>(std::move(events), std::move(gate)));
   }
+
+private:
+  std::shared_ptr<std::atomic<int>> released_;
 };
 
 void VerifyWorkspaceTools(const File& root) {
@@ -6618,8 +6649,9 @@ void VerifyWorkspaceTools(const File& root) {
   if (!workspace.Child("src").CreateDirectories() ||
       !config.WriteString("mode=disabled\n"))
     throw std::runtime_error("Could not initialize the workspace tool fixture");
+  const auto released = std::make_shared<std::atomic<int>>(0);
   kit::ModelRegistration model{{{"workspace-tools-fixture"}, 1}, {"fixture", "workspace-tools", "script", {}},
-      std::make_shared<WorkspaceToolModel>()};
+      std::make_shared<WorkspaceToolModel>(released)};
   const Application application{App, {.application_hooks = {
       MakeRunSettingsTestInstaller(root.Child("sessions.sqlite3"), workspace, {std::move(model)},
           [](auto started, auto, auto) -> Task<void> { LiveTake(std::move(started)); co_return; })}}};
@@ -6642,6 +6674,55 @@ void VerifyWorkspaceTools(const File& root) {
     ChooseDraftAssistant(ui, assistant);
     exercise("Inspect the workspace and update the mode in config.txt.");
   }
+
+  if (!config.WriteString("mode=disabled\n")) throw std::runtime_error("Could not reset the workspace");
+  ui.Find(UiSelector::Key("new-conversation")).Tap();
+  ChooseDraftAssistant(ui, "Code");
+  SendNewConversation(ui, timeline_layout_prompt);
+  const auto history = ui.Find(UiSelector::Key("agent-chat-history"));
+  const auto read = ui.Find(UiSelector::Text("Read workspace files · Completed"));
+  const auto heading = ui.Find(UiSelector::Text("Workspace overview"));
+  Wait(ui, [&] { return read.Exists() && heading.Exists(); }, "The reading step and streamed heading did not mount");
+  const auto gap = [&] {
+    const auto step = read.One().bounds;
+    return heading.One().bounds.y - step.y - step.height;
+  };
+  const auto initial_gap = gap();
+  if (initial_gap < 0.0F || initial_gap > 32.0F)
+    throw std::runtime_error("The timeline reserved space for folded tool output");
+  released->store(1);
+  Wait(ui, [&] { return ShowsText(ui, "Stream checkpoint 1."); }, "The first longer reply did not start streaming");
+  history.ScrollBy({0.0F, -10000.0F});
+  Wait(ui, [&] { return read.Exists() && read.One().in_viewport && heading.Exists() && heading.One().in_viewport; },
+      "The start of the streamed reply was not reachable");
+  if (std::abs(gap() - initial_gap) > 4.0F)
+    throw std::runtime_error("Streaming moved the heading away from the preceding work step");
+  const auto read_y = read.One().bounds.y;
+  read.Tap();
+  Wait(ui, [&] { return gap() > initial_gap + 6.0F; }, "The reading details did not expand under their heading");
+  if (std::abs(read.One().bounds.y - read_y) > 4.0F)
+    throw std::runtime_error("Expanding a work step moved its heading");
+  const auto expanded_gap = gap();
+  released->store(2);
+  Wait(ui, [&] { return ShowsText(ui, "Stream checkpoint 2."); }, "The second longer reply did not render");
+  ui.Pump(16ms);
+  if (!read.One().in_viewport || std::abs(read.One().bounds.y - read_y) > 4.0F || std::abs(gap() - expanded_gap) > 4.0F)
+    throw std::runtime_error("Streaming moved the expanded work step or introduced empty space");
+  read.Tap();
+  try {
+    Wait(ui, [&] { return std::abs(gap() - initial_gap) <= 4.0F; }, "Collapsing the step left space behind");
+  } catch (...) {
+    static_cast<void>(root.Child("timeline-layout.snapshot").WriteString(ui.CaptureSnapshot().ToString()));
+    throw std::runtime_error("Collapsing the step left space behind: collapsed " + std::to_string(initial_gap) +
+        ", expanded " + std::to_string(expanded_gap) + ", after closing " + std::to_string(gap()));
+  }
+  if (std::abs(read.One().bounds.y - read_y) > 4.0F)
+    throw std::runtime_error("Collapsing a work step moved its heading");
+  ui.Find(UiSelector::Key("jump-to-latest")).Tap();
+  Wait(ui, [&] { return ui.Find(UiSelector::Text("Stream checkpoint 2.")).One().in_viewport; },
+      "Jump to latest did not return to the streaming reply");
+  released->store(3);
+  Wait(ui, [&] { return !ui.Find(UiSelector::Key("agent-chat-stop")).Exists(); }, "The layout check did not finish");
 }
 
 void VerifyLiveWorkspaceTools(const File& root) {
@@ -6701,7 +6782,9 @@ void VerifyLiveCodeTurnActivity(const File& root) {
       auto runtime = LiveTake(std::move(started));
       if (!workspace_id) throw std::runtime_error("The test workspace did not start");
       auto session = co_await LiveConversation(runtime, project, *workspace_id, agentkit_preview::CodeAgent,
-          code_activity_prompt, std::string(code_activity_prompt) + " Use apply_patch and run_tests, then summarize the outcome.");
+          code_activity_prompt, std::string(code_activity_prompt) +
+          " Before your first tool call, write one short visible sentence about the work you will do. "
+          "Use read_files for both files, then apply_patch and run_tests. Summarize the outcome in your final answer.");
       auto watching = co_await LiveObserve(session);
       bool saw_model_activity = false;
       bool saw_completion = false;
@@ -6725,7 +6808,7 @@ void VerifyLiveCodeTurnActivity(const File& root) {
       CheckText(workspace.Child("settings.html"), live_settings_after);
       if (workspace.Child("tested.txt").Exists()) throw std::runtime_error("CTest ran before its separate approval");
       co_await LiveApprove(session, test);
-      co_await LiveRunCompleted(session);
+      co_await LiveRunCompleted(session, 90s);
       CheckText(workspace.Child("tested.txt"), "verified");
       const auto deadline = std::chrono::steady_clock::now() + 5s;
       while (!saw_completion && std::chrono::steady_clock::now() < deadline) co_await Delay(25ms);
@@ -6734,8 +6817,40 @@ void VerifyLiveCodeTurnActivity(const File& root) {
       if (!saw_model_activity || !saw_completion || !run.timing || !run.timing->ended_at ||
           *run.timing->ended_at <= run.timing->started_at || run.timing->waiting_for_input < 1s)
         throw std::runtime_error("The native turn did not publish model activity, measured wait time and completion");
+      const auto find_tool = [&](const kit::ToolId& id) -> const kit::ToolCallSnapshot& {
+        const auto call = std::ranges::find_if(snapshot->tools, [&](const auto& item) {
+          return item.tool.id == id && item.state == kit::ToolCallState::Succeeded;
+        });
+        if (call == snapshot->tools.end() || !call->registered_sequence || !call->output_message ||
+            std::ranges::find(snapshot->messages, *call->output_message, &kit::Message::ref) == snapshot->messages.end())
+          throw std::runtime_error("The timeline lost the position or output for " + id.value);
+        return *call;
+      };
+      const auto& read = find_tool(agentkit_preview::ReadWorkspaceFiles);
+      const auto& write = find_tool(agentkit_preview::ApplyWorkspacePatch);
+      const auto& tests = find_tool(agentkit_preview::RunWorkspaceTests);
+      const auto first_text = std::ranges::find(snapshot->messages, kit::MessageAuthor::Agent, &kit::Message::author);
+      const auto last_text = std::ranges::find(snapshot->messages.rbegin(), snapshot->messages.rend(),
+          kit::MessageAuthor::Agent, &kit::Message::author);
+      if (first_text == snapshot->messages.end() || last_text == snapshot->messages.rend() ||
+          first_text->sequence >= *read.registered_sequence || *read.registered_sequence >= *write.registered_sequence ||
+          *write.registered_sequence >= *tests.registered_sequence || *tests.registered_sequence >= last_text->sequence)
+        throw std::runtime_error("Real model text and tool activity did not form an ordered timeline");
+      if (write.artifacts.size() != 1) throw std::runtime_error("The applied files did not record implementation evidence");
+      const auto record = LiveTake(co_await runtime->Artifacts().ReadAsync(write.artifacts.front()));
+      const auto evidence = workspace.Parent()->Child("workspace-evidence");
+      const auto config_diff = LiveTake(co_await agentkit_preview::PreviewAppliedFile(evidence, record, *snapshot, {"config.txt"}));
+      const auto settings_diff = LiveTake(co_await agentkit_preview::PreviewAppliedFile(evidence, record, *snapshot, {"settings.html"}));
+      if (config_diff.find("-mode=disabled") == std::string::npos || config_diff.find("+mode=enabled") == std::string::npos ||
+          settings_diff.find("Enabled") == std::string::npos)
+        throw std::runtime_error("The per-file diffs did not match the applied changes");
+      const auto command = std::ranges::find(snapshot->messages, *tests.output_message, &kit::Message::ref);
+      if (std::ranges::none_of(command->blocks, [](const auto& block) {
+            const auto* text = std::get_if<kit::TextBlock>(&block.body);
+            return text && text->text.find("--output-on-failure") != std::string::npos;
+          })) throw std::runtime_error("CTest did not record the executed command");
       std::cout << "Elapsed " << (*run.timing->ended_at - run.timing->started_at).count()
-                << " ms. " << code_activity_conclusion << ".\n";
+                << " ms. Verified the live timeline, two applied diffs and the CTest command.\n";
       LiveTake(co_await runtime->CloseAsync());
       passed = true;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; }
@@ -6747,6 +6862,41 @@ void VerifyLiveCodeTurnActivity(const File& root) {
           File(AGENTKIT_PREVIEW_CTEST), std::move(drive))}}};
   static_cast<void>(RunApplication());
   if (!passed) throw std::runtime_error("The native code turn acceptance failed");
+}
+
+void CheckCodeTimelineDetails(UiTest& preview) {
+  const auto tests = UiSelector::Text("Run workspace tests · Completed");
+  Wait(preview, [&] { return ShowsText(preview, "Read workspace files · Completed") && preview.Find(tests).Exists(); },
+      "The read and verification steps did not reopen in the conversation");
+  TapControl(preview, ButtonText("View changes"), "The completed turn could not locate its changes");
+  const auto first_diff = UiSelector::Key("workspace-file-diff/config.txt");
+  const auto second_diff = UiSelector::Key("workspace-file-diff/settings.html");
+  TapControl(preview, first_diff, "The first recorded file was not available", "agent-chat-history");
+  Wait(preview, [&] { return preview.Find(UiSelector::Key("workspace-applied-diff/config.txt")).Exists() &&
+      ReviewedDiff(preview).find("+mode=enabled") != std::string::npos; },
+      "The config diff did not show the recorded applied version");
+  TapControl(preview, second_diff, "The second recorded file was not available", "agent-chat-history");
+  Wait(preview, [&] { return preview.Find(UiSelector::Key("workspace-applied-diff/settings.html")).Exists() &&
+      ReviewedDiff(preview).find("Enabled") != std::string::npos; },
+      "The settings diff did not show the recorded applied version");
+  TapControl(preview, second_diff, "The settings diff could not be closed", "agent-chat-history");
+  TapControl(preview, tests, "The verification step could not expand", "agent-chat-history");
+  Wait(preview, [&] { return preview.Find(UiSelector::Key("ctest-command")).Exists() &&
+      preview.Find(UiSelector::Key("ctest-directory")).Exists() && preview.Find(UiSelector::Key("ctest-output")).Exists(); },
+      "Expanding the verification step did not restore the command, directory and output");
+  TapControl(preview, tests, "The verification step could not collapse", "agent-chat-history", -96.0F);
+  Wait(preview, [&] { return !preview.Find(UiSelector::Key("ctest-output")).Exists(); }, "CTest output did not collapse");
+}
+
+void VerifyReopenedCodeTimeline(const File& root) {
+  const Application application{App, {.application_hooks = {MakeConfiguredPreviewTestInstaller(
+      root.Child("sessions.sqlite3"), root.Child("code"), File(AGENTKIT_PREVIEW_CTEST), {})}}};
+  UiTest preview(application, {.viewport = {1180.0F, 1000.0F}, .resource_provider = std::make_shared<PreviewTestResources>()});
+  const auto entry = ConversationRow(preview, code_activity_prompt);
+  Wait(preview, [&] { return entry.Exists() && entry.One().in_viewport; }, "The live conversation was not restored from SQLite");
+  entry.Tap();
+  CheckCodeTimelineDetails(preview);
+  std::cout << "Reopened the live timeline, both applied diffs and the CTest output from SQLite.\n";
 }
 
 void VerifyCodeTurnActivity(const File& root) {
@@ -6797,8 +6947,8 @@ void VerifyCodeTurnActivity(const File& root) {
     recorded_elapsed = preview.Find(elapsed).One().text.value_or("");
     if (!recorded_elapsed.starts_with("Elapsed ") || recorded_elapsed == "Elapsed 0m 0s")
       throw std::runtime_error("The code turn did not retain a measured elapsed time");
-    if (preview.Find(UiSelector::Text("Read workspace files · Completed")).Exists())
-      throw std::runtime_error("A completed turn did not collapse its work by default");
+    if (!ShowsText(preview, "Read workspace files · Completed") || preview.Find(UiSelector::Key("ctest-output")).Exists())
+      throw std::runtime_error("A completed turn did not retain compact tool steps");
     CheckText(workspace.Child("tested.txt"), "verified");
   }
   {
@@ -6808,10 +6958,8 @@ void VerifyCodeTurnActivity(const File& root) {
     entry.Tap();
     wait(preview, [&] { return preview.Find(elapsed).Exists() && preview.Find(elapsed).One().text == recorded_elapsed &&
         ShowsText(preview, code_activity_conclusion); }, "The elapsed time or conclusion changed after restart");
-    preview.Find(work).Tap();
-    wait(preview, [&] { return preview.Find(UiSelector::Text("Read workspace files · Completed")).Exists() &&
-        preview.Find(UiSelector::Text("Run workspace tests · Completed")).Exists(); },
-        "Expanding the work did not restore the read and verification activity");
+    CheckCodeTimelineDetails(preview);
+    TapControl(preview, work, "The run details could not expand", "agent-chat-history");
     if (preview.Find(UiSelector::Text(reasoning)).Exists()) throw std::runtime_error("The reasoning summary opened by default");
     preview.Find(summary).Tap();
     wait(preview, [&] { return preview.Find(UiSelector::Text(reasoning)).Exists(); }, "The public reasoning summary did not reopen");
@@ -8141,6 +8289,12 @@ int main(int argc, char** argv) {
       }
       return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << "\nFixture: " << path.string() << '\n'; return 1; }
+  }
+  if (argc == 3 && std::string_view(argv[1]) == "--code-timeline-reopen") {
+    try {
+      VerifyReopenedCodeTimeline(File(std::filesystem::absolute(std::filesystem::u8path(argv[2])).u8string()));
+      return 0;
+    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
   }
   if ((argc == 2 || argc == 3) && std::string_view(argv[1]) == "--workspace-tools") {
     const auto path = argc == 3 ? std::filesystem::absolute(std::filesystem::u8path(argv[2])) :

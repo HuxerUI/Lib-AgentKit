@@ -18,7 +18,16 @@ huxerui::View CodeChat(std::shared_ptr<huxerui::agentkit::Conversation> conversa
     std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime,
     huxerui::agentkit::AgentChatOptions options = {}, std::optional<CodeWorkspace> workspace = {},
     std::optional<huxerui::File> evidence = {});
+
 huxerui::View AppliedFileDiff(huxerui::agentkit::ArtifactRef artifact, huxerui::agentkit::PartId file, std::string diff);
+
+huxerui::View WorkspaceChangeActivity(std::shared_ptr<huxerui::agentkit::Conversation> conversation,
+    std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime, huxerui::agentkit::ToolCallSnapshot call,
+    std::optional<CodeWorkspace> workspace, huxerui::File evidence);
+
+std::string CodeReviewAttachmentLabel(
+    const huxerui::agentkit::ApprovalPreview& preview, const huxerui::agentkit::ArtifactRef& artifact);
+
 huxerui::View CodeRevertReview(std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime,
     std::shared_ptr<huxerui::agentkit::Conversation> conversation, huxerui::agentkit::ToolCallSnapshot original,
     std::optional<CodeWorkspace> workspace, std::optional<huxerui::File> evidence);

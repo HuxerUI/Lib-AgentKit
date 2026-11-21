@@ -259,6 +259,7 @@ struct AgentChatOptions {
   /// Optional handle for focusing the composer from the host shell.
   std::optional<ViewHandle> composer_focus;
   /// Presents a block from the visible transcript, with an empty result selecting the default rendering.
+  /// An expanded tool step also supplies a ToolBlock with its call ID, alongside the output or its history anchor.
   std::function<std::optional<View>(const Message&, const ContentBlock&, std::shared_ptr<Conversation>)> render_block;
   /// Resolves an exact tool version to a display label for Run activity.
   /// An empty callback or label falls back to the tool ID.

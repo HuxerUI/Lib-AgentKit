@@ -8,6 +8,9 @@
 #include <huxerui/terminal.h>
 
 #include <algorithm>
+#include <iomanip>
+#include <ranges>
+#include <sstream>
 
 namespace agentkit_preview {
 namespace {
@@ -18,6 +21,9 @@ using namespace huxerui;
 using namespace std::chrono_literals;
 using Result = kit::AgentResult<kit::ToolExecutionResult>;
 using kit::JsonValue;
+
+constexpr std::string_view ctest_command = "ctest-command/";
+constexpr std::string_view ctest_directory = "ctest-directory/";
 
 Result Failed(kit::ErrorCode code, std::string message, kit::ToolOutcome outcome = kit::ToolOutcome::Failed) {
   return Result::Success({.outcome = outcome, .reason = kit::AgentError{.code = code, .message = std::move(message)}});
@@ -81,6 +87,12 @@ std::string CTestDisplayLog(std::string_view raw) {
   return log;
 }
 
+View CTestLog(std::string text, const ColorScheme& colors) {
+  auto log = Text(std::move(text)).Style({Font::Monospace(12.0F), colors.on_surface});
+  return ScrollView(SelectionArea(std::move(log))).With(Frame{.max_height = 220.0F},
+      ScrollBar(), Padding(8.0F), Background(colors.surface_container_high), CornerRadius(6.0F)).Key("ctest-output");
+}
+
 [[huxerui::composable]]
 View CTestDiagnostics(std::string text) {
   const auto expanded = UseState(false);
@@ -94,11 +106,7 @@ View CTestDiagnostics(std::string text) {
       Button(expanded.Get() ? ::app::strings::ui_hide_test_output : ::app::strings::ui_show_test_output)
           .OnClick([expanded] { expanded = !expanded.Get(); })
           .With(Semantics{.expanded = expanded.Get()}).Key("ctest-output-toggle")), Spacer()}};
-  if (expanded.Get()) {
-    auto log = Text(std::move(text)).Style({Font::Monospace(12.0F), colors.on_surface});
-    body.push_back(ScrollView(SelectionArea(std::move(log))).With(Frame{.max_height = 220.0F},
-        ScrollBar(), Padding(8.0F), Background(colors.surface_container_high), CornerRadius(6.0F)).Key("ctest-output"));
-  }
+  if (expanded.Get()) body.push_back(CTestLog(std::move(text), colors));
   return Column(std::move(body)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
@@ -136,6 +144,12 @@ kit::Async<kit::ToolExecutionResult> ExecuteTests(kit::ToolContext context, File
       .working_directory = std::filesystem::u8path(root.Path()),
       .environment = {{"HUXERUI_AGENTKIT_API_KEY", ""},
           {"HUXERUI_AGENTKIT_VERIFICATION_PNG", capture.file ? capture.file->Path() : std::string{}}}};
+  std::ostringstream command;
+  command << std::quoted(executable.Path());
+  for (const auto& argument : shell.arguments) {
+    if (argument.find_first_of(" \t\"") != argument.npos) command << ' ' << std::quoted(argument);
+    else command << ' ' << argument;
+  }
   auto opened = co_await term::OpenShellAsync(std::move(shell));
   if (!opened.Succeeded()) co_return Failed(kit::ErrorCode::ProviderFailure, "Could not start CTest: " + opened.Error().message);
   auto process = std::move(opened).Value();
@@ -174,6 +188,8 @@ kit::Async<kit::ToolExecutionResult> ExecuteTests(kit::ToolContext context, File
       if (!display.empty()) result.blocks.push_back({{kit::NewCommandId().value}, kit::TextBlock{std::move(display), false}});
     }
   }
+  result.blocks.push_back({{std::string(ctest_command) + context.CallId().value}, kit::TextBlock{command.str(), false}});
+  result.blocks.push_back({{std::string(ctest_directory) + context.CallId().value}, kit::TextBlock{root.Path(), false}});
   if (code != 0) result.reason = kit::AgentError{.code = kit::ErrorCode::ProviderFailure, .message = summary};
   if (capture.file && code == 0) {
     auto staged = co_await RunWorker(StageVerificationScreenshot, evidence, context.CallId());
@@ -224,11 +240,34 @@ kit::Async<kit::ArtifactRef> CandidateImplementation(const std::shared_ptr<kit::
 
 std::optional<View> RenderCTestDiagnostics(const kit::Message& message, const kit::ContentBlock& block) {
   if (message.author != kit::MessageAuthor::Tool || message.blocks.size() < 2 || block.id != message.blocks[1].id) return {};
+  if (block.id.value.starts_with(ctest_command)) return {};
   const auto* summary = std::get_if<kit::TextBlock>(&message.blocks.front().body);
   const auto* log = std::get_if<kit::TextBlock>(&block.body);
   if (!summary || !log || (!summary->text.starts_with("Tests passed (exit ") &&
       !summary->text.starts_with("Tests failed (exit "))) return {};
   return CTestDiagnostics(CTestDisplayLog(log->text));
+}
+
+[[huxerui::composable]]
+View CTestActivity(kit::Message message) {
+  const auto colors = UseTheme().colors;
+  std::vector<View> details;
+  const kit::TextBlock* diagnostics = nullptr;
+  for (const auto& block : message.blocks | std::views::drop(1)) {
+    const auto* value = std::get_if<kit::TextBlock>(&block.body);
+    if (!value) continue;
+    if (block.id.value.starts_with(ctest_command)) {
+      details.push_back(SelectionArea(Text(value->text).Style({Font::Monospace(12.0F), colors.on_surface}))
+          .Key("ctest-command"));
+    } else if (block.id.value.starts_with(ctest_directory)) {
+      details.push_back(Text(StringVariant::Format(::app::strings::ui_ctest_working_directory, value->text), TextRole::Label)
+          .Style({Font::System(12.0F), colors.on_surface_variant}).Key("ctest-directory"));
+    } else {
+      diagnostics = value;
+    }
+  }
+  if (diagnostics) details.push_back(CTestLog(CTestDisplayLog(diagnostics->text), colors));
+  return Column(std::move(details)).With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
 kit::AgentResult<void> RegisterCodeTests(

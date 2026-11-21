@@ -11,6 +11,7 @@ inline const huxerui::agentkit::JsonValue VerifyCandidateTests{std::string("veri
 
 std::optional<huxerui::View> RenderCTestDiagnostics(const huxerui::agentkit::Message& message,
     const huxerui::agentkit::ContentBlock& block);
+huxerui::View CTestActivity(huxerui::agentkit::Message message);
 
 huxerui::agentkit::AgentResult<void> RegisterCodeTests(
     const std::shared_ptr<huxerui::agentkit::AgentRuntime>& runtime, huxerui::File executable,

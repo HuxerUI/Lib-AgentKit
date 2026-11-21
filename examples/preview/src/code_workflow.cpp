@@ -581,7 +581,7 @@ static View CodeWorkspaceConversation(std::shared_ptr<kit::Conversation> convers
   return IndexedPages({std::move(chat), recovery_review ? std::move(*recovery_review) : View{Spacer()}}, page).With(Grow());
 }
 
-static std::string CodeReviewAttachmentLabel(const kit::ApprovalPreview& preview, const kit::ArtifactRef& artifact) {
+std::string CodeReviewAttachmentLabel(const kit::ApprovalPreview& preview, const kit::ArtifactRef& artifact) {
   if (!HasCodeTargets(preview.targets) || preview.artifacts.size() < preview.targets.size()) return {};
   const auto first_diff = preview.artifacts.end() - static_cast<std::ptrdiff_t>(preview.targets.size());
   if (!std::all_of(first_diff, preview.artifacts.end(), [](const auto& ref) { return ref.id.value.starts_with("workspace-evidence:"); }))
@@ -769,6 +769,97 @@ static View CodeDiffReview(std::shared_ptr<kit::Conversation> conversation, kit:
 
 View AppliedFileDiff(kit::ArtifactRef artifact, kit::PartId file, std::string diff) {
   return CodeDiffReview({}, std::move(artifact), std::move(file.value), std::move(diff), {}, {});
+}
+
+[[huxerui::composable]]
+View WorkspaceChangeActivity(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<kit::AgentRuntime> runtime,
+    kit::ToolCallSnapshot call, std::optional<CodeWorkspace> workspace, File evidence) {
+  struct OpenedDiff {
+    kit::ArtifactRef artifact;
+    kit::ResourceRef resource;
+    kit::PartId part;
+    kit::Revision access;
+    std::string text;
+  };
+
+  const auto theme = UseTheme();
+  const auto tasks = UseTaskScope();
+  const auto selected = UseState(std::optional<kit::ResourceRef>{});
+  const auto loaded = UseState(std::optional<OpenedDiff>{});
+  const auto busy = UseState(false);
+  const auto snapshot = conversation->Snapshot();
+  const auto access = snapshot ? std::optional{snapshot->access_revision} : std::nullopt;
+  const auto resource = selected.Get();
+  Lifecycle([conversation, runtime, tasks, call, evidence, resource, access, loaded, busy] {
+    loaded = std::nullopt;
+    busy = resource && access;
+    if (!busy.Get()) return std::function<void()>{[] {}};
+    auto worker = tasks.Launch([conversation, runtime, call, evidence, resource = *resource, access = *access,
+        loaded, busy]() -> Task<void> {
+      for (const auto& ref : call.artifacts) {
+        auto record = co_await runtime->Artifacts().ReadAsync(ref);
+        auto current = conversation->Snapshot();
+        if (!current || current->access_revision != access) break;
+        if (!record.Succeeded() || record.Value().call != call.id ||
+            record.Value().metadata.type != ImplementationEvidence) continue;
+        const auto& dependencies = record.Value().dependencies;
+        const auto edge = std::ranges::find_if(dependencies, [&](const kit::ArtifactDependency& dependency) {
+          return dependency.output_part && dependency.input.source == kit::SourceRef{resource};
+        });
+        if (edge == dependencies.end()) continue;
+        const auto part = *edge->output_part;
+        auto diff = co_await PreviewAppliedFile(evidence, record.Value(), *current, part);
+        current = conversation->Snapshot();
+        if (!current || current->access_revision != access) break;
+        const auto visible = std::ranges::find(current->tools, call.id, &kit::ToolCallSnapshot::id);
+        if (diff.Succeeded() && visible != current->tools.end() && std::ranges::find(visible->artifacts, ref) != visible->artifacts.end()) {
+          loaded = OpenedDiff{ref, resource, part, access, std::move(diff).Value()};
+          break;
+        }
+      }
+      busy = false;
+    });
+    return std::function<void()>{[worker] { worker.Cancel(); }};
+  }, conversation, call.id, resource, access, call.artifacts);
+
+  std::vector<View> rows;
+  const auto button = PreviewSecondaryButton(UseEnvironment<ButtonStyle>(), theme.colors);
+  for (const auto& effect : call.effects) {
+    auto name = File(effect.resource.value).Name();
+    if (workspace && !workspace->root.empty()) {
+      const auto relative = std::filesystem::u8path(effect.resource.value).lexically_relative(workspace->root);
+      if (!relative.empty() && *relative.begin() != "..") {
+        const auto path = relative.generic_u8string();
+        name.assign(path.begin(), path.end());
+      }
+    }
+    const bool applied = effect.state == kit::ResourceEffectState::Applied;
+    const bool expanded = resource && resource == effect.after;
+    const auto status = applied ? ::app::strings::ui_workspace_file_applied :
+        effect.state == kit::ResourceEffectState::Unchanged ? ::app::strings::ui_workspace_file_unchanged :
+        ::app::strings::ui_workspace_file_unverified;
+    std::vector<View> cells {
+        Text(name).Style({Font::Monospace(12.0F), theme.colors.on_surface}).With(Grow()),
+        Text(status, TextRole::Label),
+    };
+    if (applied && effect.after && !call.artifacts.empty()) {
+      cells.push_back(ProvideEnvironment(button, Button(expanded ? ::app::strings::ui_hide_file_diff : ::app::strings::ui_view_diff)
+          .OnClick([selected, after = *effect.after] { selected = selected.Get() == after ? std::nullopt : std::optional{after}; })
+          .Key("workspace-file-diff/" + name)));
+    }
+    rows.push_back(Row(std::move(cells)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)).Key(effect.resource.value));
+    if (!expanded) continue;
+    const auto result = loaded.Get();
+    if (result && result->resource == resource && result->access == access &&
+        std::ranges::find(call.artifacts, result->artifact) != call.artifacts.end()) {
+      rows.push_back(AppliedFileDiff(result->artifact, result->part, result->text)
+          .With(Frame{.height = 210.0F}).Key("workspace-applied-diff/" + result->part.value));
+    } else {
+      rows.push_back(Text(busy.Get() ? ::app::strings::ui_loading_file_diff : ::app::strings::ui_file_diff_unavailable,
+          TextRole::Label));
+    }
+  }
+  return Column(std::move(rows)).With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
 [[huxerui::composable]]

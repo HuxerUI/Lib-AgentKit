@@ -81,7 +81,8 @@ Async<Receipt<ToolCallAccepted>> RuntimeState::RequestTool(RunId id, CommandId c
   ++session.sequence;
   CommitStamp stamp{.command = command, .commit = {MakeId()}, .session = session.summary.id, .session_sequence = session.sequence};
   run.tool_requests.emplace(command, HostToolRecord{std::move(request), ref, stamp, call});
-  session.tools.push_back({.id = call, .run = id, .tool = std::move(ref), .state = ToolCallState::Preparing});
+  session.tools.push_back({.id = call, .run = id, .tool = std::move(ref), .state = ToolCallState::Preparing,
+      .registered_sequence = session.sequence});
   auto saved = co_await WhenSaved(Persist(session, false, stamp.commit));
   if (!saved.Succeeded()) co_return Registration::Failure(saved.Error());
   ScheduleHostedTool(run, call);

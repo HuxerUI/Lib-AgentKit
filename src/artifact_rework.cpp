@@ -421,7 +421,8 @@ void RuntimeState::StartArtifactChangeTool(RunExecution& run, const CommandId& c
   if (plan.source_revision) run.tool_attempts[plan.call].plan.source_revision = plan.source_revision;
   ++run.view.usage.tool_calls;
   run.tool_requests.emplace(command, HostToolRecord{{tool, JsonValue{command.value}}, ref, record.progress.accepted, plan.call});
-  session.tools.push_back({.id = plan.call, .run = run.view.id, .tool = ref, .state = ToolCallState::Preparing});
+  session.tools.push_back({.id = plan.call, .run = run.view.id, .tool = ref, .state = ToolCallState::Preparing,
+      .registered_sequence = ++session.sequence});
   if (record.input.revert) session.tools.back().reverts = record.input.revert->original_call;
 }
 

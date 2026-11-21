@@ -255,7 +255,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(UndoRef, handle, support)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(ResourceEffect, resource, state, before, after, undo, error)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(ToolReviewRecord, plan, reviewer, reviewer_version, outcome, reason)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ToolCallSnapshot, id, run, tool, plan, state, review, progress, effects,
-    artifacts, reason, reverts, source_changes, issued_targets, reconciliation)
+    artifacts, reason, reverts, source_changes, issued_targets, reconciliation, registered_sequence, output_message)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(ActionParty, kind, principal, session, run, call, agent)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(SessionOrigin, kind, creator, source_session, fork_point, side_chat_selection)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(TransferRequest, next, expected_binding, handoff_summary)

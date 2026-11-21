@@ -266,8 +266,18 @@ kit::AgentResult<kit::ToolExecutionResult> InspectWorkspace(File directory, Json
   std::ranges::stable_sort(items, [](const JsonValue& left, const JsonValue& right) {
     return Field(left, "path") < Field(right, "path");
   });
+  std::string listing;
+  for (const auto& item : items) {
+    if (!listing.empty()) listing += '\n';
+    listing += Field(item, "path");
+    if (search) listing += ':' + std::to_string(std::get<std::int64_t>(Object(item).at("line").value));
+    else if (std::get<bool>(Object(item).at("directory").value)) listing += '/';
+  }
+  std::vector<kit::ContentBlock> blocks;
+  if (!listing.empty()) blocks.push_back({{kit::NewCommandId().value}, kit::TextBlock{std::move(listing), false}});
   return Result::Success({.outcome = kit::ToolOutcome::Succeeded, .model_value =
-      JsonValue{JsonValue::Object{{"entries", JsonValue{std::move(items)}}, {"truncated", JsonValue{truncated}}}}});
+      JsonValue{JsonValue::Object{{"entries", JsonValue{std::move(items)}}, {"truncated", JsonValue{truncated}}}},
+      .blocks = std::move(blocks)});
 }
 
 kit::AgentResult<void> RegisterWorkspaceInspection(const std::shared_ptr<kit::AgentRuntime>& runtime, bool search) {
@@ -1328,7 +1338,17 @@ kit::AgentResult<void> RegisterCodeTools(const std::shared_ptr<kit::AgentRuntime
             .preview = {.title = "Read selected files"}, .execution_data = std::move(request.arguments)});
       },
       .execute = [drafts = workspaces->Editor()](kit::ToolContext context, kit::PreparedToolCall call) -> kit::Async<kit::ToolExecutionResult> {
-        co_return co_await RunWorker(ReadFiles, context.Resources(), std::move(call.change.execution_data), drafts);
+        auto result = co_await RunWorker(ReadFiles, context.Resources(), std::move(call.change.execution_data), drafts);
+        if (call.request.tool == ReadWorkspaceFiles && result.Succeeded() && result.Value().model_value) {
+          std::string paths;
+          for (const auto& file : Array(Object(*result.Value().model_value).at("files"))) {
+            if (!paths.empty()) paths += '\n';
+            paths += Field(file, "path");
+          }
+          if (!paths.empty())
+            result.Value().blocks.push_back({{kit::NewCommandId().value}, kit::TextBlock{std::move(paths), false}});
+        }
+        co_return result;
       }};
   auto read = runtime->RegisterTool(read_definition);
   if (!read.Succeeded()) return read;

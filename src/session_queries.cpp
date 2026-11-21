@@ -199,6 +199,14 @@ std::shared_ptr<const SessionSnapshot> RuntimeState::Snapshot(const SessionData&
   std::erase_if(result.messages, [&](const Message& message) {
     return message.blocks.empty() || (message.ref.session != session.summary.id && !history_source_visible(message.ref.session));
   });
+  std::set<MessageId> output_messages;
+  for (const auto& message : result.messages) {
+    if (message.author == MessageAuthor::Tool && message.ref.session == session.summary.id)
+      output_messages.insert(message.ref.message);
+  }
+  for (auto& call : result.tools) {
+    if (call.output_message && !output_messages.contains(call.output_message->message)) call.output_message.reset();
+  }
   for (const auto& [other_id, other] : sessions) {
     const auto* image = Published(other);
     if (!image || (other_id != session.summary.id && !visible_sessions.contains({user, other_id}))) continue;
@@ -456,6 +464,7 @@ Async<std::optional<SessionEventBatch>> RuntimeState::ReadSessionEvents(SessionI
       const auto shown = std::ranges::find(snapshot.tools, body.id, &ToolCallSnapshot::id);
       if (shown == snapshot.tools.end()) return false;
       FilterArtifactRefs(body.artifacts, permitted);
+      if (body.output_message != shown->output_message) body.output_message.reset();
       std::erase_if(body.source_changes, [&](const CommandId& command) {
         return std::ranges::find(shown->source_changes, command) == shown->source_changes.end();
       });

@@ -311,6 +311,20 @@ struct PreviewService {
 
 std::optional<View> RenderPreviewBlock([[maybe_unused]] const PreviewService& service, const kit::Message& message,
     const kit::ContentBlock& block, std::shared_ptr<kit::Conversation> conversation) {
+  if (const auto* step = std::get_if<kit::ToolBlock>(&block.body)) {
+    const auto current = conversation->Snapshot();
+    if (!current) return {};
+    const auto call = std::ranges::find(current->tools, step->call, &kit::ToolCallSnapshot::id);
+    if (call == current->tools.end()) return {};
+    if ((call->tool.id == agentkit_preview::RunCodeTests || call->tool.id == agentkit_preview::RunWorkspaceTests) &&
+        call->output_message == message.ref) return agentkit_preview::CTestActivity(message);
+    if (agentkit_preview::IsCodePatchTool(call->tool.id) && !call->effects.empty() && service.workspace_evidence) {
+      auto workspace = current->summary.workspace ? service.workspaces->Find(*current->summary.workspace) : std::nullopt;
+      return agentkit_preview::WorkspaceChangeActivity(std::move(conversation), service.runtime, *call,
+          std::move(workspace), *service.workspace_evidence);
+    }
+    return {};
+  }
   if (const auto* custom = std::get_if<kit::CustomBlock>(&block.body)) {
     if (custom->type == agentkit_preview::ReportChart)
       return agentkit_preview::RenderReportChart({message.ref, block.id}, *custom, std::move(conversation));
@@ -2549,6 +2563,7 @@ View PreviewShell() {
           std::shared_ptr<kit::Conversation> conversation) {
         return RenderPreviewBlock(*service, message, block, std::move(conversation));
       };
+      options.review_attachment_label = agentkit_preview::CodeReviewAttachmentLabel;
       options.tool_label = [resources](const kit::ToolRef& tool) -> std::string {
         using namespace agentkit_preview;
         if (tool.id == ReadCodeFiles || tool.id == ReadWorkspaceFiles) return resources->GetString(::app::strings::ui_activity_read_files);

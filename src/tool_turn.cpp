@@ -115,7 +115,8 @@ void RuntimeState::CancelToolTurnTasks(RunExecution& run) {
 void RuntimeState::RecordModelTool(SessionData& session, const RunId& run, PendingModelCall& pending) {
   if (pending.local_call) return;
   pending.local_call = ToolCallId{MakeId()};
-  session.tools.push_back({.id = *pending.local_call, .run = run, .tool = *pending.tool, .state = ToolCallState::Preparing});
+  session.tools.push_back({.id = *pending.local_call, .run = run, .tool = *pending.tool, .state = ToolCallState::Preparing,
+      .registered_sequence = ++session.sequence});
 }
 
 Task<void> RuntimeState::DriveModelTool(RunId id, PendingModelCall& pending) {

@@ -1327,6 +1327,10 @@ struct ToolCallSnapshot {
   std::optional<std::vector<TargetBaseline>> issued_targets;
   /// Command that recorded verified effects for a previously unknown call, when present.
   std::optional<CommandId> reconciliation;
+  /// Session sequence at which this call was registered. Older calls may have no recorded position.
+  std::optional<Sequence> registered_sequence;
+  /// Exact tool-authored message containing this call's published output, when visible to the reader.
+  std::optional<MessageRef> output_message;
 };
 
 /// @brief Status of a collaboration request's reply expectation.

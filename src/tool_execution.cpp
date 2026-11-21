@@ -172,9 +172,11 @@ Async<ToolResult> PublishToolResult(RuntimeState& runtime, const ToolInvocation&
     }
   }
   if (!output.blocks.empty()) {
+    const MessageRef ref{session.summary.id, MessageId{MakeId()}, 1};
     session.messages.push_back(Message{
-        .ref = {session.summary.id, MessageId{MakeId()}, 1}, .sequence = ++session.sequence, .run = invocation.run,
+        .ref = ref, .sequence = ++session.sequence, .run = invocation.run,
         .author = MessageAuthor::Tool, .state = MessageState::Complete, .blocks = output.blocks});
+    tool().output_message = ref;
   }
   if (output.outcome != ToolOutcome::Succeeded && !output.reason) {
     const auto code = output.outcome == ToolOutcome::ResultUnknown ? ErrorCode::ResultUnknown : ErrorCode::InvalidState;
