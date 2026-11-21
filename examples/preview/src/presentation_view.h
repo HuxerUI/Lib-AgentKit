@@ -1,6 +1,7 @@
 #pragma once
 
 #include <huxerui/agentkit.h>
+#include <huxerui/presentation.h>
 
 #include "presentation_tools.h"
 
@@ -31,7 +32,9 @@ huxerui::View BrowserWorkspaceReportControl(std::shared_ptr<huxerui::agentkit::A
     huxerui::agentkit::ProjectId project, huxerui::File store, huxerui::agentkit::WorkspaceId workspace,
     std::string folder, std::function<void(ImportedPresentationReport)> imported);
 huxerui::agentkit::AgentResult<void> RegisterBrowserPresentationExport(
-    const std::shared_ptr<huxerui::agentkit::AgentRuntime>& runtime, huxerui::File directory);
+    const std::shared_ptr<huxerui::agentkit::AgentRuntime>& runtime);
+huxerui::View RenderBrowserPresentationExport(const huxerui::agentkit::CustomBlock& block, const huxerui::File& directory,
+    const std::shared_ptr<huxerui::agentkit::AgentRuntime>& runtime);
 #endif
 
 huxerui::agentkit::Async<std::shared_ptr<huxerui::agentkit::Conversation>> OpenPresentationReviewAsync(

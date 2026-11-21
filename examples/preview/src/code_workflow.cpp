@@ -1,3 +1,5 @@
+#include "chat_chrome.h"
+#include "side_chat.h"
 #include <app_resources.h>
 
 #include "code_workflow.h"
@@ -517,11 +519,9 @@ static View CodeWorkspaceConversation(std::shared_ptr<kit::Conversation> convers
     }
   }
   if (!status.Get().empty()) actions.push_back(Text(status.Get(), TextRole::Label));
-  auto options = base_options;
-  if (options.header_actions) actions.push_back(std::move(*options.header_actions));
-  options.header_actions = Flow(std::move(actions)).With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Center));
   const auto page = recovery_review ? 1U : 0U;
-  auto chat = kit::AgentChat(std::move(conversation), std::move(options));
+  auto chat = PreviewChat(std::move(conversation), base_options,
+      Flow(std::move(actions)).With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Center)));
   return IndexedPages({std::move(chat), recovery_review ? std::move(*recovery_review) : View{Spacer()}}, page).With(Grow());
 }
 
@@ -678,7 +678,7 @@ static View SelectableCodeDiff(std::shared_ptr<kit::Conversation> conversation, 
               CornerRadius(7.0F), Border{colors.outline}, Background(colors.surface_container_high),
               Semantics{.label = ::app::strings::ui_code_diff, .identifier = "code-diff"}),
   };
-  if (draft) body.push_back(kit::AgentChatSourceActions(std::move(conversation), std::move(selected), *draft));
+  if (draft) body.push_back(PreviewSourceActions(std::move(conversation), std::move(selected), *draft));
   return Column(std::move(body)).With(Grow(), Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
@@ -770,8 +770,8 @@ View CodeChat(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<k
     return CodeDiffReview(std::move(session), preview.artifact, *path, *diff, draft, std::move(editor), show_filename)
         .Key(preview.artifact.id.value);
   };
-  if (base_options.close_review_window || !workspace || !workspace->NativeFolder())
-    return kit::AgentChat(std::move(conversation), std::move(options));
+  if (base_options.review_only || !workspace || !workspace->NativeFolder())
+    return PreviewChat(std::move(conversation), std::move(options));
   return CodeWorkspaceConversation(std::move(conversation), std::move(options), std::move(runtime), *workspace,
       std::move(evidence), [open_editor] { open_editor({}, {}); });
 }

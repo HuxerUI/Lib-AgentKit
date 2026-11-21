@@ -1,6 +1,6 @@
 #include "sqlite_session_store.h"
 
-#include <huxerui/agentkit.h>
+#include <huxerui/agentkit/runtime.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -174,7 +174,7 @@ std::shared_ptr<kit::AgentRuntime> ArtifactForkRuntime(std::shared_ptr<kit::Sess
   Take(runtime->RegisterModel({.ref = {{"fork.history"}, 1}, .endpoint = {"test", "local", "script", {}},
       .provider = std::make_shared<ForkHistoryModel>(probe), .allow_server_state = true}));
   const kit::JsonSchema flag{kit::JsonValue{kit::JsonValue::Object{{"type", kit::JsonValue{std::string("boolean")}}}}};
-  Take(runtime->RegisterContentComponent({report_card, {kit::JsonValue{true}}, {}, {
+  Take(runtime->RegisterContentComponent({report_card, {kit::JsonValue{true}}, {
       {"export", flag, [&probe](kit::ContentActionContext context, kit::JsonValue value) -> kit::Async<kit::ContentActionPlan> {
         ++probe.card_preparations;
         Check(!context.block->interactions.empty(), "export action received no interaction binding");
@@ -479,7 +479,7 @@ huxerui::Task<void> ReopenArtifactFork(huxerui::File file, ArtifactForkProbe& pr
   const auto& block = preserved->blocks.front();
   const auto& card = std::get<kit::CustomBlock>(block.body);
   Check(card.data == kit::JsonValue{std::string("Versioned summary data")} && card.artifacts == std::vector{probe.original} &&
-      card.interactions.empty() && !branch->RenderContent({preserved->ref, block.id}, card),
+      card.interactions.empty(),
       "stored card lost its versioned bindings or failed to use the fallback");
   auto nested = kit::NewCommandId();
   Take(co_await branch->DispatchContentActionAsync(nested, {{preserved->ref, block.id}, "summarize", kit::JsonValue{true}}));

@@ -62,54 +62,65 @@ if (EMSCRIPTEN)
     list(APPEND LIBRARY_SOURCE_FILES ${LIBRARY_WEB_SOURCE_FILES})
 endif ()
 
-huxerui_add_library(huxerui_agentkit
-        SOURCES
-            ${LIBRARY_SOURCE_FILES}
-        RESOURCES
-            resources
-        RESOURCE_NAMESPACE
-            huxerui_agentkit
+set(AGENTKIT_VIEW_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/agent_chat.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/markdown_selection.cpp"
 )
+list(REMOVE_ITEM LIBRARY_SOURCE_FILES ${AGENTKIT_VIEW_SOURCES})
+huxerui_add_library(huxerui_agentkit_runtime SOURCES ${LIBRARY_SOURCE_FILES})
+add_library(HuxerUI::AgentKitRuntime ALIAS huxerui_agentkit_runtime)
 
-add_library(HuxerUI::AgentKit ALIAS huxerui_agentkit)
-
-if (NOT TARGET HuxerUI::Markdown)
-    cmake_policy(PUSH)
-    if (POLICY CMP0168)
-        cmake_policy(SET CMP0168 NEW)
-    endif ()
-    include(FetchContent)
-    # Use a fresh checkout when upgrading from the locally patched dependency.
-    FetchContent_Declare(huxerui_markdown
-            GIT_REPOSITORY https://github.com/HuxerUI/Lib-Markdown.git
-            GIT_TAG 3a004b8fb01adf81e46848d091b09909afd2e81b
+option(HUXERUI_AGENTKIT_BUILD_VIEWS "Build the AgentKit conversation views" ON)
+if (HUXERUI_AGENTKIT_BUILD_VIEWS)
+    huxerui_add_library(huxerui_agentkit
+            SOURCES ${AGENTKIT_VIEW_SOURCES}
+            RESOURCES resources
+            RESOURCE_NAMESPACE huxerui_agentkit
     )
-    FetchContent_MakeAvailable(huxerui_markdown)
-    cmake_policy(POP)
-    # huxerui_add_library already selects and links the SDK's static framework.
-    # The pinned Markdown CMake also links the shared target explicitly.
-    if (TARGET HuxerUI::huxerui_static AND NOT HUXERUI_LIBRARY_GRAPH_ONLY)
-        get_target_property(agentkit_markdown_target HuxerUI::Markdown ALIASED_TARGET)
-        foreach (link_property IN ITEMS LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)
-            get_property(markdown_links TARGET ${agentkit_markdown_target} PROPERTY ${link_property})
-            list(REMOVE_ITEM markdown_links HuxerUI::huxerui)
-            set_property(TARGET ${agentkit_markdown_target} PROPERTY ${link_property} ${markdown_links})
-        endforeach ()
+    add_library(HuxerUI::AgentKit ALIAS huxerui_agentkit)
+    huxerui_use_library(huxerui_agentkit TARGET HuxerUI::AgentKitRuntime PUBLIC)
+
+    if (NOT TARGET HuxerUI::Markdown)
+        cmake_policy(PUSH)
+        if (POLICY CMP0168)
+            cmake_policy(SET CMP0168 NEW)
+        endif ()
+        include(FetchContent)
+        # Use a fresh checkout when upgrading from the locally patched dependency.
+        FetchContent_Declare(huxerui_markdown
+                GIT_REPOSITORY https://github.com/HuxerUI/Lib-Markdown.git
+                GIT_TAG 3a004b8fb01adf81e46848d091b09909afd2e81b
+        )
+        FetchContent_MakeAvailable(huxerui_markdown)
+        cmake_policy(POP)
+        # huxerui_add_library already selects and links the SDK's static framework.
+        # The pinned Markdown CMake also links the shared target explicitly.
+        if (TARGET HuxerUI::huxerui_static AND NOT HUXERUI_LIBRARY_GRAPH_ONLY)
+            get_target_property(agentkit_markdown_target HuxerUI::Markdown ALIASED_TARGET)
+            foreach (link_property IN ITEMS LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)
+                get_property(markdown_links TARGET ${agentkit_markdown_target} PROPERTY ${link_property})
+                list(REMOVE_ITEM markdown_links HuxerUI::huxerui)
+                set_property(TARGET ${agentkit_markdown_target} PROPERTY ${link_property} ${markdown_links})
+            endforeach ()
+        endif ()
     endif ()
-endif ()
-huxerui_use_library(huxerui_agentkit TARGET HuxerUI::Markdown)
+    huxerui_use_library(huxerui_agentkit TARGET HuxerUI::Markdown)
+endif()
 
 if (HUXERUI_LIBRARY_GRAPH_ONLY)
     return()
 endif ()
 
-target_include_directories(huxerui_agentkit PUBLIC
+target_include_directories(huxerui_agentkit_runtime PUBLIC
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
         "$<INSTALL_INTERFACE:include>"
 )
-target_compile_features(huxerui_agentkit PUBLIC cxx_std_20)
+target_compile_features(huxerui_agentkit_runtime PUBLIC cxx_std_20)
 if (MSVC)
-    target_compile_options(huxerui_agentkit PRIVATE /bigobj)
+    target_compile_options(huxerui_agentkit_runtime PRIVATE /bigobj)
+    if (HUXERUI_AGENTKIT_BUILD_VIEWS)
+        target_compile_options(huxerui_agentkit PRIVATE /bigobj)
+    endif()
 endif ()
 
 if (NOT TARGET nlohmann_json::nlohmann_json)
@@ -126,7 +137,10 @@ if (NOT TARGET nlohmann_json::nlohmann_json)
     )
     FetchContent_MakeAvailable(nlohmann_json)
 endif ()
-target_link_libraries(huxerui_agentkit PRIVATE nlohmann_json::nlohmann_json)
+target_link_libraries(huxerui_agentkit_runtime PRIVATE nlohmann_json::nlohmann_json)
+if (HUXERUI_AGENTKIT_BUILD_VIEWS)
+    target_link_libraries(huxerui_agentkit PRIVATE nlohmann_json::nlohmann_json)
+endif()
 
 option(HUXERUI_AGENTKIT_BUILD_TESTS "Build AgentKit tests" OFF)
 option(HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS "Include the Preview integration tests" ON)
@@ -135,31 +149,33 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS)
         find_package(HuxerUI CONFIG REQUIRED COMPONENTS testing PATHS "${HUXERUI_HOME}")
     endif ()
     enable_testing()
-    add_executable(huxerui_agentkit_runtime_tests tests/runtime_test.cpp)
-    huxerui_use_library(huxerui_agentkit_runtime_tests TARGET HuxerUI::AgentKit)
-    target_link_libraries(huxerui_agentkit_runtime_tests PRIVATE HuxerUI::testing)
-    set_property(TARGET huxerui_agentkit_runtime_tests APPEND PROPERTY HUXERUI_RESOURCE_PACKAGE_INPUTS
-            "${HUXERUI_BUILTIN_RESOURCE_PACKAGE}")
-    target_compile_definitions(huxerui_agentkit_runtime_tests PRIVATE
-            AGENTKIT_TEST_RESOURCE_PACKAGE="$<TARGET_PROPERTY:huxerui_agentkit_runtime_tests,HUXERUI_RESOURCE_PACKAGE>")
-    add_test(NAME huxerui_agentkit_runtime_tests COMMAND huxerui_agentkit_runtime_tests)
-    add_test(NAME huxerui_agentkit_tool_schedule_tests COMMAND huxerui_agentkit_runtime_tests --tool-schedule)
-    if (NOT CMAKE_CROSSCOMPILING AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
-        find_package(Python3 QUIET COMPONENTS Interpreter)
-        if (Python3_Interpreter_FOUND)
-            target_include_directories(huxerui_agentkit_runtime_tests PRIVATE src)
-            target_compile_definitions(huxerui_agentkit_runtime_tests PRIVATE AGENTKIT_TEST_MCP_TRANSPORTS)
-            target_link_libraries(huxerui_agentkit_runtime_tests PRIVATE nlohmann_json::nlohmann_json)
-            if (MSVC)
-                target_compile_options(huxerui_agentkit_runtime_tests PRIVATE /bigobj)
+    if (HUXERUI_AGENTKIT_BUILD_VIEWS)
+        add_executable(huxerui_agentkit_runtime_tests tests/runtime_test.cpp)
+        huxerui_use_library(huxerui_agentkit_runtime_tests TARGET HuxerUI::AgentKit)
+        target_link_libraries(huxerui_agentkit_runtime_tests PRIVATE HuxerUI::testing)
+        set_property(TARGET huxerui_agentkit_runtime_tests APPEND PROPERTY HUXERUI_RESOURCE_PACKAGE_INPUTS
+                "${HUXERUI_BUILTIN_RESOURCE_PACKAGE}")
+        target_compile_definitions(huxerui_agentkit_runtime_tests PRIVATE
+                AGENTKIT_TEST_RESOURCE_PACKAGE="$<TARGET_PROPERTY:huxerui_agentkit_runtime_tests,HUXERUI_RESOURCE_PACKAGE>")
+        add_test(NAME huxerui_agentkit_runtime_tests COMMAND huxerui_agentkit_runtime_tests)
+        add_test(NAME huxerui_agentkit_tool_schedule_tests COMMAND huxerui_agentkit_runtime_tests --tool-schedule)
+        if (NOT CMAKE_CROSSCOMPILING AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
+            find_package(Python3 QUIET COMPONENTS Interpreter)
+            if (Python3_Interpreter_FOUND)
+                target_include_directories(huxerui_agentkit_runtime_tests PRIVATE src)
+                target_compile_definitions(huxerui_agentkit_runtime_tests PRIVATE AGENTKIT_TEST_MCP_TRANSPORTS)
+                target_link_libraries(huxerui_agentkit_runtime_tests PRIVATE nlohmann_json::nlohmann_json)
+                if (MSVC)
+                    target_compile_options(huxerui_agentkit_runtime_tests PRIVATE /bigobj)
+                endif ()
+                add_test(NAME huxerui_agentkit_mcp_http_tests COMMAND "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/mcp_http_server.py" $<TARGET_FILE:huxerui_agentkit_runtime_tests>)
+                add_test(NAME huxerui_agentkit_mcp_stdio_tests COMMAND "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/mcp_stdio_server.py" $<TARGET_FILE:huxerui_agentkit_runtime_tests>)
+                set_tests_properties(huxerui_agentkit_mcp_http_tests huxerui_agentkit_mcp_stdio_tests PROPERTIES TIMEOUT 45)
             endif ()
-            add_test(NAME huxerui_agentkit_mcp_http_tests COMMAND "${Python3_EXECUTABLE}"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/mcp_http_server.py" $<TARGET_FILE:huxerui_agentkit_runtime_tests>)
-            add_test(NAME huxerui_agentkit_mcp_stdio_tests COMMAND "${Python3_EXECUTABLE}"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/mcp_stdio_server.py" $<TARGET_FILE:huxerui_agentkit_runtime_tests>)
-            set_tests_properties(huxerui_agentkit_mcp_http_tests huxerui_agentkit_mcp_stdio_tests PROPERTIES TIMEOUT 45)
         endif ()
-    endif ()
+    endif()
 
     include(cmake/HostSQLite.cmake)
     add_executable(huxerui_agentkit_sqlite_tests
@@ -169,12 +185,12 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS)
     if (MSVC)
         target_compile_options(huxerui_agentkit_sqlite_tests PRIVATE /bigobj)
     endif ()
-    target_link_libraries(huxerui_agentkit_sqlite_tests PRIVATE HuxerUI::AgentKit HuxerUI::testing nlohmann_json::nlohmann_json)
+    target_link_libraries(huxerui_agentkit_sqlite_tests PRIVATE HuxerUI::AgentKitRuntime HuxerUI::testing nlohmann_json::nlohmann_json)
     agentkit_host_use_sqlite_session_store(huxerui_agentkit_sqlite_tests)
     add_test(NAME huxerui_agentkit_sqlite_tests COMMAND huxerui_agentkit_sqlite_tests)
 
     add_executable(huxerui_agentkit_delegation_tests tests/delegation_test.cpp)
-    target_link_libraries(huxerui_agentkit_delegation_tests PRIVATE HuxerUI::AgentKit HuxerUI::testing)
+    target_link_libraries(huxerui_agentkit_delegation_tests PRIVATE HuxerUI::AgentKitRuntime HuxerUI::testing)
     agentkit_host_use_sqlite_session_store(huxerui_agentkit_delegation_tests)
     add_test(NAME huxerui_agentkit_delegation_tests COMMAND huxerui_agentkit_delegation_tests)
     set_tests_properties(huxerui_agentkit_delegation_tests PROPERTIES TIMEOUT 45)
@@ -184,12 +200,12 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS)
     )
     target_include_directories(huxerui_agentkit_model_tests PRIVATE src)
     target_link_libraries(huxerui_agentkit_model_tests PRIVATE
-            HuxerUI::AgentKit HuxerUI::testing nlohmann_json::nlohmann_json)
+            HuxerUI::AgentKitRuntime HuxerUI::testing nlohmann_json::nlohmann_json)
     agentkit_host_use_sqlite_session_store(huxerui_agentkit_model_tests)
     add_test(NAME huxerui_agentkit_model_tests COMMAND huxerui_agentkit_model_tests)
 endif ()
 
-if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS)
+if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HUXERUI_AGENTKIT_BUILD_VIEWS)
     include(examples/preview/cmake/Archive.cmake)
     include(cmake/HostTerminal.cmake)
     include(examples/preview/cmake/Skills.cmake)
@@ -214,6 +230,7 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS)
             examples/preview/src/run_settings.cpp
             examples/preview/src/preview_settings.cpp
             examples/preview/src/release_workflow.cpp
+            examples/preview/src/side_chat.cpp
             examples/preview/src/workspace_evidence.cpp
             examples/preview/src/worktree.cpp
             examples/preview/src/presentation.cpp

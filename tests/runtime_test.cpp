@@ -503,10 +503,11 @@ Task<void> VerifyHostResourceContext() {
 
 void VerifyContentApplication() {
   using VisibleConversation = State<std::shared_ptr<Conversation>>;
+  using ShowLegend = State<bool>;
   std::shared_ptr<Conversation> rendered_chat;
   std::exception_ptr error;
   bool complete = false;
-  const ContentTypeRef chart_type{"reporting.breakdown", 1};
+  static const ContentTypeRef chart_type{"reporting.breakdown", 1};
   const ContentTypeRef fallback_type{chart_type.id, 2};
   const JsonValue integer_schema{JsonValue::Object{{"type", JsonValue{std::string("integer")}}}};
   const JsonSchema chart_schema{JsonValue{JsonValue::Object{
@@ -515,16 +516,35 @@ void VerifyContentApplication() {
       {"properties", JsonValue{JsonValue::Object{{"count", integer_schema}}}}}}};
   Application application{
       []() -> View {
-        if (auto state = UseService<VisibleConversation>(); state && state->Get()) return AgentChat(state->Get());
+        if (auto state = UseService<VisibleConversation>(); state && state->Get()) {
+          return AgentChat(state->Get(), {.render_block = [show_legend = *UseService<ShowLegend>()](
+              const Message& message, const ContentBlock& block, std::shared_ptr<Conversation> conversation) -> std::optional<View> {
+            const auto* card = std::get_if<CustomBlock>(&block.body);
+            if (!card || card->type != chart_type) return {};
+            Check(message.ref.version && !block.id.value.empty(), "the report lacked a versioned origin");
+            const auto& data = std::get<JsonValue::Object>(card->data.value);
+            const auto count = std::get<std::int64_t>(data.at("count").value);
+            const auto tasks = UseApplicationTaskScope();
+            return Column{
+                Button(show_legend.Get() ? "Hide operations" : "Show operations")
+                    .OnClick([show_legend] { show_legend = !show_legend.Get(); }),
+                Button("Review this report").OnClick([tasks, conversation, target = CustomBlockRef{message.ref, block.id}] {
+                  tasks.Launch([conversation, target]() -> Task<void> {
+                    Take(co_await conversation->DispatchContentActionAsync(NewCommandId(), {target, "follow-up", JsonValue{true}}));
+                  });
+                }),
+                Text(show_legend.Get() ? "Operations: " + std::to_string(count) : "Operations hidden")};
+          }});
+        }
         return Text("Opening a report");
       }, {.application_hooks = {[&](ApplicationContext& context) {
         auto visible = std::make_shared<VisibleConversation>(std::shared_ptr<Conversation>{});
-        State<bool> show_legend{true};
         context.Provide(visible);
+        context.Provide(std::make_shared<ShowLegend>(true));
         auto selections = std::make_shared<AgentChatSelection>();
         context.Provide(selections);
         auto tasks = UseApplicationTaskScope();
-        tasks.Launch([&, tasks, visible, show_legend, selections]() -> Task<void> {
+        tasks.Launch([&, tasks, visible, selections]() -> Task<void> {
           try {
             auto runtime = Take(AgentRuntime::Create({
                 .tasks = tasks,
@@ -534,29 +554,12 @@ void VerifyContentApplication() {
                 }}));
             Take(runtime->RegisterModel({{{"report.model"}, 1}, {"test", "reporting", "script", {}},
                 std::make_shared<ScriptModel>()}));
-            auto render = [show_legend](RenderInput<CustomBlock> input) -> View {
-              Check(input.origin && input.origin->message.version && !input.origin->block.value.empty(),
-                  "renderer did not receive a versioned origin");
-              const auto& data = std::get<JsonValue::Object>(input.value->data.value);
-              const auto count = std::get<std::int64_t>(data.at("count").value);
-              const auto tasks = UseApplicationTaskScope();
-              auto follow_up = [tasks, dispatch = std::move(input.dispatch), target = *input.origin] {
-                tasks.Launch([dispatch, target]() -> Task<void> {
-                  Take(co_await dispatch(NewCommandId(), CustomBlockAction{target, "follow-up", JsonValue{true}}));
-                });
-              };
-              return Column{
-                  Button(show_legend.Get() ? "Hide operations" : "Show operations")
-                      .OnClick([show_legend] { show_legend = !show_legend.Get(); }),
-                  Button("Review this report").OnClick(std::move(follow_up)),
-                  Text(show_legend.Get() ? "Operations: " + std::to_string(count) : "Operations hidden")};
-            };
-            Take(runtime->RegisterContentComponent({chart_type, chart_schema, render, {{
+            Take(runtime->RegisterContentComponent({chart_type, chart_schema, {{
                 "follow-up", {JsonValue{true}}, [](ContentActionContext, JsonValue) -> Async<ContentActionPlan> {
                   co_return AgentResult<ContentActionPlan>::Success(SendInput{.text = "Review the selected report"});
                 }}}}));
             Take(runtime->RegisterContentComponent({fallback_type, chart_schema, {}}));
-            CheckError(runtime->RegisterContentComponent({chart_type, chart_schema, render}),
+            CheckError(runtime->RegisterContentComponent({chart_type, chart_schema, {}}),
                 ErrorCode::Conflict, "component schema version was overwritten");
             const ToolId publisher{"test.chart"};
             Take(runtime->RegisterTool({
@@ -565,7 +568,7 @@ void VerifyContentApplication() {
                 .prepare = [](ToolPrepareContext, ToolRequest) -> Async<PreparedChange> {
                   co_return AgentResult<PreparedChange>::Success({.preview = {.title = "Draw report"}});
                 },
-                .execute = [chart_type](ToolContext, PreparedToolCall plan) -> Async<ToolExecutionResult> {
+                .execute = [](ToolContext, PreparedToolCall plan) -> Async<ToolExecutionResult> {
                   const auto& arguments = std::get<JsonValue::Object>(plan.request.arguments.value);
                   auto type = chart_type;
                   type.schema_version = std::get<std::int64_t>(arguments.at("version").value);

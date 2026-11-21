@@ -228,7 +228,8 @@ struct ChartSubmission {
 };
 
 [[huxerui::composable]]
-View ChartCard(kit::RenderInput<kit::CustomBlock> input, Chart chart) {
+View ChartCard(std::shared_ptr<kit::Conversation> conversation, kit::CustomBlockRef origin,
+               std::optional<kit::Revision> version, Chart chart) {
   const auto tasks = UseTaskScope();
   const auto selected = UseState(std::vector<bool>(chart.categories.size(), true));
   const auto name = UseState(TextEditingValue::FromText("Report chart.csv"));
@@ -263,18 +264,15 @@ View ChartCard(kit::RenderInput<kit::CustomBlock> input, Chart chart) {
   std::vector<View> card{Text(chart.title, TextRole::Title), Row{
       Pie(chart, visible, total), Column(std::move(legend)).With(Spacing(4.0F)),
   }.With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Center))};
-  const auto form = std::ranges::find_if(input.interactions, [](const auto& item) {
-    return item.state == kit::InteractionState::Pending && std::holds_alternative<kit::FormRequest>(item.body);
-  });
-  if (form != input.interactions.end() && input.origin) {
-    const auto submit = [tasks, busy, retry, error, dispatch = input.dispatch, origin = *input.origin, version = form->version](
+  if (version) {
+    const auto submit = [tasks, busy, retry, error, conversation, origin, version = *version](
                             std::string action, Json payload) {
       if (busy.Get()) return;
       const auto submission = retry.Get().value_or(ChartSubmission{kit::NewCommandId(),
           {origin, std::move(action), DecodeJson(Json{{"version", version}, {"value", std::move(payload)}})}});
       busy = true;
-      tasks.Launch([busy, retry, error, dispatch, submission]() -> Task<void> {
-        auto result = co_await dispatch(submission.command, submission.action);
+      tasks.Launch([busy, retry, error, conversation, submission]() -> Task<void> {
+        auto result = co_await conversation->DispatchContentActionAsync(submission.command, submission.action);
         busy = false;
         retry = !result.Succeeded() && result.Error().code == kit::ErrorCode::CommitUncertain
             ? std::optional{submission} : std::nullopt;
@@ -317,6 +315,21 @@ kit::Async<kit::ContentActionPlan> ChartDecision(kit::ContentActionContext conte
 
 } // namespace
 
+View RenderReportChart(kit::CustomBlockRef origin, const kit::CustomBlock& block,
+                     std::shared_ptr<kit::Conversation> conversation) {
+  auto parsed = ReadChart(EncodeJson(block.data));
+  if (!parsed.Succeeded()) return Text(block.fallback);
+  std::optional<kit::Revision> version;
+  if (const auto snapshot = conversation->Snapshot()) {
+    const auto form = std::ranges::find_if(snapshot->interactions, [&](const auto& item) {
+      return item.state == kit::InteractionState::Pending && std::holds_alternative<kit::FormRequest>(item.body) &&
+          std::ranges::find(block.interactions, item.id) != block.interactions.end();
+    });
+    if (form != snapshot->interactions.end()) version = form->version;
+  }
+  return ChartCard(std::move(conversation), std::move(origin), version, std::move(parsed).Value());
+}
+
 kit::AgentResult<void> RegisterReportChart(const std::shared_ptr<kit::AgentRuntime>& runtime, File exports) {
   const auto decision_schema = [](Json value) {
     return kit::JsonSchema{DecodeJson(Json{{"type", "object"}, {"additionalProperties", false},
@@ -324,11 +337,6 @@ kit::AgentResult<void> RegisterReportChart(const std::shared_ptr<kit::AgentRunti
             {"version", {{"type", "integer"}, {"minimum", 1}}}, {"value", std::move(value)}}}})};
   };
   auto registered = runtime->RegisterContentComponent({ReportChart, ChartSchema(),
-      [](kit::RenderInput<kit::CustomBlock> input) -> View {
-        auto parsed = ReadChart(EncodeJson(input.value->data));
-        if (!parsed.Succeeded()) return Text(input.value->fallback);
-        return ChartCard(std::move(input), std::move(parsed).Value());
-      },
       {{"export", decision_schema(EncodeJson(SelectionSchema().document)), [](auto context, auto payload) {
           return ChartDecision(std::move(context), std::move(payload), true);
         }},

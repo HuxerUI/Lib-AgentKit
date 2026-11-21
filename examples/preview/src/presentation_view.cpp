@@ -1,3 +1,5 @@
+#include "chat_chrome.h"
+#include "side_chat.h"
 #include <app_resources.h>
 
 #include "presentation_view.h"
@@ -751,7 +753,7 @@ View StagedPresentationReview(PresentationOutline outline, std::optional<std::si
   if (const auto selected = selection.Get()) {
     const auto key = selected->text_range ? part.value + "/" + std::to_string(selected->text_range->begin_utf8)
                                           : selected->parts.front().value;
-    content.push_back(kit::AgentChatSourceActions(conversation, *selected, draft).Key(key));
+    content.push_back(PreviewSourceActions(conversation, *selected, draft).Key(key));
   }
   return ScrollView(Column(std::move(content)).With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch)))
       .With(Grow(), ScrollBar());
@@ -1272,17 +1274,17 @@ View BrowserWorkspaceReportControl(std::shared_ptr<kit::AgentRuntime> runtime, k
   return Column(std::move(body)).With(Spacing(6.0F));
 }
 
-kit::AgentResult<void> RegisterBrowserPresentationExport(
-    const std::shared_ptr<kit::AgentRuntime>& runtime, File directory) {
+kit::AgentResult<void> RegisterBrowserPresentationExport(const std::shared_ptr<kit::AgentRuntime>& runtime) {
   return runtime->RegisterContentComponent({BrowserPresentationExport,
-      {JsonValue{JsonValue::Object{{"type", JsonValue{std::string("string")}}}}},
-      [directory = std::move(directory), weak = std::weak_ptr<kit::AgentRuntime>(runtime)](
-          kit::RenderInput<kit::CustomBlock> input) -> View {
-        const auto* name = std::get_if<std::string>(&input.value->data.value);
-        if (!name || !ValidatePresentationFilename(*name).Succeeded() || input.value->artifacts.size() != 1)
-          return Text(input.value->fallback);
-        return BrowserExportCard(directory.Child(*name), input.value->artifacts.front(), weak);
-      }});
+      {JsonValue{JsonValue::Object{{"type", JsonValue{std::string("string")}}}}}});
+}
+
+View RenderBrowserPresentationExport(const kit::CustomBlock& block, const File& directory,
+                                    const std::shared_ptr<kit::AgentRuntime>& runtime) {
+  const auto* name = std::get_if<std::string>(&block.data.value);
+  if (!name || !ValidatePresentationFilename(*name).Succeeded() || block.artifacts.size() != 1)
+    return Text(block.fallback);
+  return BrowserExportCard(directory.Child(*name), block.artifacts.front(), runtime);
 }
 #endif
 
@@ -1334,7 +1336,7 @@ View PresentationChat(std::shared_ptr<kit::Conversation> conversation, std::shar
     return fallback ? fallback(request, std::move(session)) : std::nullopt;
   };
   if (!options.render_artifact) ConfigurePreviewArtifactReview(options, runtime, review_pages);
-  return kit::AgentChat(std::move(conversation), std::move(options));
+  return PreviewChat(std::move(conversation), std::move(options));
 }
 
 } // namespace agentkit_preview

@@ -170,6 +170,12 @@ View SelectionField(SourceRef source, std::variant<BlockId, PartId> leaf, std::s
   return TextField(std::move(value)).Variant(TextFieldVariant::Standard)
       .LineLimits(TextFieldLineLimits::MultiLine())
       .InputConfiguration({.multiline = true, .autocorrect = false, .keyboard_policy = SoftwareKeyboardPolicy::Manual})
+      .On<ViewEvents::PointerIntercept>([anchor](const PointerEvent& event) {
+        if (event.type == PointerEventType::Down &&
+            (event.changed_button == PointerButton::None || event.changed_button == PointerButton::Primary))
+          anchor.RequestFocus();
+        return false;
+      })
       .OnChanged([selection, anchor, source = std::move(source), leaf = std::move(leaf), original = std::move(text)](
                      const TextEditingValue& state) {
         if (state.text != original || state.composition) return;
@@ -642,8 +648,7 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
                  const ThemeSpec& theme, const TextFieldStyle& selection_style,
                  Revision access_revision, const std::shared_ptr<const AgentChatLinkHandler>& links,
                  const std::optional<InlineArtifactSummary>& inline_summary,
-                 const decltype(AgentChatOptions::render_text_block)& render_text_block, bool bubbles, bool narrow,
-                 bool floating_actions) {
+                 const decltype(AgentChatOptions::render_block)& render_block, bool bubbles, bool narrow) {
   const auto& colors = theme.colors;
   const bool user = message.author == MessageAuthor::User;
   const bool agent_reply = message.author == MessageAuthor::Agent;
@@ -661,11 +666,12 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
   }
   const auto selected = selection_actions ? selection.Get() : std::nullopt;
   for (const auto& block : message.blocks) {
+    if (auto rendered = render_block ? render_block(message, block, conversation) : std::nullopt) {
+      content.push_back(std::move(*rendered).Key(block.id.value));
+      continue;
+    }
     if (const auto* text = std::get_if<TextBlock>(&block.body)) {
-      auto rendered = render_text_block ? render_text_block(message, block) : std::nullopt;
-      if (rendered) {
-        content.push_back(std::move(*rendered).Key(block.id.value));
-      } else if (text->markdown) {
+      if (text->markdown) {
         content.push_back(MarkdownMessageBlock(message.ref, block.id, text->text, message.state == MessageState::Complete,
             selectable, selection, links).Key(block.id.value));
       } else if (selectable && message.state == MessageState::Complete && !text->text.empty()) {
@@ -674,7 +680,7 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
       } else {
         content.push_back(Text(text->text).Style({Font::System(14.0F), colors.on_surface}).Key(block.id.value));
       }
-      if (!floating_actions && !rendered && selected && selected->source.text_range &&
+      if (selected && selected->source.text_range &&
           selected->source.text_range->leaf == std::variant<BlockId, PartId>{block.id}) {
         content.push_back(std::move(*selection_actions));
       }
@@ -688,17 +694,13 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
       content.push_back(Text(moved->handoff_summary ? StringVariant{*moved->handoff_summary} :
           StringVariant{huxerui_agentkit::strings::ui_assistant_changed}).Key(block.id.value));
     } else if (const auto* custom = std::get_if<CustomBlock>(&block.body)) {
-      auto rendered = conversation->RenderContent({message.ref, block.id}, *custom);
-      content.push_back(rendered ? std::move(*rendered).Key(block.id.value) : Text(custom->fallback).Key(block.id.value));
+      content.push_back(Text(custom->fallback).Key(block.id.value));
     } else if (const auto* conclusion = std::get_if<SideChatConclusion>(&block.body)) {
       content.push_back(Text(conclusion->text, TextRole::Label).Key(block.id.value));
     }
   }
   View body = Column(std::move(content)).With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch));
-  if (bubbles) {
-    body = Stack{std::move(body).Key("message-body"), floating_actions && selection_actions ? std::move(*selection_actions) : View(Spacer())}
-        .With(Align(HorizontalAlignment::Stretch, VerticalAlignment::Start));
-  }
+  if (bubbles) body = std::move(body).Key("message-body");
   if (bubble) {
     auto tile = std::move(body).With(Padding(EdgeInsets::Symmetric(13.0F, 9.0F)),
         CornerRadius(user ? CornerRadii{15.0F, 5.0F, 15.0F, 15.0F} : CornerRadii{5.0F, 15.0F, 15.0F, 15.0F}),
@@ -891,22 +893,18 @@ struct SideChatRequest {
   State<AgentChatDraftSources> draft;
   std::function<void()> restore_origin;
   std::function<void()> on_citation_added;
-  std::uint64_t generation = 0;
 };
 
-struct SideChatPaneHost {
-  std::shared_ptr<const std::function<void(SideChatRequest)>> open;
+struct SideChatReturn {
+  std::shared_ptr<const std::function<void(AgentChatCitation)>> action;
+  static SideChatReturn Default() { return {}; }
 
-  static SideChatPaneHost Default() {
-    return {};
-  }
-
-  bool operator==(const SideChatPaneHost&) const = default;
+  bool operator==(const SideChatReturn&) const = default;
 };
 
 [[huxerui::composable]]
 View SideChatContent(std::shared_ptr<const SideChatRequest> request, ViewHandle question_focus,
-                     std::function<void()> close, std::function<void()> restore_origin, bool embedded) {
+                     std::function<void()> close, std::function<void()> restore_origin) {
   const auto tasks = UseApplicationTaskScope();
   const auto observation = UseTaskScope();
   const auto source_available = UseState(true);
@@ -918,7 +916,6 @@ View SideChatContent(std::shared_ptr<const SideChatRequest> request, ViewHandle 
   const auto error = side->error;
   const auto opened = side->conversation.Get();
   const auto returned = UseState(false);
-  const auto composer_focused = UseState(false);
   const bool compact = UseViewportClass() == ViewportClass::Compact;
   const auto colors = UseTheme().colors;
   Lifecycle([observation, origin, source_available] {
@@ -938,10 +935,8 @@ View SideChatContent(std::shared_ptr<const SideChatRequest> request, ViewHandle 
       else if (!returned.Get() && restore_origin) restore_origin();
     };
   });
-  Lifecycle([observation, opened, question_focus, embedded, available = selection_visible()] {
-    if (!available) return;
-    if (embedded) observation.Post([question_focus] { question_focus.RequestFocus(true); });
-    else if (opened) question_focus.RequestFocus(true);
+  Lifecycle([opened, question_focus, available = selection_visible()] {
+    if (available && opened) question_focus.RequestFocus(true);
   }, static_cast<bool>(opened), source_available.Get());
   const auto submit = [tasks, runtime = request->runtime, agent = request->agent, side, question, pending, error, selection_visible] {
     if (!selection_visible()) return;
@@ -1003,33 +998,19 @@ View SideChatContent(std::shared_ptr<const SideChatRequest> request, ViewHandle 
     AgentChatOptions options;
     options.draft = question;
     options.composer_focus = question_focus;
-    options.bring_back = [draft = request->draft, close, returned, selection_visible](SourceSlice ref, std::string text) {
+    const auto bring_back = [draft = request->draft, close, returned, selection_visible](AgentChatCitation reply) {
       if (!selection_visible()) return;
       auto sources = draft.Get();
-      sources.conclusion = AgentChatCitation{std::move(ref), std::move(text)};
+      sources.conclusion = std::move(reply);
       draft = std::move(sources);
       returned = true;
       close();
     };
-    auto chat = AgentChat(opened, std::move(options)).With(Grow());
-    if (embedded) {
-      body.push_back(std::move(chat).With(ClipChildren{}));
-    } else {
-      const float height = compact ? 248.0F : 304.0F;
-      body.push_back(Column{std::move(chat)}.With(Frame{.height = height, .max_height = height},
-          CrossAlign(CrossAxisAlignment::Stretch), ClipChildren{}));
-    }
-  } else if (embedded) {
-    body.push_back(Spacer());
-    if (pending.Get()) body.push_back(ChatActivityHeader(huxerui_agentkit::strings::ui_sending_message).Key("chat-sending-message"));
-    if (!error.Get().empty()) body.push_back(Text(error.Get(), TextRole::Label));
-    auto input = ChatComposerInput(question, question_focus, composer_focused,
-        huxerui_agentkit::strings::ui_ask_about_this_selection, "side-chat-question", submit, !pending.Get());
-    auto send = detail::ChatSendAction(huxerui_agentkit::strings::ui_send, "chat-send/Send", submit,
-        !pending.Get() && !question->text.empty() && !question->composition, colors, UseEnvironment<IconButtonStyle>());
-    body.push_back(ChatComposerPanel({std::move(input),
-        Row{Spacer(), std::move(send)}.With(CrossAlign(CrossAxisAlignment::Center)).Key("agent-chat-toolbar")},
-        composer_focused.Get(), true, colors));
+    auto chat = ProvideEnvironment(SideChatReturn{std::make_shared<const std::function<void(AgentChatCitation)>>(bring_back)},
+        AgentChat(opened, std::move(options)).With(Grow()));
+    const float height = compact ? 248.0F : 304.0F;
+    body.push_back(Column{std::move(chat)}.With(Frame{.height = height, .max_height = height},
+        CrossAlign(CrossAxisAlignment::Stretch), ClipChildren{}));
   } else {
     auto style = UseEnvironment<TextFieldStyle>();
     style.show_label = false;
@@ -1054,14 +1035,12 @@ View SideChatContent(std::shared_ptr<const SideChatRequest> request, ViewHandle 
   }
   View content = Column(std::move(body)).With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch),
       Padding(EdgeInsets{.top = 13.0F, .right = 15.0F, .bottom = 16.0F, .left = 15.0F}));
-  if (embedded) content = std::move(content).With(Grow());
   auto panel = Column{std::move(header), Divider(), std::move(content)}
       .With(CrossAlign(CrossAxisAlignment::Stretch), Background(colors.surface));
-  if (embedded) return std::move(panel).With(Grow());
   return std::move(panel).With(Frame{.width = 440.0F}, CornerRadius(12.0F), Border{colors.outline}).Key("side-chat-dialog");
 }
 
-void OpenSideChat(const SideChatPaneHost& pane, const DialogHandle& dialogs, std::shared_ptr<AgentChatSelection> service,
+void OpenSideChat(const DialogHandle& dialogs, std::shared_ptr<AgentChatSelection> service,
                   SelectionOrigin origin, MessageSelection selected, State<AgentChatDraftSources> draft,
                   ViewHandle question_focus, std::function<void()> restore_origin, std::function<void()> on_citation_added) {
   if (!service || !service->runtime) return;
@@ -1082,19 +1061,15 @@ void OpenSideChat(const SideChatPaneHost& pane, const DialogHandle& dialogs, std
   }
   SideChatRequest request{service->runtime, service->assistant, std::move(origin), std::move(selected.passages),
       *found, draft, std::move(restore_origin), std::move(on_citation_added)};
-  if (pane.open) {
-    (*pane.open)(std::move(request));
-    return;
-  }
   dialogs.Show(DialogFactory{[request = std::make_shared<const SideChatRequest>(std::move(request)), question_focus](DialogContext dialog) {
-    return SideChatContent(request, question_focus, [dialog] { dialog.Dismiss(); }, request->restore_origin, false);
+    return SideChatContent(request, question_focus, [dialog] { dialog.Dismiss(); }, request->restore_origin);
   }}, {.initial_focus = question_focus});
 }
 
 [[huxerui::composable]]
 View MessageSelectionToolbar(SourceSlice source, bool ranging, State<std::optional<SourceSlice>> focus_request,
                              State<bool> busy, State<std::string> error, std::function<void(bool)> use,
-                             std::function<void()> extend, bool floating) {
+                             std::function<void()> extend) {
   const auto action_focus = UseViewHandle();
   const auto theme = UseTheme();
   const auto style = ChatActionStyle(UseEnvironment<ButtonStyle>(), theme);
@@ -1109,8 +1084,6 @@ View MessageSelectionToolbar(SourceSlice source, bool ranging, State<std::option
       Button(ranging ? huxerui_agentkit::strings::ui_cancel_range : huxerui_agentkit::strings::ui_extend_selection).OnClick(std::move(extend)).With(Enabled(!busy.Get())),
   }.With(Spacing(4.0F)));
   View toolbar = error.Get().empty() ? std::move(row) : View(Column{std::move(row), Text(error.Get(), TextRole::Label)}.With(Spacing(3.0F)));
-  if (floating) toolbar = Column{std::move(toolbar)}.With(Padding(4.0F), CornerRadius(9.0F), Border{theme.colors.outline},
-      Background(theme.colors.surface_container_high));
   return std::move(toolbar).Key("message-selection-actions");
 }
 
@@ -1120,19 +1093,17 @@ View MessageSelectionActions(std::shared_ptr<Conversation> conversation,
                              SelectedText selected, State<std::optional<SelectedText>> selection,
                              State<std::optional<SourceSlice>> range_anchor,
                              State<AgentChatDraftSources> draft, State<std::optional<SourceSlice>> focus_request,
-                             std::function<void()> on_citation_added, bool floating) {
+                             std::function<void()> on_citation_added) {
   const auto service = UseService<AgentChatSelection>();
   const auto tasks = UseTaskScope();
   const auto dialogs = UseDialog();
-  const auto pane = UseEnvironment<SideChatPaneHost>();
   const auto question_focus = UseViewHandle();
-  const auto popup = UsePopup();
   const auto busy = UseState(false);
   const auto error = UseState(std::string{});
   const auto anchor = range_anchor.Get();
   const auto endpoint = SelectionBounds(selected);
-  auto use = [tasks, pane, dialogs, service, conversation, snapshot, selected, draft, question_focus, selection, endpoint,
-              focus_request, range_anchor, anchor, busy, error, on_citation_added, floating](bool ask) {
+  auto use = [tasks, dialogs, service, conversation, snapshot, selected, draft, question_focus, selection, endpoint,
+              focus_request, range_anchor, anchor, busy, error, on_citation_added](bool ask) {
     const auto current = snapshot.Get();
     if (busy.Get() || !current) return;
     auto excerpts = anchor ? MessageRange(current->messages, *anchor, endpoint) :
@@ -1145,16 +1116,15 @@ View MessageSelectionActions(std::shared_ptr<Conversation> conversation,
     };
     error = "";
     busy = true;
-    tasks.Launch([pane, dialogs, service, origin = SelectionOrigin{conversation, current->access_revision}, selected, draft, question_focus, selection,
-                  focus_request, range_anchor, anchor, busy, error, excerpts = std::move(excerpts), visible, ask, on_citation_added,
-                  floating]() mutable -> Task<void> {
+    tasks.Launch([dialogs, service, origin = SelectionOrigin{conversation, current->access_revision}, selected, draft, question_focus, selection,
+                  focus_request, range_anchor, anchor, busy, error, excerpts = std::move(excerpts), visible, ask,
+                  on_citation_added]() mutable -> Task<void> {
       auto text = co_await origin.conversation->ReadSelectionsAsync(excerpts.slices);
       busy = false;
       if (!text.Succeeded()) { error = text.Error().message; co_return; }
       if (!visible() || !origin.HasAccess()) { error = "Selection access changed"; co_return; }
       if (ask) {
-        if (floating) selection = std::nullopt;
-        OpenSideChat(pane, dialogs, service, std::move(origin), std::move(excerpts), draft, question_focus,
+        OpenSideChat(dialogs, service, std::move(origin), std::move(excerpts), draft, question_focus,
             [selection, selected, focus_request, range_anchor, anchor, visible] {
               if (!visible()) return;
               selection = selected;
@@ -1172,61 +1142,93 @@ View MessageSelectionActions(std::shared_ptr<Conversation> conversation,
   const auto extend = [range_anchor, anchor, endpoint] {
     range_anchor = anchor ? std::nullopt : std::optional{endpoint};
   };
-  if (!floating) return MessageSelectionToolbar(selected.source, anchor.has_value(), focus_request, busy, error, use, extend, false);
-  const auto target = *selected.toolbar_anchor;
-  Lifecycle([popup, target, selection, source = selected.source, ranging = anchor.has_value(), focus_request, busy, error, use, extend] {
-    ViewFactory toolbar = [source, ranging, focus_request, busy, error, use, extend] {
-      return MessageSelectionToolbar(source, ranging, focus_request, busy, error, use, extend, true);
-    };
-    PopupOptions options{.placement = {AnchorSide::Above, AnchorAlignment::Center}, .gap = 6.0F,
-        .dismiss_on_outside_press = false, .retain_anchor_focus = true,
-        .on_dismiss_request = [selection] { selection = std::nullopt; }};
-    try {
-      const auto layer = target.caret ? popup.ShowAtAnchor(target.view, *target.caret, std::move(toolbar), std::move(options)) :
-                                      popup.Show(target.view, std::move(toolbar), std::move(options));
-      return std::function<void()>{[popup, layer] { popup.Dismiss(layer); }};
-    } catch (const std::logic_error&) {
-      return std::function<void()>{[] {}};
-    }
-  }, target, anchor, selected.source, selected.selection, selected.markdown_range);
-  return Spacer();
+  return MessageSelectionToolbar(selected.source, anchor.has_value(), focus_request, busy, error, use, extend);
 }
 
 } // namespace
 
-[[huxerui::composable]]
-View AgentChatWithSidePane(View content) {
-  using Request = std::shared_ptr<const SideChatRequest>;
-  const auto active = UseState(Request{});
-  const auto open = UseState(std::make_shared<const std::function<void(SideChatRequest)>>(
-      [active](SideChatRequest request) {
-        const auto& previous = active.Get();
-        request.generation = previous ? previous->generation + 1 : 1;
-        active = std::make_shared<const SideChatRequest>(std::move(request));
-      }));
-  const auto question_focus = UseViewHandle();
-  const auto split_tree = UseState(DockTree::Split(Axis::Horizontal, {
-      DockTree::Tabs({"source"}).With(Frame{.min_width = 316.0F}, Grow()),
-      DockTree::Tabs({"side-chat"}).With(Frame{.width = 336.0F, .min_width = 276.0F, .max_width = 520.0F}, Grow(0.0F)),
-  }));
-  const auto request = active.Get();
-  const bool split = request && UseViewportClass() == ViewportClass::Expanded;
-  const auto source_tab = huxerui_agentkit::strings::ui_back_to_conversation;
-  const auto side_tab = huxerui_agentkit::strings::ui_side_chat;
-  std::vector<DockItem> panes;
-  panes.push_back(DockItem("source", source_tab, ProvideEnvironment(SideChatPaneHost{open.Get()}, std::move(content))).Closable(false));
-  if (request) {
-    auto pane = SideChatContent(request, question_focus, [active, request] {
-      if (active.Get() == request) active = Request{};
-    }, [active, request] {
-      if (!active.Get() && request->restore_origin) request->restore_origin();
-    }, true).Key(request->generation);
-    panes.push_back(DockItem("side-chat", side_tab, Column{std::move(pane)}
-        .With(CrossAlign(CrossAxisAlignment::Stretch)).Key("side-chat-pane")).Closable(false));
+struct AgentChatTextSelection::Data {
+  std::shared_ptr<Conversation> conversation;
+  State<std::shared_ptr<const SessionSnapshot>> snapshot;
+  std::shared_ptr<const SessionSnapshot> projected;
+  Revision access;
+  SelectedText text;
+  State<std::optional<SelectedText>> selection;
+  State<std::optional<SourceSlice>> range;
+  std::optional<SourceSlice> start;
+
+  bool IsVisible() const {
+    const auto current = snapshot.Get();
+    const auto authorized = conversation->Snapshot();
+    return current && authorized && current->summary.id == authorized->summary.id &&
+        current->access_revision == access && authorized->access_revision == access &&
+        std::ranges::any_of(current->messages, [&](const Message& message) {
+          return message.state == MessageState::Complete && SourceRef{message.ref} == text.source.source;
+        });
   }
-  return DockLayout(std::move(panes), split ? split_tree.Get() : DockTree::Tabs({request ? "side-chat" : "source"}))
-      .TabBar([](const DockTabBarContext&) { return View{}; })
-      .OnChanged([split_tree](const DockTree& tree) { split_tree = tree; }).With(Grow());
+
+  MessageSelection Excerpts() const {
+    if (start) return MessageRange(projected->messages, *start, SelectionBounds(text));
+    MessageSelection excerpts{{text.source}, {{0, text.text}}};
+    excerpts.slices.insert(excerpts.slices.end(), text.additional_sources.begin(), text.additional_sources.end());
+    return excerpts;
+  }
+};
+
+struct detail::ChatTextSelectionAccess {
+  static std::shared_ptr<const AgentChatTextSelection> Bind(std::shared_ptr<Conversation> conversation,
+      State<std::shared_ptr<const SessionSnapshot>> snapshot, Revision access, SelectedText text,
+      State<std::optional<SelectedText>> selection, State<std::optional<SourceSlice>> range) {
+    auto data = std::make_shared<AgentChatTextSelection::Data>(AgentChatTextSelection::Data{
+        std::move(conversation), snapshot, snapshot.Get(), access, std::move(text), selection, range, range.Get()});
+    return std::shared_ptr<const AgentChatTextSelection>(new AgentChatTextSelection(std::move(data)));
+  }
+};
+
+AgentChatTextSelection::AgentChatTextSelection(std::shared_ptr<const Data> data) : data_(std::move(data)) {}
+
+ViewHandle AgentChatTextSelection::Anchor() const { return data_->text.toolbar_anchor->view; }
+
+std::optional<Rect> AgentChatTextSelection::Caret() const { return data_->text.toolbar_anchor->caret; }
+
+bool AgentChatTextSelection::IsExtending() const { return data_->start.has_value(); }
+
+Async<AgentChatCitation> AgentChatTextSelection::ReadAsync() const {
+  return [](std::shared_ptr<const Data> data) -> Async<AgentChatCitation> {
+    if (!data->IsVisible()) co_return detail::Fail<AgentChatCitation>(ErrorCode::Conflict, "Selection access changed");
+    auto excerpts = data->Excerpts();
+    if (excerpts.slices.empty()) co_return detail::Fail<AgentChatCitation>(ErrorCode::InvalidArgument,
+        "The selected message range could not be resolved");
+    const auto checked = co_await data->conversation->ReadSelectionsAsync(excerpts.slices);
+    if (!checked.Succeeded()) co_return AgentResult<AgentChatCitation>::Failure(checked.Error());
+    if (!data->IsVisible()) co_return detail::Fail<AgentChatCitation>(ErrorCode::Conflict, "Selection access changed");
+    co_return AgentResult<AgentChatCitation>::Success(GatherCitation(std::move(excerpts)));
+  }(data_);
+}
+
+std::vector<std::string> AgentChatTextSelection::Passages() const {
+  std::vector<std::string> result;
+  if (data_->IsVisible())
+    for (auto& passage : data_->Excerpts().passages) result.push_back(std::move(passage.text));
+  return result;
+}
+
+void AgentChatTextSelection::Extend() const {
+  if (data_->IsVisible())
+    data_->range = data_->start ? std::nullopt : std::optional{SelectionBounds(data_->text)};
+}
+
+void AgentChatTextSelection::Clear() const {
+  if (!data_->IsVisible()) return;
+  const auto& selected = data_->selection.Get();
+  if (!selected || SelectionBounds(*selected) == SelectionBounds(data_->text)) data_->selection = std::nullopt;
+  if (data_->range.Get() == data_->start) data_->range = std::nullopt;
+}
+
+void AgentChatTextSelection::Restore() const {
+  if (!data_->IsVisible()) return;
+  data_->selection = data_->text;
+  data_->range = data_->start;
 }
 
 [[huxerui::composable]]
@@ -1254,7 +1256,6 @@ View AgentChatSourceActions(std::shared_ptr<Conversation> conversation, std::opt
   const auto service = UseService<AgentChatSelection>();
   const auto tasks = UseTaskScope();
   const auto dialogs = UseDialog();
-  const auto pane = UseEnvironment<SideChatPaneHost>();
   const auto question_focus = UseViewHandle();
   const auto busy = UseState(false);
   const auto error = UseState(std::string{});
@@ -1263,20 +1264,20 @@ View AgentChatSourceActions(std::shared_ptr<Conversation> conversation, std::opt
   if (!cited && navigation.on_citation_added)
     cited = [navigation] { (*navigation.on_citation_added)(navigation.review_ticket); };
   if (!service || !conversation) return Spacer();
-  const auto use = [service, tasks, pane, dialogs, busy, error, conversation, draft, question_focus, cited](SourceSlice source, bool ask) {
+  const auto use = [service, tasks, dialogs, busy, error, conversation, draft, question_focus, cited](SourceSlice source, bool ask) {
     if (busy.Get()) return;
     const auto current = conversation->Snapshot();
     if (!current) { error = "The conversation is unavailable"; return; }
     busy = true;
     error = "";
-    tasks.Launch([service, pane, dialogs, busy, error, origin = SelectionOrigin{conversation, current->access_revision},
+    tasks.Launch([service, dialogs, busy, error, origin = SelectionOrigin{conversation, current->access_revision},
                   source, draft, question_focus, ask, cited]() -> Task<void> {
       auto text = co_await origin.conversation->ReadSelectionAsync(source);
       busy = false;
       if (!text.Succeeded()) { error = text.Error().message; co_return; }
       if (!origin.HasAccess()) { error = "Selection access changed"; co_return; }
       if (ask) {
-        OpenSideChat(pane, dialogs, service, origin, {{source}, {{0, std::move(text).Value()}}}, draft, question_focus, {}, cited);
+        OpenSideChat(dialogs, service, origin, {{source}, {{0, std::move(text).Value()}}}, draft, question_focus, {}, cited);
       } else {
         auto sources = draft.Get();
         sources.quote = AgentChatCitation{source, std::move(text).Value()};
@@ -1311,8 +1312,33 @@ View AgentChatArtifactText(std::shared_ptr<Conversation> conversation, ArtifactR
   }.With(Grow(), Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
+static View ChatHistoryViewport(View history, ScrollController controller, std::size_t count,
+                                State<std::optional<SelectedText>> selection, bool clear_selection,
+                                IconButtonStyle style, const ThemeSpec& theme) {
+  const auto viewport = controller.Metrics();
+  View jump = Spacer();
+  if (count && viewport.maximum_offset - viewport.offset > 24.0F) {
+    style.foreground = theme.colors.on_surface_variant;
+    style.icon_size = 16.0F;
+    style.minimum_interactive_size = 34.0F;
+    style.state_layer_size = 32.0F;
+    jump = Row{ProvideEnvironment(style, IconButton(huxerui_agentkit::images::arrow_down, huxerui_agentkit::strings::ui_jump_to_latest)
+        .OnClick([controller, count] { controller.ScrollToItem(count - 1, ScrollAlignment::End); })
+        .With(Tooltip(huxerui_agentkit::strings::ui_jump_to_latest), CornerRadius(17.0F), Background(theme.colors.surface_container_high),
+            Border{theme.colors.outline}).Key("jump-to-latest"))}.With(Padding(EdgeInsets{.bottom = 8.0F}));
+  }
+  auto view = Stack{std::move(history), std::move(jump)}.With(Grow(), Align(HorizontalAlignment::Center, VerticalAlignment::End));
+  if (clear_selection) return std::move(view).On<ViewEvents::PointerIntercept>([selection](const PointerEvent& event) {
+    if (event.type == PointerEventType::Down && !event.modifiers.shift && selection.Get()) selection = std::nullopt;
+    return false;
+  });
+  return view;
+}
+
+enum class ChatPart { Full, Messages, Composer };
+
 [[huxerui::composable]]
-View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions options) {
+static View ConversationChatView(std::shared_ptr<Conversation> conversation, AgentChatOptions options, ChatPart part) {
   const auto tasks = UseTaskScope();
   const auto snapshot = UseState(conversation ? conversation->Snapshot() : std::shared_ptr<const SessionSnapshot>{});
   const auto activity_feed = UseState(std::shared_ptr<const ChatActivityFeed>{});
@@ -1327,7 +1353,7 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
   const auto local_draft = UseState(TextEditingValue::FromText({}));
   const auto draft = options.draft.value_or(local_draft);
   const auto artifact_review = UseState(std::shared_ptr<const ArtifactPreview>{});
-  const auto review_loading = UseState(static_cast<bool>(options.close_review_window) && options.review_request.has_value());
+  const auto review_loading = UseState(options.review_only && options.review_request.has_value());
   const auto review_ticket = UseState(std::uint64_t{0});
   const auto review_approval = UseState(std::optional<AgentChatApprovalRef>{});
   const auto review_origin = UseState(std::optional<ViewHandle>{});
@@ -1342,7 +1368,7 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
   const auto error = UseState(std::string{});
   const auto sending = UseState(false);
   const auto queue = UseState(std::optional<RunId>{});
-  const auto side_service = UseService<AgentChatSelection>();
+  const auto side_service = OptionalChatService<AgentChatSelection>();
   const auto links = OptionalChatService<AgentChatLinkHandler>();
   const auto send_menu = UseMenu();
   const auto send_mode = UseViewHandle();
@@ -1380,6 +1406,15 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
         focused_interaction = std::nullopt;
         focus_cited_draft();
       }));
+  const auto observed_quote = draft_sources->quote;
+  const auto observed_conclusion = draft_sources->conclusion;
+  Lifecycle([close_review, reviewed = artifact_review.Get(), review_only = options.review_only,
+      focus_cited_draft, observed_quote, observed_conclusion] {
+    if (reviewed && !review_only && (observed_quote || observed_conclusion)) {
+      close_review();
+      focus_cited_draft();
+    }
+  }, observed_quote, observed_conclusion);
 
   Lifecycle([conversation, history_owner, history_window, history_loading, history_initialized, history_scroll, follow_sent_message, snapshot,
       artifact_review, review_ticket, review_loading, review_approval, review_origin, review_message, handled_review,
@@ -1404,11 +1439,12 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
     snapshot = conversation ? conversation->Snapshot() : std::shared_ptr<const SessionSnapshot>{};
   }, conversation);
 
-  const bool review_only = static_cast<bool>(options.close_review_window);
+  const bool review_only = options.review_only;
+  const bool track_history = part != ChatPart::Composer;
   const auto requested_history = review_only && options.review_request && options.review_request->history_first
       ? std::optional{SessionHistoryWindow{*options.review_request->history_first}}
       : history_owner.Get() == conversation ? history_window.Get() : std::nullopt;
-  const auto activity_access = layout_style.show_run_activity && !review_only && snapshot.Get()
+  const auto activity_access = track_history && layout_style.show_run_activity && !review_only && snapshot.Get()
       ? std::optional{snapshot.Get()->access_revision} : std::nullopt;
   Lifecycle([tasks, conversation, activity_feed, activity_access] {
     if (!activity_access) return std::function<void()>{[] {}};
@@ -1416,12 +1452,12 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
   }, conversation, activity_access);
   Lifecycle([conversation, tasks, snapshot, error, artifact_review, review_ticket, review_loading, focused_interaction,
       history_owner, history_window, history_loading, history_initialized, history_controller, history_scroll, follow_sent_message,
-      requested_history, review_only] {
+      requested_history, review_only, track_history] {
     auto subscription = std::make_shared<std::optional<Subscription>>();
     if (!conversation) return std::function<void()>{[] {}};
     auto project = [conversation, snapshot, error, artifact_review, review_ticket, review_loading, focused_interaction,
         history_owner, history_window, history_loading, history_initialized, history_controller, history_scroll, follow_sent_message,
-        requested_history, review_only](auto result) {
+        requested_history, review_only, track_history](auto result) {
       if (history_owner.Get() != conversation || (!review_only && history_window.Get() != requested_history)) return;
       if (result.Succeeded()) {
         auto incoming = std::move(result).Value();
@@ -1431,7 +1467,7 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
         const auto viewport = history_controller.Metrics();
         history_loading = false;
         history_initialized = true;
-        if (!review_only && !incoming->messages.empty()) {
+        if (track_history && !review_only && !incoming->messages.empty()) {
           const std::size_t earlier = incoming->older_history ? 1 : 0;
           const auto pending = follow_sent_message.Get();
           const bool sent = pending && std::ranges::any_of(incoming->messages, [pending](const Message& message) {
@@ -1553,10 +1589,9 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
     draft_sources = std::move(sources);
   }, empty_draft);
   const auto current = history_owner.Get() == conversation ? snapshot.Get() : std::shared_ptr<const SessionSnapshot>{};
-  if (!current && !options.close_review_window) return Text(error->empty() ? StringVariant{huxerui_agentkit::strings::ui_opening_conversation} : StringVariant{error.Get()});
+  if (!current && !options.review_only) return Text(error->empty() ? StringVariant{huxerui_agentkit::strings::ui_opening_conversation} : StringVariant{error.Get()});
   const auto detached_status = [&](StringVariant message) -> View {
-    return Column{ProvideEnvironment(action_style, Button(huxerui_agentkit::strings::ui_close_review).OnClick(options.close_review_window)),
-        Text(std::move(message), TextRole::Label)}
+    return Column{Text(std::move(message), TextRole::Label)}
         .With(Grow(), Padding(24.0F), Spacing(12.0F), Background(theme.colors.surface));
   };
   if (!current) return detached_status(error->empty() ? StringVariant{huxerui_agentkit::strings::ui_opening_conversation} : StringVariant{error.Get()});
@@ -1666,7 +1701,9 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
     });
   };
 
-  const bool selection_enabled = side_chat ? static_cast<bool>(options.bring_back) : static_cast<bool>(side_service);
+  const auto bring_back = UseEnvironment<SideChatReturn>().action;
+  const bool selection_enabled = options.selection.has_value() ||
+      (part == ChatPart::Full && (side_chat ? static_cast<bool>(bring_back) : static_cast<bool>(side_service)));
   std::optional<SelectedText> selected = selection.Get();
   if (selected && (!selection_enabled || selected->text.empty() ||
       std::ranges::none_of(current->messages, [&](const Message& message) {
@@ -1675,6 +1712,16 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
       }))) {
     selected.reset();
   }
+  const bool ready_selection = selected && selected->toolbar_anchor && !selected->toolbar_anchor->pointer_selecting &&
+      range_anchor.Get() != SelectionBounds(*selected);
+  Lifecycle([binding = options.selection, conversation, snapshot, access = current->access_revision, selection, range_anchor,
+      presented = ready_selection ? selected : std::nullopt] {
+    if (binding) *binding = presented ? detail::ChatTextSelectionAccess::Bind(conversation, snapshot, access, *presented,
+        selection, range_anchor) : std::shared_ptr<const AgentChatTextSelection>{};
+  }, options.selection.has_value(), conversation, current->access_revision, range_anchor.Get(),
+     ready_selection ? std::optional{SelectionBounds(*selected)} : std::nullopt,
+     ready_selection ? selected->toolbar_anchor : std::nullopt,
+     ready_selection ? std::optional{selected->selection} : std::nullopt);
   const std::size_t earlier = current->older_history && !current->messages.empty() ? 1 : 0;
   const auto return_to_chat = [close_review, review_origin, return_focus] {
     close_review();
@@ -1688,7 +1735,6 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
   std::optional<std::size_t> summary_scroll;
   if (reviewed && reviewed->access_revision == current->access_revision && ShowsArtifact(*current, reviewed->artifact)) {
     if (options.render_artifact) review_body = options.render_artifact(*reviewed, conversation, draft_sources);
-    if (!review_body) review_body = conversation->RenderArtifact(*reviewed);
     if (!review_body) {
       const auto generic_preview = [&] {
         std::vector<View> details;
@@ -1740,8 +1786,8 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
        history_loading, history_window, loading = history_loading.Get(), theme, field_style, action_style, restore,
        can_restore = empty_draft && !recovering.Get(),
        agent_label = options.agent_label, links, selected, draft_sources, selection_focus, focus_cited_draft,
-       inline_summary = std::move(inline_summary), render_text_block = options.render_text_block,
-       activity, tool_label = options.tool_label, bubbles = layout_style.chat_bubbles, narrow = compact || side_chat](std::size_t index) -> View {
+       inline_summary = std::move(inline_summary), render_block = options.render_block,
+       activity, host_selection = options.selection.has_value(), tool_label = options.tool_label, bubbles = layout_style.chat_bubbles, narrow = compact || side_chat](std::size_t index) -> View {
     if (earlier && index == 0) {
       return ProvideEnvironment(action_style, Button(loading ? huxerui_agentkit::strings::ui_loading_earlier_messages : huxerui_agentkit::strings::ui_load_earlier_messages)
           .OnClick([history_window, history_loading, boundary = current->messages.front().sequence] {
@@ -1768,17 +1814,15 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
       }
     }
     std::optional<View> selection_actions;
-    const bool floating_actions = bubbles && selected && selected->toolbar_anchor.has_value();
-    if (!side_chat && selected && selected->source.source == SourceRef{message.ref} && range_anchor.Get() != SelectionBounds(*selected) &&
-        (!floating_actions || !selected->toolbar_anchor->pointer_selecting)) {
+    if (!host_selection && !side_chat && selected && selected->source.source == SourceRef{message.ref} &&
+        range_anchor.Get() != SelectionBounds(*selected) && (!selected->toolbar_anchor || !selected->toolbar_anchor->pointer_selecting)) {
       selection_actions = MessageSelectionActions(conversation, snapshot, *selected, selection, range_anchor, draft_sources, selection_focus,
-          focus_cited_draft, floating_actions);
+          focus_cited_draft);
     }
     auto view = MessageView(message, conversation, open_artifact, selection,
         selection_enabled && (!side_chat || message.author == MessageAuthor::Agent), steer, std::move(recover),
         std::move(selection_actions),
-        std::move(agent), theme, field_style, current->access_revision, links, inline_summary, render_text_block, bubbles, narrow,
-        floating_actions)
+        std::move(agent), theme, field_style, current->access_revision, links, inline_summary, render_block, bubbles, narrow)
         .Key(message.ref.message.value);
     if (!activity) return std::move(view).With(Padding(EdgeInsets{.top = 2.0F, .bottom = 18.0F}));
     std::vector<View> row;
@@ -1792,6 +1836,91 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
         Padding(EdgeInsets{.top = 2.0F, .bottom = 18.0F})).Key("chat-history-row/" + message.ref.message.value);
   }).EstimatedItemExtent(76.0F).Controller(history_controller).With(Grow(), ScrollBar())
       .Key("agent-chat-history");
+  auto history_view = ChatHistoryViewport(std::move(history), history_controller, current->messages.size() + earlier, selection,
+      part == ChatPart::Messages && layout_style.chat_bubbles && !side_chat, UseEnvironment<IconButtonStyle>(), theme);
+  std::optional<View> review_page;
+  AgentChatPage active_page;
+  if (focused_interaction.Get()) active_page = *focused_interaction.Get();
+  if (review_body) {
+    if (options.page) {
+      std::optional<Sequence> first;
+      if (std::ranges::find(current->artifacts, reviewed->artifact) == current->artifacts.end()) {
+        const auto source = std::ranges::find_if(current->messages, [&](const Message& message) {
+          return std::ranges::any_of(message.blocks, [&](const ContentBlock& block) {
+            const auto* artifact = std::get_if<ArtifactBlock>(&block.body);
+            return artifact && artifact->artifact == reviewed->artifact;
+          });
+        });
+        if (source != current->messages.end()) first = source->sequence;
+      }
+      active_page = AgentChatReviewRequest{reviewed->artifact, review_ticket.Get(), approval, first};
+    }
+    std::vector<View> toolbar;
+    if (!review_only)
+      toolbar.push_back(Button(huxerui_agentkit::strings::ui_back_to_conversation).OnClick(return_to_chat));
+    std::vector<View> details;
+    if (!toolbar.empty()) details.push_back(Column{ProvideEnvironment(action_style, Row(std::move(toolbar))
+        .With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)))}
+        .With(CrossAlign(CrossAxisAlignment::Stretch), LayoutPriority(4.0F)));
+    details.push_back(
+        Row{
+            Text(reviewed->name.empty() ? StringVariant{huxerui_agentkit::strings::ui_artifact} : StringVariant{reviewed->name}, TextRole::Title)
+                .Style({Font::System(compact ? 21.0F : 28.0F).WithWeight(FontWeight::SemiBold), theme.colors.on_surface})
+                .LineLimit(2).Overflow(TextOverflow::Ellipsis).With(Grow()).Key("artifact-review-title"),
+            Text(StringVariant::Format(huxerui_agentkit::strings::ui_version_0, reviewed->artifact.version), TextRole::Label)
+                .Style({Font::System(12.0F), theme.colors.on_surface_variant}).Key("artifact-review-version"),
+        }.With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center), LayoutPriority(3.0F)).Key("artifact-review-heading"));
+    if (approval) {
+      const auto item = std::ranges::find(current->interactions, approval->id, &InteractionSnapshot::id);
+      const auto* plan = item != current->interactions.end() && item->version == approval->version
+          ? ApprovalDetails(*item) : nullptr;
+      if (plan) {
+        auto attachments = VisibleApprovalAttachments(*plan, *current);
+        const auto selected = std::ranges::find(attachments, reviewed->artifact);
+        if (attachments.size() > 1 && selected != attachments.end()) {
+          const auto index = static_cast<std::size_t>(selected - attachments.begin());
+          std::vector<TabItem> tabs;
+          for (std::size_t i = 0; i < attachments.size(); ++i) {
+            auto label = options.review_attachment_label ? options.review_attachment_label(*plan, attachments[i]) : std::string{};
+            if (label.empty()) label = "Attachment " + std::to_string(i + 1);
+            tabs.push_back(TabItem(std::move(label)).Enabled(!review_loading.Get()));
+          }
+          details.push_back(ScrollView(Tabs(std::move(tabs), index).OnChanged(
+              [attachments = std::move(attachments), index, open_artifact, approval, origin = review_origin.Get()](std::size_t next) {
+                if (next < attachments.size() && next != index) open_artifact(attachments[next], approval, origin, {});
+              }).Key("review-attachments")).ScrollAxis(Axis::Horizontal).With(LayoutPriority(3.0F)));
+        }
+      }
+    }
+    if (review_loading.Get()) details.push_back(Text(huxerui_agentkit::strings::ui_opening_attachment, TextRole::Label));
+    auto body = std::move(*review_body).With(Grow());
+    if (approval) body = std::move(body).With(Frame{.min_height = 96.0F});
+    if (!review_only)
+      body = ProvideEnvironment(CitationNavigation{review_citation.Get(), review_ticket.Get()}, std::move(body));
+    details.push_back(std::move(body));
+    if (approval) {
+      details.push_back(ReviewedApproval(*current, reviewed->artifact, *approval, conversation, tasks, error,
+          review_loading.Get(), action_style, theme.colors).With(LayoutPriority(2.0F)));
+    }
+    if (!error->empty()) details.push_back(Text(error.Get(), TextRole::Label));
+    review_page = Row{Spacer(), Column(std::move(details)).With(Frame{.width = 804.0F}, Spacing(12.0F),
+        CrossAlign(CrossAxisAlignment::Stretch)).Key("artifact-review-content"), Spacer()}
+        .With(Grow(), CrossAlign(CrossAxisAlignment::Stretch), Padding(compact ? 14.0F : 24.0F),
+              Background(theme.colors.surface));
+  }
+  Lifecycle([binding = options.page, active_page] {
+    if (binding) *binding = active_page;
+  }, active_page);
+  if (options.review_only) {
+    if (review_page) return std::move(*review_page);
+    return detached_status(!error->empty() ? error.Get() : review_loading.Get() ? UseString(huxerui_agentkit::strings::ui_opening_review) : UseString(huxerui_agentkit::strings::ui_artifact_unavailable));
+  }
+  if (part == ChatPart::Messages) {
+    if (unanchored_summary) history_view = Column{std::move(history_view), std::move(*unanchored_summary)}
+        .With(Grow(), CrossAlign(CrossAxisAlignment::Stretch));
+    if (!review_page) return history_view;
+    return IndexedPages({std::move(history_view), std::move(*review_page)}, 1U).With(Grow());
+  }
   std::vector<View> notices;
   if (const auto anchor = range_anchor.Get(); anchor && (!selected || SelectionBounds(*selected) == *anchor))
     notices.push_back(ProvideEnvironment(action_style, Row{
@@ -1903,9 +2032,9 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
   }
   if (!error->empty()) notices.push_back(Text(error.Get(), TextRole::Label).Style({Font::System(12.0F), theme.colors.error}));
   std::optional<AgentChatCitation> conclusion;
-  if (side_chat && selected) conclusion = AgentChatCitation{selected->source, selected->text};
+  if (side_chat && bring_back && selected) conclusion = AgentChatCitation{selected->source, selected->text, selected->additional_sources};
   const bool returning_selection = conclusion.has_value();
-  if (!conclusion && side_chat && options.bring_back) conclusion = LastCompletedReply(current->messages);
+  if (!conclusion && side_chat && bring_back) conclusion = LastCompletedReply(current->messages);
   std::vector<View> composer;
   if (!draft_sources->attachments.empty()) composer.push_back(AgentChatAttachmentChips(draft_sources));
   if (const auto quoted = draft_sources.Get().quote) {
@@ -1916,7 +2045,8 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
           sources.quote.reset();
           draft_sources = std::move(sources);
         })}.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center), CornerRadius(5.0F),
-            Background(theme.colors.surface_container_high), Padding(EdgeInsets::Symmetric(7.0F, 0.0F)))));
+            Background(theme.colors.surface_container_high), Padding(EdgeInsets::Symmetric(7.0F, 0.0F))))
+        .Key("composer-draft-quote"));
   }
   if (const auto brought = draft_sources.Get().conclusion) {
     composer.push_back(ProvideEnvironment(action_style, Row{Text(brought->text, TextRole::Label).LineLimit(2)
@@ -1926,7 +2056,8 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
           sources.conclusion.reset();
           draft_sources = std::move(sources);
         })}.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center), CornerRadius(5.0F),
-            Background(theme.colors.surface_container_high), Padding(EdgeInsets::Symmetric(7.0F, 0.0F)))));
+            Background(theme.colors.surface_container_high), Padding(EdgeInsets::Symmetric(7.0F, 0.0F))))
+        .Key("composer-draft-conclusion"));
   }
   if (!recovered.Get().empty()) {
     std::vector<View> references;
@@ -1952,7 +2083,8 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
   }
   composer.push_back(ChatComposerInput(draft, composer_focus, composer_focused,
       side_chat ? huxerui_agentkit::strings::ui_ask_a_follow_up : huxerui_agentkit::strings::ui_send_a_message,
-      side_chat ? "side-chat-composer" : "composer", send, true, side_chat && !layout_style.chat_bubbles));
+      side_chat ? "side-chat-composer" : "composer", send, true, side_chat && !layout_style.chat_bubbles)
+      .Key("chat-composer-editor"));
   std::optional<View> run_controls;
   const bool stable_toolbar = layout_style.chat_bubbles && !side_chat;
   if (options.run_controls && options.run_controls->render) {
@@ -2007,8 +2139,8 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
   }
   if (conclusion) {
     actions.push_back(ProvideEnvironment(action_style, Button(huxerui_agentkit::strings::ui_bring_back_conclusion)
-        .OnClick([bring_back = options.bring_back, selected = std::move(*conclusion)] {
-          bring_back(selected.source, selected.text);
+        .OnClick([bring_back, selected = std::move(*conclusion)] {
+          (*bring_back)(selected);
         }).Key(returning_selection ? "side-chat-return-selection" : "side-chat-return-reply")));
   }
   auto send_style = UseEnvironment<ButtonStyle>();
@@ -2065,142 +2197,21 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
         .With(Frame{.max_height = 110.0F}, ScrollBar()));
   }
 
-  std::vector<View> heading;
-  if (!side_chat) {
-    auto title = Text(current->summary.title, TextRole::Title)
-        .Style({Font::System(layout_style.heading_size.value_or(
-                   compact ? 24.0F : viewport_class == ViewportClass::Medium ? 29.0F : 34.0F))
-                    .WithWeight(FontWeight::SemiBold), theme.colors.on_surface})
-        .LineLimit(layout_style.chat_bubbles ? 1 : 2).Overflow(TextOverflow::Ellipsis).Key("agent-chat-title");
-    if (layout_style.chat_bubbles) {
-      heading.push_back(std::move(title).With(Grow()));
-      if (current->summary.pending_interactions && !compact)
-        heading.push_back(Text(huxerui_agentkit::strings::ui_action_required, TextRole::Label).With(Foreground(theme.colors.on_surface_variant)));
-      if (options.header_actions)
-        heading.push_back(View(*options.header_actions).Key("agent-chat-header-actions"));
-    } else {
-      auto agent_name = options.agent_label ? options.agent_label(current->summary.agent) : std::string{};
-      if (agent_name.empty()) agent_name = "Assistant";
-      if (current->summary.pending_interactions) agent_name += " · Action required";
-      else if (active) agent_name += " · Running";
-      View metadata = Text(std::move(agent_name)).Style({Font::System(12.0F), theme.colors.on_surface_variant});
-      if (options.header_actions) {
-        auto actions = ProvideEnvironment(action_style, std::move(*options.header_actions)).Key("agent-chat-header-actions");
-        if (compact) {
-          metadata = Column{std::move(metadata), std::move(actions)}.With(Spacing(3.0F));
-        } else {
-          metadata = Row{std::move(metadata).With(Grow()), std::move(actions)}
-              .With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center));
-        }
-      }
-      heading.push_back(Column{std::move(title), std::move(metadata)}
-          .With(Grow(), Spacing(3.0F), CrossAlign(CrossAxisAlignment::Stretch)));
-    }
-  }
-  const auto viewport = history_controller.Metrics();
-  const bool can_jump = !current->messages.empty() && viewport.maximum_offset - viewport.offset > 24.0F;
   const bool has_notices = !notices.empty();
   std::vector<View> content;
-  if (!heading.empty()) {
-    auto title = Row(std::move(heading)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center),
-        Padding(EdgeInsets{.bottom = layout_style.chat_bubbles ? 2.0F : 18.0F})).Key("agent-chat-heading");
-    if (has_notices) title = std::move(title).With(LayoutPriority(1.0F), ClipChildren{});
-    content.push_back(std::move(title));
-  }
-  View jump = Spacer();
-  if (can_jump) {
-    jump = Row{ProvideEnvironment(compact_action, IconButton(huxerui_agentkit::images::arrow_down, huxerui_agentkit::strings::ui_jump_to_latest)
-        .OnClick([history_controller, last = current->messages.size() + earlier - 1] {
-          history_controller.ScrollToItem(last, ScrollAlignment::End);
-        }).With(Tooltip(huxerui_agentkit::strings::ui_jump_to_latest), CornerRadius(17.0F), Background(theme.colors.surface_container_high),
-            Border{theme.colors.outline}).Key("jump-to-latest"))}.With(Padding(EdgeInsets{.bottom = 8.0F}));
-  }
-  content.push_back(Stack{std::move(history), std::move(jump)}
-      .With(Grow(), Align(HorizontalAlignment::Center, VerticalAlignment::End)));
+  content.push_back(std::move(history_view));
   if (activity_access && sending.Get() && !active)
     content.push_back(ChatActivityHeader(huxerui_agentkit::strings::ui_sending_message).Key("chat-sending-message"));
   if (unanchored_summary) content.push_back(std::move(*unanchored_summary));
-  std::optional<View> review_page;
-  if (review_body) {
-    std::vector<View> toolbar{
-        options.close_review_window ? Button(huxerui_agentkit::strings::ui_close_review).OnClick(options.close_review_window) :
-            Button(huxerui_agentkit::strings::ui_back_to_conversation).OnClick(return_to_chat),
-        Spacer(),
-    };
-    if (options.open_review_window) {
-      std::optional<Sequence> first;
-      if (std::ranges::find(current->artifacts, reviewed->artifact) == current->artifacts.end()) {
-        const auto source = std::ranges::find_if(current->messages, [&](const Message& message) {
-          return std::ranges::any_of(message.blocks, [&](const ContentBlock& block) {
-            const auto* artifact = std::get_if<ArtifactBlock>(&block.body);
-            return artifact && artifact->artifact == reviewed->artifact;
-          });
-        });
-        if (source != current->messages.end()) first = source->sequence;
-      }
-      toolbar.push_back(Button(huxerui_agentkit::strings::ui_open_in_new_window).OnClick([open = options.open_review_window, error,
-          request = AgentChatReviewRequest{reviewed->artifact, review_ticket.Get(), approval, first}] {
-        try { open(request); }
-        catch (const std::exception& failure) { error = failure.what(); }
-      }).With(Enabled(!review_loading.Get())));
-    }
-    std::vector<View> details{Column{ProvideEnvironment(action_style, Row(std::move(toolbar))
-        .With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)))}
-        .With(CrossAlign(CrossAxisAlignment::Stretch), LayoutPriority(4.0F)),
-        Row{
-            Text(reviewed->name.empty() ? StringVariant{huxerui_agentkit::strings::ui_artifact} : StringVariant{reviewed->name}, TextRole::Title)
-                .Style({Font::System(compact ? 21.0F : 28.0F).WithWeight(FontWeight::SemiBold), theme.colors.on_surface})
-                .LineLimit(2).Overflow(TextOverflow::Ellipsis).With(Grow()).Key("artifact-review-title"),
-            Text(StringVariant::Format(huxerui_agentkit::strings::ui_version_0, reviewed->artifact.version), TextRole::Label)
-                .Style({Font::System(12.0F), theme.colors.on_surface_variant}).Key("artifact-review-version"),
-        }.With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center), LayoutPriority(3.0F)).Key("artifact-review-heading"),
-    };
-    if (approval) {
-      const auto item = std::ranges::find(current->interactions, approval->id, &InteractionSnapshot::id);
-      const auto* plan = item != current->interactions.end() && item->version == approval->version
-          ? ApprovalDetails(*item) : nullptr;
-      if (plan) {
-        auto attachments = VisibleApprovalAttachments(*plan, *current);
-        const auto selected = std::ranges::find(attachments, reviewed->artifact);
-        if (attachments.size() > 1 && selected != attachments.end()) {
-          const auto index = static_cast<std::size_t>(selected - attachments.begin());
-          std::vector<TabItem> tabs;
-          for (std::size_t i = 0; i < attachments.size(); ++i) {
-            auto label = options.review_attachment_label ? options.review_attachment_label(*plan, attachments[i]) : std::string{};
-            if (label.empty()) label = "Attachment " + std::to_string(i + 1);
-            tabs.push_back(TabItem(std::move(label)).Enabled(!review_loading.Get()));
-          }
-          details.push_back(ScrollView(Tabs(std::move(tabs), index).OnChanged(
-              [attachments = std::move(attachments), index, open_artifact, approval, origin = review_origin.Get()](std::size_t next) {
-                if (next < attachments.size() && next != index) open_artifact(attachments[next], approval, origin, {});
-              }).Key("review-attachments")).ScrollAxis(Axis::Horizontal).With(LayoutPriority(3.0F)));
-        }
-      }
-    }
-    if (review_loading.Get()) details.push_back(Text(huxerui_agentkit::strings::ui_opening_attachment, TextRole::Label));
-    auto body = std::move(*review_body).With(Grow());
-    if (approval) body = std::move(body).With(Frame{.min_height = 96.0F});
-    if (!review_only)
-      body = ProvideEnvironment(CitationNavigation{review_citation.Get(), review_ticket.Get()}, std::move(body));
-    details.push_back(std::move(body));
-    if (approval) {
-      details.push_back(ReviewedApproval(*current, reviewed->artifact, *approval, conversation, tasks, error,
-          review_loading.Get(), action_style, theme.colors).With(LayoutPriority(2.0F)));
-    }
-    if (!error->empty()) details.push_back(Text(error.Get(), TextRole::Label));
-    review_page = Row{Spacer(), Column(std::move(details)).With(Frame{.width = 804.0F}, Spacing(12.0F),
-        CrossAlign(CrossAxisAlignment::Stretch)).Key("artifact-review-content"), Spacer()}
-        .With(Grow(), CrossAlign(CrossAxisAlignment::Stretch), Padding(compact ? 14.0F : 24.0F),
-              Background(theme.colors.surface));
-  }
-  if (options.close_review_window) {
-    if (review_page) return std::move(*review_page);
-    return detached_status(!error->empty() ? error.Get() : review_loading.Get() ? UseString(huxerui_agentkit::strings::ui_opening_review) : UseString(huxerui_agentkit::strings::ui_artifact_unavailable));
-  }
   if (has_notices) content.push_back(Column(std::move(notices))
       .With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch), LayoutPriority(2.0F)));
   auto composer_panel = ChatComposerPanel(std::move(composer), composer_focused.Get(), layout_style.chat_bubbles, theme.colors)
       .With(composer_anchor);
+  if (part == ChatPart::Composer) {
+    if (has_notices) return Column{std::move(content.back()), std::move(composer_panel)}
+        .With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch));
+    return composer_panel;
+  }
   if (has_notices) composer_panel = std::move(composer_panel).With(LayoutPriority(3.0F));
   content.push_back(std::move(composer_panel));
   const float gutter = compact ? 14.0F : viewport_class == ViewportClass::Medium ? 21.0F : 36.0F;
@@ -2243,9 +2254,27 @@ View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions opti
         CrossAlign(CrossAxisAlignment::Stretch)), Spacer()}.With(Grow(), Padding(compact ? 14.0F : 24.0F),
               CrossAlign(CrossAxisAlignment::Stretch), Background(theme.colors.surface));
   }
+  if (options.page && options.page->Get() != active_page) {
+    review_page.reset();
+    request_page.reset();
+  }
   const auto page = review_page ? 1U : request_page ? 2U : 0U;
   return IndexedPages({std::move(chat), review_page ? std::move(*review_page) : View{Spacer()},
       request_page ? std::move(*request_page) : View{Spacer()}}, page).With(Grow());
+}
+
+View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions options) {
+  return ConversationChatView(std::move(conversation), std::move(options), ChatPart::Full);
+}
+
+View AgentChatMessages(std::shared_ptr<Conversation> conversation, std::optional<AgentChatTextSelection::Binding> selection) {
+  return ConversationChatView(std::move(conversation), {.selection = std::move(selection)}, ChatPart::Messages);
+}
+
+View AgentChatComposer(std::shared_ptr<Conversation> conversation, State<TextEditingValue> draft,
+                       std::optional<State<AgentChatDraftSources>> sources, std::optional<ViewHandle> focus) {
+  return ConversationChatView(std::move(conversation), {.draft_sources = std::move(sources), .draft = draft, .composer_focus = std::move(focus)},
+      ChatPart::Composer);
 }
 
 } // namespace huxerui::agentkit

@@ -19,6 +19,8 @@
 #include "release_workflow.h"
 #include "release_skill.h"
 #include "report_chart.h"
+#include "side_chat.h"
+#include "chat_chrome.h"
 #include "run_settings.h"
 #include "preview_settings.h"
 #include "preview_store.h"
@@ -56,7 +58,7 @@ namespace {
 using namespace std::chrono_literals;
 
 constexpr kit::AgentChatLayoutStyle preview_chat_layout{
-    .content_width = 754.0F, .heading_size = 17.0F, .chat_bubbles = true, .show_run_activity = true};
+    .content_width = 754.0F, .chat_bubbles = true, .show_run_activity = true};
 
 const kit::AgentId selection_agent{"preview.side-chat"};
 constexpr std::string_view selection_label = "Selected passage:\n";
@@ -281,6 +283,9 @@ struct PreviewService {
   std::shared_ptr<agentkit_preview::CodeWorkspaces> workspaces;
   std::shared_ptr<agentkit_preview::WorktreeForks> worktrees;
   std::optional<File> workspace_evidence;
+#ifdef __EMSCRIPTEN__
+  std::optional<File> exports;
+#endif
   std::shared_ptr<agentkit_preview::RunSettings> run_settings;
   std::optional<File> model_profiles;
   std::optional<File> settings_file;
@@ -303,6 +308,20 @@ struct PreviewService {
   std::optional<Started> startup;
   std::vector<CallbackCompletion<Started>> listeners;
 };
+
+std::optional<View> RenderPreviewBlock([[maybe_unused]] const PreviewService& service, const kit::Message& message,
+    const kit::ContentBlock& block, std::shared_ptr<kit::Conversation> conversation) {
+  if (const auto* custom = std::get_if<kit::CustomBlock>(&block.body)) {
+    if (custom->type == agentkit_preview::ReportChart)
+      return agentkit_preview::RenderReportChart({message.ref, block.id}, *custom, std::move(conversation));
+#ifdef __EMSCRIPTEN__
+    if (custom->type == agentkit_preview::BrowserPresentationExport && service.exports)
+      return agentkit_preview::RenderBrowserPresentationExport(*custom, *service.exports, service.runtime);
+#endif
+    return {};
+  }
+  return agentkit_preview::RenderCTestDiagnostics(message, block);
+}
 
 kit::Async<std::shared_ptr<kit::AgentRuntime>> WaitForRuntime(std::shared_ptr<PreviewService> service) {
   if (service->startup) co_return *service->startup;
@@ -1008,7 +1027,7 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
   Require(registered->RegisterSkillSource(agentkit_preview::PreviewSkills, agentkit_preview::MakePreviewSkills()));
   std::vector<kit::ContentTypeRef> presentation_content;
 #ifdef __EMSCRIPTEN__
-  Require(agentkit_preview::RegisterBrowserPresentationExport(registered, files.exports));
+  Require(agentkit_preview::RegisterBrowserPresentationExport(registered));
   presentation_content.push_back(agentkit_preview::BrowserPresentationExport);
 #endif
   auto general_content = presentation_content;
@@ -1077,7 +1096,7 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
                     bool review_user_comparisons = false) {
   auto service = std::make_shared<PreviewService>();
   service->run_settings = std::make_shared<agentkit_preview::RunSettings>(std::move(clock));
-  auto selection = std::make_shared<kit::AgentChatSelection>(kit::AgentChatSelection{nullptr, selection_agent});
+  auto selection = std::make_shared<agentkit_preview::PreviewSideChats>(agentkit_preview::PreviewSideChats{nullptr, selection_agent});
   context.Provide(service);
   context.Provide(std::make_shared<State<agentkit_preview::PreviewSettings>>(service->settings));
   context.Provide(selection);
@@ -1144,6 +1163,9 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
         }
         service->workspace_evidence = data.Child("workspace-evidence");
         agentkit_preview::PresentationFiles files{data.Child("presentations"), data.Child("exports"), temporary};
+#ifdef __EMSCRIPTEN__
+        service->exports = files.exports;
+#endif
         if (!co_await files.exports.CreateDirectoriesAsync()) {
           throw std::runtime_error("Could not open the presentation export directory");
         }
@@ -1639,16 +1661,31 @@ View PendingRequests(std::shared_ptr<kit::AgentRuntime> runtime, State<std::shar
       .With(Grow(), Padding(24.0F), Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
+[[huxerui::composable]]
 View PreviewConversation(kit::AgentId agent, std::shared_ptr<kit::Conversation> conversation,
-                         std::shared_ptr<kit::AgentRuntime> runtime, kit::AgentChatOptions options,
+                         std::shared_ptr<kit::AgentRuntime> runtime, kit::AgentChatOptions base_options,
                          std::optional<agentkit_preview::CodeWorkspace> workspace = {}, std::optional<File> evidence = {}) {
-  if (agent == agentkit_preview::DesignAgent)
-    return agentkit_preview::DesignChat(conversation, runtime, std::move(options), {}, std::move(evidence));
-  if (agent == agentkit_preview::CodeAgent) return agentkit_preview::CodeChat(
-      conversation, runtime, std::move(options), std::move(workspace), std::move(evidence));
-  if (agent == agentkit_preview::GeneralAgent) return agentkit_preview::GeneralChat(conversation, runtime, std::move(options));
-  if (agent == agentkit_preview::PptAgent) return agentkit_preview::PresentationChat(conversation, runtime, std::move(options));
-  return kit::AgentChat(std::move(conversation), std::move(options));
+  const auto selection = UseState(std::shared_ptr<const kit::AgentChatTextSelection>{});
+  const auto local_draft = UseState(kit::AgentChatDraftSources{});
+  const auto draft = base_options.draft_sources.value_or(local_draft);
+  const auto local_focus = UseViewHandle();
+  const auto focus = base_options.composer_focus.value_or(local_focus);
+  auto options = base_options;
+  options.selection = selection;
+  options.draft_sources = draft;
+  options.composer_focus = focus;
+  auto chat = [&]() -> View {
+    if (agent == agentkit_preview::DesignAgent)
+      return agentkit_preview::DesignChat(conversation, runtime, std::move(options), {}, std::move(evidence));
+    if (agent == agentkit_preview::CodeAgent)
+      return agentkit_preview::CodeChat(conversation, runtime, std::move(options), std::move(workspace), std::move(evidence));
+    if (agent == agentkit_preview::GeneralAgent)
+      return agentkit_preview::GeneralChat(conversation, runtime, std::move(options));
+    if (agent == agentkit_preview::PptAgent)
+      return agentkit_preview::PresentationChat(conversation, runtime, std::move(options));
+    return agentkit_preview::PreviewChat(conversation, std::move(options));
+  }();
+  return agentkit_preview::PreviewSideChatWorkspace(std::move(chat), std::move(conversation), selection, draft, focus);
 }
 
 std::optional<View> PreviewAttachmentAction(const std::shared_ptr<PreviewService>& service, const kit::AgentId& agent,
@@ -1685,7 +1722,7 @@ View DetachedArtifactReview(std::shared_ptr<kit::Conversation> conversation, std
   const auto window = UseWindow();
   const auto pages = UseState(std::move(initial_pages));
   kit::AgentChatOptions options{
-      .draft_sources = draft_sources, .review_request = std::move(request), .close_review_window = [window] { window.Close(); }};
+      .draft_sources = draft_sources, .review_request = std::move(request), .review_only = true};
   agentkit_preview::ConfigurePreviewArtifactReview(options, runtime, pages);
   const auto service = UseService<PreviewService>();
   const auto snapshot = conversation->Snapshot();
@@ -1695,8 +1732,13 @@ View DetachedArtifactReview(std::shared_ptr<kit::Conversation> conversation, std
       service ? service->settings->appearance : agentkit_preview::PreviewAppearance::Dark, UseSystemThemeBrightness()));
   auto chat = PreviewConversation(std::move(agent), std::move(conversation), std::move(runtime), std::move(options),
       std::move(workspace), service ? service->workspace_evidence : std::nullopt);
+  auto chrome = std::make_shared<const agentkit_preview::ChatHeader>(
+      [window](const kit::AgentChatPage&, std::optional<View>) -> std::optional<View> {
+        return Row{Button(::app::strings::ui_close_review).OnClick([window] { window.Close(); }), Spacer()}
+            .With(Padding(14.0F));
+      });
   return MaterialTheme(theme, ProvideEnvironment(preview_chat_layout,
-      kit::AgentChatWithSidePane(std::move(chat)).With(Background(theme.colors.surface))));
+      ProvideEnvironment(agentkit_preview::ChatChrome{std::move(chrome)}, std::move(chat).With(Background(theme.colors.surface)))));
 }
 
 WindowHandle OpenPreviewArtifactReview(const ApplicationHandle& application, std::shared_ptr<kit::Conversation> conversation,
@@ -1791,6 +1833,7 @@ View PreviewShell() {
   const auto loading_sessions = UseState(false);
   const auto pending_page = UseState(std::shared_ptr<const kit::PendingInteractionPage>{});
   const auto pending_error = UseState(std::string{});
+  const auto review_window_error = UseState(std::string{});
   const auto pending_retry = UseState(std::uint64_t{0});
   const auto navigation_open = UseState(false);
   const auto workspace_expansion = UseState(std::map<kit::WorkspaceId, bool>{});
@@ -2411,10 +2454,11 @@ View PreviewShell() {
           .recovered_references = composer.recovered,
           .draft_skills = composer.skills,
           .review_request = selection.review, .interaction_request = selection.interaction,
-          .agent_label = [resources](const kit::AgentRef& ref) { return resources->GetString(PreviewAgentLabel(ref)); },
-          .header_actions = ProvideEnvironment(conversation_action_style,
-              Row(std::move(actions)).With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Center)))};
-      options.render_text_block = agentkit_preview::RenderCTestDiagnostics;
+          .agent_label = [resources](const kit::AgentRef& ref) { return resources->GetString(PreviewAgentLabel(ref)); }};
+      options.render_block = [service](const kit::Message& message, const kit::ContentBlock& block,
+          std::shared_ptr<kit::Conversation> conversation) {
+        return RenderPreviewBlock(*service, message, block, std::move(conversation));
+      };
       options.tool_label = [resources](const kit::ToolRef& tool) -> std::string {
         using namespace agentkit_preview;
         if (tool.id == ReadCodeFiles) return resources->GetString(::app::strings::ui_activity_read_files);
@@ -2423,8 +2467,9 @@ View PreviewShell() {
         return {};
       };
       agentkit_preview::ConfigurePreviewArtifactReview(options, service->runtime, presentation_pages, open_presentation, service->workspaces);
+      std::function<void(kit::AgentChatReviewRequest)> open_review;
       if (application.SupportsMultipleWindows()) {
-        options.open_review_window = [application, runtime = service->runtime, conversation = selection.conversation,
+        open_review = [application, runtime = service->runtime, conversation = selection.conversation,
             agent, presentation_pages, draft_sources = composer.sources](kit::AgentChatReviewRequest request) {
           agentkit_preview::PresentationReviewPages initial_pages;
           const auto key = std::pair{request.artifact.id, request.artifact.version};
@@ -2433,12 +2478,54 @@ View PreviewShell() {
           OpenPreviewArtifactReview(application, conversation, runtime, agent, std::move(request), std::move(initial_pages), draft_sources);
         };
       }
+      auto chrome = std::make_shared<const agentkit_preview::ChatHeader>(
+          [actions = std::move(actions), snapshot, conversation_action_style, open_review = std::move(open_review), review_window_error](
+              const kit::AgentChatPage& page, std::optional<View> workspace_actions) -> std::optional<View> {
+            if (const auto* review = std::get_if<kit::AgentChatReviewRequest>(&page)) {
+              if (!open_review) return {};
+              std::vector<View> toolbar{Spacer(), Button(::app::strings::ui_open_in_new_window).OnClick(
+                  [open_review, review = *review, review_window_error] {
+                    try {
+                      open_review(review);
+                      review_window_error = "";
+                    } catch (const std::exception& failure) {
+                      review_window_error = failure.what();
+                    }
+                  })};
+              if (!review_window_error->empty())
+                toolbar.insert(toolbar.begin(), Text(review_window_error.Get(), TextRole::Label));
+              return Row(std::move(toolbar)).With(Padding(EdgeInsets::Symmetric(24.0F, 4.0F)));
+            }
+            if (!snapshot || !std::holds_alternative<std::monostate>(page)) return {};
+            const auto viewport = UseViewportClass();
+            const auto compact = viewport == ViewportClass::Compact;
+            const auto colors = UseTheme().colors;
+            const float gutter = compact ? 14.0F : viewport == ViewportClass::Medium ? 21.0F : 36.0F;
+            auto title = Text(snapshot->summary.title, TextRole::Title)
+                .Style({Font::System(17.0F).WithWeight(FontWeight::SemiBold), colors.on_surface})
+                .LineLimit(1).Overflow(TextOverflow::Ellipsis).Key("agent-chat-title");
+            auto buttons = actions;
+            if (workspace_actions) buttons.insert(buttons.begin(), std::move(*workspace_actions));
+            auto controls = ProvideEnvironment(conversation_action_style,
+                Row(std::move(buttons)).With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Center)))
+                .Key("agent-chat-header-actions");
+            std::vector<View> row{std::move(title).With(Grow())};
+            if (snapshot->summary.pending_interactions && !compact)
+              row.push_back(Text(::app::strings::ui_action_required, TextRole::Label).With(Foreground(colors.on_surface_variant)));
+            row.push_back(std::move(controls));
+            auto heading = Row(std::move(row)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
+            return Row{Spacer(), std::move(heading).With(Frame{.width = preview_chat_layout.content_width})
+                          .Key("agent-chat-heading"), Spacer()}
+                .With(Padding(EdgeInsets{.top = 10.0F, .right = gutter, .left = gutter}),
+                    CrossAlign(CrossAxisAlignment::Stretch));
+          });
       auto code_workspace = snapshot && snapshot->summary.workspace ? service->workspaces->Find(*snapshot->summary.workspace) : std::nullopt;
       auto chat = PreviewConversation(agent, selection.conversation, service->runtime, std::move(options),
           std::move(code_workspace), service->workspace_evidence);
       const auto run = snapshot && snapshot->summary.active_run ? snapshot->summary.run_state : std::nullopt;
       return agentkit_preview::SessionWorkspace(selection.conversation,
-          ProvideEnvironment(preview_chat_layout, kit::AgentChatWithSidePane(std::move(chat))),
+          ProvideEnvironment(preview_chat_layout,
+              ProvideEnvironment(agentkit_preview::ChatChrome{std::move(chrome)}, std::move(chat))),
           service->runtime, run,
           goal_session.Get() == selection.id, [goal_session] { goal_session = kit::SessionId{}; },
           [select_session](kit::PendingApproval approval) {

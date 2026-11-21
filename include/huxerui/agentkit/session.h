@@ -9,7 +9,6 @@
 /// submitting an approval, opening an artifact or resolving a selection.
 
 #include <huxerui/agentkit/types.h>
-#include <huxerui/view.h>
 
 namespace huxerui::agentkit {
 
@@ -1560,18 +1559,6 @@ public:
   /// appear after their read permissions have been checked.
   /// @return The latest accessible snapshot, or an empty pointer when unavailable.
   std::shared_ptr<const SessionSnapshot> Snapshot() const;
-
-  /// @brief Invokes the renderer for an authorized custom block, when registered.
-  /// @param ref Exact reference of the visible transcript block.
-  /// @param block Block data for that reference.
-  /// @return A view from the registered renderer, or an empty value if rendering is unavailable.
-  /// @note Pass the reference and block together from an authorized snapshot. Dispatched actions are revalidated.
-  std::optional<huxerui::View> RenderContent(CustomBlockRef ref, const CustomBlock& block) const;
-
-  /// @brief Invokes the renderer for an authorized artifact preview, when registered.
-  /// @param preview Data resolved by PreviewArtifactAsync().
-  /// @return The rendered view when the preview is still visible and a matching renderer handles it.
-  std::optional<huxerui::View> RenderArtifact(const ArtifactPreview& preview) const;
 
   /// @brief Validates a block version and dispatches its named registered action.
   /// @param command Stable ID for this action submission.

@@ -11,11 +11,6 @@
 
 namespace huxerui::agentkit {
 
-/// @brief Application-hook entry point for AgentKit setup.
-/// @param context Owning application context passed to the installation hook.
-/// @note The hook currently performs no registration. Register host services and create the runtime in the application scope.
-void Install(ApplicationContext& context);
-
 namespace detail { struct SideChatDrafts; }
 
 /// @brief Application service enabling quotation and side chat in AgentChat().
@@ -75,6 +70,48 @@ struct AgentChatCitation {
   std::vector<SourceSlice> additional_sources;
   /// Compares the stored fields for equality.
   bool operator==(const AgentChatCitation&) const = default;
+};
+
+namespace detail { struct ChatTextSelectionAccess; }
+
+/// @brief A completed text selection in a mounted message view.
+/// Hosts can anchor their own controls to the selection and resolve it before quoting or starting a side chat.
+class AgentChatTextSelection {
+public:
+  /// State updated by AgentChatMessages() or AgentChat(). Empty means no selection is ready to use.
+  using Binding = State<std::shared_ptr<const AgentChatTextSelection>>;
+
+  /// Mounted control containing the active end of the selection.
+  ViewHandle Anchor() const;
+
+  /// Optional caret rectangle in the anchor's local coordinates.
+  std::optional<Rect> Caret() const;
+
+  /// Whether this selection ends a range started in another message or block.
+  bool IsExtending() const;
+
+  /// Resolves the text and ordered source slices under current session permissions.
+  /// @return Display text and exact original message versions and UTF-8 ranges, or a selection error.
+  Async<AgentChatCitation> ReadAsync() const;
+
+  /// Returns display passages in reading order for a selection that has been successfully resolved.
+  std::vector<std::string> Passages() const;
+
+  /// Sets the active end as the start of an extended range, or cancels an existing range.
+  void Extend() const;
+
+  /// Clears the highlighted text and any extended range.
+  void Clear() const;
+
+  /// Restores this selection after temporary host navigation, while its source is still visible.
+  void Restore() const;
+
+private:
+  struct Data;
+  explicit AgentChatTextSelection(std::shared_ptr<const Data> data);
+
+  std::shared_ptr<const Data> data_;
+  friend struct detail::ChatTextSelectionAccess;
 };
 
 /// @brief Composer entry for an attachment staged by the host.
@@ -143,13 +180,14 @@ struct AgentChatInteractionRequest {
   bool operator==(const AgentChatInteractionRequest&) const = default;
 };
 
+/// @brief Active surface of the default conversation view.
+using AgentChatPage = std::variant<std::monostate, InteractionId, AgentChatReviewRequest>;
+
 /// @brief Optional layout and activity presentation for AgentChat().
 /// Provide it with ProvideEnvironment() around a conversation or a group of conversations.
 struct AgentChatLayoutStyle {
   /// Maximum content width in logical pixels.
   float content_width = 672.0F;
-  /// Title font size in logical pixels. Empty uses the default size.
-  std::optional<float> heading_size;
   /// Uses chat bubbles and the compact composer layout.
   bool chat_bubbles = false;
   /// Shows per-Run status, elapsed time, and collapsible activity from session events.
@@ -182,8 +220,6 @@ struct AgentChatComposerAnchor {
 struct AgentChatOptions {
   /// Returns a custom form for the snapshot, or empty to use the default form.
   std::function<std::optional<View>(const InteractionSnapshot&, std::shared_ptr<Conversation>)> render_form;
-  /// Receives a selected or complete side-chat reply and its source, for updating the originating draft.
-  std::function<void(SourceSlice, std::string)> bring_back;
   /// Optional host-owned quotation, conclusion and attachment state shared across views.
   std::optional<State<AgentChatDraftSources>> draft_sources;
   /// Returns a full review for a validated preview and its originating Conversation.
@@ -203,10 +239,10 @@ struct AgentChatOptions {
   std::function<std::optional<View>(const ArtifactPreview&, std::shared_ptr<Conversation>)> render_artifact_summary;
   /// Optional host-driven request to focus a particular pending interaction.
   std::optional<AgentChatInteractionRequest> interaction_request;
-  /// Opens a detached review while retaining its version, approval and history bindings.
-  std::function<void(AgentChatReviewRequest)> open_review_window;
-  /// Destination-specific callback for closing a detached review.
-  std::function<void()> close_review_window;
+  /// Displays the requested review on its own surface.
+  bool review_only = false;
+  /// Reports the visible chat, interaction, or review so the host can compose its own navigation.
+  std::optional<State<AgentChatPage>> page;
   /// Resolves a versioned agent reference to its visible name.
   std::function<std::string(const AgentRef&)> agent_label;
   /// Supplies a label for an artifact attached to an approval preview.
@@ -214,15 +250,15 @@ struct AgentChatOptions {
   /// Lets the host handle opening an artifact and retain optional return focus.
   /// Return true when the host consumes the navigation.
   std::function<bool(const ArtifactPreview&, std::optional<ViewHandle>)> open_artifact_review;
-  /// Extra view placed in the conversation header.
-  std::optional<View> header_actions;
   /// Optional handle for focusing the composer from the host shell.
   std::optional<ViewHandle> composer_focus;
-  /// Returns a custom view for a transcript text block, or empty for the default renderer.
-  std::function<std::optional<View>(const Message&, const ContentBlock&)> render_text_block;
+  /// Presents a block from the visible transcript, with an empty result selecting the default rendering.
+  std::function<std::optional<View>(const Message&, const ContentBlock&, std::shared_ptr<Conversation>)> render_block;
   /// Resolves an exact tool version to a display label for Run activity.
   /// An empty callback or label falls back to the tool ID.
   std::function<std::string(const ToolRef&)> tool_label;
+  /// When bound, reports selections for host-supplied controls in place of the default selection menu.
+  std::optional<AgentChatTextSelection::Binding> selection;
 };
 
 /// @brief Builds the default conversation view with history, interactions, selection and a composer.
@@ -232,11 +268,19 @@ struct AgentChatOptions {
 /// @see Conversation::ObserveAsync(), AgentChatSelection, AgentChatOptions
 View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions options = {});
 
-/// @brief Hosts side chats opened by the wrapped AgentChat or source actions in a resizable pane.
-/// @param content Primary view containing AgentChat or AgentChatSourceActions.
-/// @return A layout that shows both views on wide surfaces and switches between them on narrow surfaces.
-/// @see AgentChatSelection, AgentChatSourceActions
-View AgentChatWithSidePane(View content);
+/// @brief Builds a standalone virtualized message view and observes the conversation while it is mounted.
+/// @param conversation Open conversation whose history and selection permissions apply.
+/// @param selection Optional output for an application-owned selection menu.
+View AgentChatMessages(std::shared_ptr<Conversation> conversation,
+                       std::optional<AgentChatTextSelection::Binding> selection = {});
+
+/// @brief Builds a standalone composer with send, stop and queue controls.
+/// @param conversation Open conversation used to send the draft and observe the current Run.
+/// @param draft Host-owned text, selection and IME composition.
+/// @param sources Optional host-owned quotations, conclusions and staged attachments.
+/// @param focus Optional handle for setting editor focus.
+View AgentChatComposer(std::shared_ptr<Conversation> conversation, State<TextEditingValue> draft,
+                       std::optional<State<AgentChatDraftSources>> sources = {}, std::optional<ViewHandle> focus = {});
 
 /// @brief Builds quotation and side-chat actions for a selected artifact source.
 /// @param conversation Open conversation whose permissions apply to the source read.

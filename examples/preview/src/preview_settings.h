@@ -2,6 +2,8 @@
 
 #include "run_settings.h"
 
+#include <huxerui/theme.h>
+
 namespace agentkit_preview {
 
 enum class PreviewAppearance { Dark, Light, System };

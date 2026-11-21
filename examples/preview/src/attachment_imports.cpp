@@ -1,4 +1,5 @@
 #include <app_resources.h>
+#include <huxerui/app.h>
 
 #include "attachment_imports.h"
 

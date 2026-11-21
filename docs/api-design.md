@@ -1,6 +1,6 @@
 # Lib-AgentKit API 设计
 
-本稿定义 [Lib-AgentKit 完整版](design.md) 的 C++20 公共契约。应用通过 `HuxerUI::AgentKit` 和 `<huxerui/agentkit.h>` 接入。本文的代码块是拟定的头文件声明，按依赖顺序阅读。运行时在 HuxerUI 宿主应用内执行，模型和宿主工具可以调用外部服务。
+本稿定义 [Lib-AgentKit 完整版](design.md) 的 C++20 公共契约。应用可单独接入运行时，也可选用默认对话组件。本文的代码块是拟定的头文件声明，按依赖顺序阅读。运行时在 HuxerUI 宿主应用内执行，模型和宿主工具可以调用外部服务。
 
 相对于总体设计的示意签名，`AgentRuntime::Sessions()` 统一承担会话创建、发现、观察和历史读取。`Collaboration()` 承担会话间消息及回复。`Conversation` 绑定已经打开的会话。Preview 的默认通用助手是应用配置，创建请求始终携带明确的 `AgentId`。
 
@@ -8,11 +8,11 @@
 
 ## 库与参考应用的边界
 
-`HuxerUI::AgentKit` 是通用 Agent App 开发套件。它交付执行引擎、会话与事件契约、协议适配器和可选的默认对话组件。第三方宿主可以只接入运行时并自绘界面，也可以直接使用 `AgentChat`。库的公开 API、构建和默认行为独立于 Preview 的助手、配置及资源。
+`HuxerUI::AgentKit` 是通用 Agent App 开发套件。它交付执行引擎、会话与事件契约、协议适配器和可选的默认对话组件。自绘界面的宿主可包含 `<huxerui/agentkit/runtime.h>` 并链接 `HuxerUI::AgentKitRuntime`。通过 `add_subdirectory` 接入时，可以设置 `HUXERUI_AGENTKIT_BUILD_VIEWS=OFF`，此时不构建对话组件，也不获取 Lib-Markdown。运行时仍使用 HuxerUI SDK 的应用级任务作用域。需要默认对话组件时，包含 `<huxerui/agentkit.h>` 并链接 `HuxerUI::AgentKit`。库的公开 API、构建和默认行为独立于 Preview 的助手、配置及资源。
 
 `examples/preview` 是消费公开 API 的参考应用。应用负责工作台及其主题、导航和设置，注册代码、PPT、设计与通用助手，选择模型与凭据存储、授权范围及本地存储方案。补丁、Git、CTest、PPTX、设计画板和发布协作由 Preview 的工作流、工具及视图实现。其他宿主按自己的业务注册同类扩展。
 
-Run 状态、耗时、工具记录和提供方公开摘要属于会话事件。使用默认对话的宿主可通过 `AgentChatLayoutStyle` 选择布局和活动区，通过 `AgentChatOptions::tool_label` 提供工具显示名，通过 `AgentChatWithSidePane` 把旁聊放在相邻面板。自定义输入控件可以使用 `AgentChatComposerAnchor` 附着浮层。自绘聊天界面的宿主可直接订阅 `Conversation::ObserveEventsAsync`，在无聊天页的业务流程中也可使用相同的 Run 和权限语义。
+Run 状态、耗时、工具记录和提供方公开摘要属于会话事件。使用默认对话的宿主可通过 `AgentChatLayoutStyle` 选择布局和活动区，通过 `AgentChatOptions::tool_label` 提供工具显示名，也可分别挂载 `AgentChatMessages` 和 `AgentChatComposer`。Preview 在应用层组合这些视图，并自行布局旁聊面板。自定义输入控件可以使用 `AgentChatComposerAnchor` 附着浮层。自绘聊天界面的宿主可直接订阅 `Conversation::ObserveEventsAsync`，在无聊天页的业务流程中也可使用相同的 Run 和权限语义。
 
 逐文件差异的视图与具体补丁格式由宿主提供。库通过版本化产物和审批接口提供访问及执行约束。第三方宿主验收检查独立接入，Preview 验收检查参考应用自己的设置、渲染及跨领域流程。
 
@@ -590,7 +590,7 @@ Preview 在窗口内按已授权的 `WorkspaceId` 保留未发送的新建草稿
 - 右键、行尾入口和键盘使用相同的会话操作。重命名和删除分别经 `UpdateMetadataAsync` 提交 `RenameSession` 或 `DeleteSession`，使用当前 `metadata_revision`。删除活动会话返回 `Busy`，由用户停止或等待。提交后刷新目录与归类。文件、已导出产物及工作区目录由宿主的独立操作管理。
 - 统一待办通过 `Interactions().ObservePendingAsync` 观察当前身份可处理的请求。侧栏显示同一投影中的待办数量，仍有下一页时使用 `50+` 等总数下界。打开待办页可继续分页，订阅失败时可在该页重试。宿主用返回的 `SessionId` 打开会话，将 `InteractionId` 和本次打开的序号作为 `AgentChatOptions::interaction_request`（`AgentChatInteractionRequest`）传入。`AgentChat` 从该会话快照定位请求，使用最新版本渲染表单或审批。序号变化允许再次打开同一请求。请求已处理时展示关闭状态和仍可见的审批预览。点击返回后保留对话草稿。
 - 短报告在消息中展开。长差异、幻灯片和设计稿由同窗口审阅页呈现。宿主用会话 ID 和原消息位置保存返回锚点，用 `ArtifactRef` 及文件、页或节点 ID 保存审阅位置。独立窗口采用同一只读预览引用和会话订阅。审批从该会话的最新 `InteractionSnapshot` 取得 ID 与版本，经 `SubmitAsync` 提交。另一个窗口已处理请求或计划换版后刷新状态，保留获准查看的原预览。
-- 从审批附件进入审阅时，`AgentChatReviewRequest` 同时带 `ArtifactRef` 和 `AgentChatApprovalRef`（交互 ID 与版本）。界面依据最新快照判断该绑定是否仍可提交，提交时沿用已审阅的版本。宿主在支持多窗口的平台通过 `AgentChatOptions::open_review_window` 接收此请求，用同一会话和请求构建独立审阅页，并提供 `close_review_window`。从继承历史打开附件时可携带 `history_first`，使独立窗口按原消息位置取得获授权的投影。PPT 页码或设计节点随打开请求传入，各窗口各自保存后续选中位置。各入口的引用和旁聊结论进入同一会话草稿。预览授权撤回后停止显示对应内容。
+- 从审批附件进入审阅时，`AgentChatReviewRequest` 同时带 `ArtifactRef` 和 `AgentChatApprovalRef`（交互 ID 与版本）。界面依据最新快照判断该绑定是否仍可提交，提交时沿用已审阅的版本。宿主可通过 `AgentChatOptions::page` 获得当前审阅及其版本绑定，并用同一会话和请求构建独立审阅页。设置 `review_only` 可显示单独的审阅内容。宿主负责打开和关闭窗口。从继承历史打开附件时可携带 `history_first`，使独立窗口按原消息位置取得获授权的投影。PPT 页码或设计节点随打开请求传入，各窗口各自保存后续选中位置。各入口的引用和旁聊结论进入同一会话草稿。预览授权撤回后停止显示对应内容。
 
 ### 复制会话与 worktree
 
@@ -986,8 +986,6 @@ public:
   Async<CommandReceipt> WithdrawQueuedInputAsync(CommandId command, QueueItemId item);
   Async<Receipt<InteractionConsumed>> SubmitAsync(CommandId command, InteractionReply reply);
   Async<CommandReceipt> DispatchContentActionAsync(CommandId command, CustomBlockAction action);
-  std::optional<huxerui::View> RenderContent(CustomBlockRef ref, const CustomBlock& block) const;
-  std::optional<huxerui::View> RenderArtifact(const ArtifactPreview& preview) const;
   Async<Receipt<RunAccepted>> DispatchArtifactActionAsync(CommandId command, ArtifactAction action);
   Async<CommandReceipt> CancelAsync(CommandId command, RunId run);
   Async<Receipt<RunAccepted>> RetryAsync(CommandId command, RunId source);
@@ -1031,9 +1029,10 @@ struct AgentChatInteractionRequest {
   std::uint64_t ticket;
 };
 
+using AgentChatPage = std::variant<std::monostate, InteractionId, AgentChatReviewRequest>;
+
 struct AgentChatOptions {
   std::function<std::optional<huxerui::View>(const InteractionSnapshot&, std::shared_ptr<Conversation>)> render_form;
-  std::function<void(SourceSlice, std::string)> bring_back;
   std::optional<huxerui::State<AgentChatDraftSources>> draft_sources;
   std::function<std::optional<huxerui::View>(const ArtifactPreview&, std::shared_ptr<Conversation>,
       huxerui::State<AgentChatDraftSources>)> render_artifact;
@@ -1044,14 +1043,15 @@ struct AgentChatOptions {
   std::optional<AgentChatReviewRequest> review_request;
   std::function<std::optional<huxerui::View>(const ArtifactPreview&, std::shared_ptr<Conversation>)> render_artifact_summary;
   std::optional<AgentChatInteractionRequest> interaction_request;
-  std::function<void(AgentChatReviewRequest)> open_review_window;
-  std::function<void()> close_review_window;
+  bool review_only = false;
+  std::optional<huxerui::State<AgentChatPage>> page;
   std::function<std::string(const AgentRef&)> agent_label;
   std::function<std::string(const ApprovalPreview&, const ArtifactRef&)> review_attachment_label;
   std::function<bool(const ArtifactPreview&, std::optional<huxerui::ViewHandle>)> open_artifact_review;
-  std::optional<huxerui::View> header_actions;
   std::optional<huxerui::ViewHandle> composer_focus;
-  std::function<std::optional<huxerui::View>(const Message&, const ContentBlock&)> render_text_block;
+  std::function<std::optional<huxerui::View>(const Message&, const ContentBlock&, std::shared_ptr<Conversation>)> render_block;
+  std::function<std::string(const ToolRef&)> tool_label;
+  std::optional<AgentChatTextSelection::Binding> selection;
 };
 
 huxerui::View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions options = {});
@@ -1073,13 +1073,15 @@ struct AgentChatLinkHandler {
 };
 ```
 
+`AgentChat` 提供默认组合。需要自定义页面的宿主可分别挂载 `AgentChatMessages(conversation, selection)` 和 `AgentChatComposer(conversation, draft)`。消息视图观察会话和历史，输入框持有发送、排队及停止入口。宿主通过同一个选区绑定取得挂载锚点和光标位置，在点击菜单操作后调用 `ReadAsync` 重新校验权限，取回原消息版本及有序的 UTF-8 切片。Preview 自行渲染选区菜单、切换旁聊面板，并把选中的结论写回主会话草稿。
+
 `AgentChatOptions::render_form` 接收可见的待处理表单快照和当前 `Conversation`。宿主可通过 `FormRequest::presentation` 选择大纲编辑器等业务组件，组件用交互 ID 和版本提交 `SubmitAsync`。表单数据校验、权限和状态流转由运行时处理。
 
-`render_artifact` 接收当前会话已授权的产物预览和主输入框的引用状态。返回视图时在同窗口显示审阅页。普通产物也可由 `render_artifact_summary` 提供概要视图，可回退到通用预览。概要展开在发起操作的消息卡片下方，位置绑定 `MessageId`、`BlockId` 和确切的 `ArtifactRef`。收起概要后恢复原卡片焦点，主输入草稿继续保留。通过宿主直接打开概要时，定位到当前历史投影中带该版本的卡片。没有对应卡片时可在会话中独立显示概要。审批和独立窗口使用完整审阅入口。宿主通过会话导航打开目标会话，以 `review_request` 请求读取确切的产物版本。挂载中的会话视图对同一请求执行一次，重复导航使用新票据。界面经 `PreviewArtifactAsync` 复核目标。`AgentChatSourceActions` 查询选区并提供旁聊和引用动作，`AgentChatArtifactText` 从单个稳定的产物片段提取选区。引用和旁聊结论通过 `draft_sources` 或 `bring_back` 交回主输入框。
+`render_artifact` 接收当前会话已授权的产物预览和主输入框的引用状态。返回视图时在同窗口显示审阅页。普通产物也可由 `render_artifact_summary` 提供概要视图，可回退到通用预览。概要展开在发起操作的消息卡片下方，位置绑定 `MessageId`、`BlockId` 和确切的 `ArtifactRef`。收起概要后恢复原卡片焦点，主输入草稿继续保留。通过宿主直接打开概要时，定位到当前历史投影中带该版本的卡片。没有对应卡片时可在会话中独立显示概要。审批和独立窗口使用完整审阅入口。宿主通过会话导航打开目标会话，以 `review_request` 请求读取确切的产物版本。挂载中的会话视图对同一请求执行一次，重复导航使用新票据。界面经 `PreviewArtifactAsync` 复核目标。`AgentChatSourceActions` 查询选区并提供旁聊和引用动作，`AgentChatArtifactText` 从单个稳定的产物片段提取选区。引用和旁聊结论写入宿主的 `draft_sources`。
 
 从消息引用或带回结论后，焦点进入源会话草稿。从同窗口审阅页执行这些动作时先返回对话，保留原审阅版本和位置。独立审阅窗口保持在原处，源会话草稿可观察到已添加的内容。自定义审阅视图可传入 `on_citation_added`，它在引用加入草稿后调用。旁聊带回结论时先关闭弹窗，再调用回调。取消或普通关闭旁聊恢复原选区及动作焦点。
 
-`render_text_block` 可为当前授权投影中的 `TextBlock` 提供自定义视图。宿主在 UI 线程同步借用消息及正文块，返回空值时沿用默认渲染与选区交互。自定义视图按原消息块 ID 挂载，正文、版本与运行时选区契约保持原样。
+`render_block` 接收已授权投影中的消息、块和所属会话。宿主可为 `TextBlock` 或业务 `CustomBlock` 提供同步渲染，返回空值时沿用默认渲染。自定义视图按原消息块 ID 挂载，动作通过会话接口按源版本提交。
 
 在对话内打开普通产物时，`open_artifact_review` 可以接管审阅导航。`AgentChat` 校验会话、产物版本、访问修订和可见性后传入预览及可选的触发控件，返回 `true` 由宿主显示自己的审阅页，返回 `false` 继续使用 `render_artifact` 和通用审阅。宿主按访问修订停止展示失权的预览，返回时恢复原对话与触发控件焦点。审批附件及独立审阅窗口沿用已有的版本绑定流程。Preview 的设计助手通过该回调打开可选择节点的设计审阅。
 
@@ -1087,7 +1089,7 @@ struct AgentChatLinkHandler {
 
 `agent_label` 可提供助手的本地化显示名称。会话标题下方用当前会话绑定，消息署名用该消息所属 Run 的助手版本。宿主未提供名称，或继承的消息没有可见的 Run 时，使用默认的 `Assistant` 署名。
 
-`header_actions` 用于当前会话的宿主操作，例如打开工作区文件或核对待确认的补丁。控件随对话标题对齐，宽窗和助手名称同一行，窄窗移到下一行。审阅页、待处理请求页和旁聊有各自的上下文与操作入口。
+标题栏和宿主操作由应用绘制。Preview 根据 `AgentChatPage` 在对话、待处理请求和独立审阅之间切换标题栏与页面动作，工作区文件等入口跟随应用布局。
 
 `composer_focus` 允许宿主把本会话输入框作为对话框的初始焦点或键盘操作的焦点目标。默认旁聊使用同一个目标从首个问题切换到追问编辑器。窗口高度受限时，待审批对话优先为输入框和审批操作分配空间，计划详情可滚动。进入带审批的审阅页后，审阅内容和决定操作分别保留空间。
 
@@ -2630,19 +2632,6 @@ struct ArtifactActionRegistration {
   JsonSchema payload_schema;
   ArtifactActionHandler prepare;
 };
-using RenderAction = std::variant<InteractionReply, ArtifactAction, CustomBlockAction>;
-
-template<class T>
-struct RenderInput {
-  std::shared_ptr<const T> value;
-  std::optional<CustomBlockRef> origin;
-  std::function<Async<CommandReceipt>(CommandId, RenderAction)> dispatch;
-  std::vector<InteractionSnapshot> interactions;
-};
-
-using ContentRenderer = std::function<huxerui::View(RenderInput<CustomBlock>)>;
-using ArtifactRenderer = std::function<huxerui::View(RenderInput<ArtifactPreview>)>;
-
 struct ContentActionContext {
   ActionParty actor;
   CommandId command;
@@ -2662,7 +2651,6 @@ struct ContentActionRegistration {
 struct ContentComponentRegistration {
   ContentTypeRef type;
   JsonSchema data_schema;
-  ContentRenderer render;
   std::vector<ContentActionRegistration> actions;
 };
 
@@ -2702,7 +2690,6 @@ public:
   AgentResult<void> RegisterSkillSource(SkillSourceId id, std::shared_ptr<SkillSource> source);
   AgentResult<void> RegisterAgent(AgentRegistration agent);
   AgentResult<void> RegisterContentComponent(ContentComponentRegistration component);
-  AgentResult<void> RegisterArtifactRenderer(std::string type, ArtifactRenderer renderer);
   AgentResult<void> RegisterArtifactAction(ArtifactActionRegistration action);
   AgentResult<void> ValidateRegistration() const;
 
@@ -2754,13 +2741,11 @@ public:
 
 `ToolExecutionResult::blocks` 可以提交 `CustomBlock`。使用模型结构化输出的宿主 `RunHandler` 通过登记的工具提交相同内容块。执行器提交前核对 Agent 的类型声明、类型版本、数据 schema、引用和大小。块中显式携带的产物引用须已登记，本次另行提交的草稿通过产物交付结果获取引用。未授权类型返回 `PermissionDenied`，非法数据返回 `InvalidArgument` 及字段错误，已发生的工具效果继续记录。持久记录保存类型、schema 版本、数据和纯文本回退，以及关联的交互和产物引用。旧消息缺少对应版本的渲染器时显示回退文本。运行时用 `MessageRef` 和 `BlockId` 标定完整消息中的组件，渲染器收到不可变投影及绑定的动作入口。饼图的图例筛选和 hover 等仅改变视图的操作由宿主组件处理。
 
-`RenderContent` 接收当前会话可见投影中的块和来源引用，提供调用已注册渲染器的同步入口。默认 `AgentChat` 通过同一入口展示自定义块。组件数据以 UTF-8 JSON 保存，每块上限 256 KiB。纯文本回退须非空，最多 4096 字节，组件最多各绑定 64 个交互和产物。空块 ID 由运行时分配。产物访问撤销后，新快照和历史页隐藏依赖该版本的组件。分叉继续核对原产物版本和目标上下文授权，源会话的交互绑定留在原会话。
+运行时登记自定义块的类型、数据 schema 和可提交的动作。宿主从可见消息投影读取业务数据和来源引用，并选择自己的渲染器。组件数据以 UTF-8 JSON 保存，每块上限 256 KiB。纯文本回退须非空，最多 4096 字节，组件最多各绑定 64 个交互和产物。空块 ID 由运行时分配。产物访问撤销后，新快照和历史页隐藏依赖该版本的组件。分叉继续核对原产物版本和目标上下文授权，源会话的交互绑定留在原会话。
 
-`RenderInput::interactions` 提供该消息版本和块绑定的交互快照，仅包含当前会话内、当前用户接收的交互。渲染器可用交互状态显示可用动作，提交时带呈现的版本，运行时按当前状态和权限复核。产物渲染和继承的历史组件投影不附带这些快照。
+宿主从会话快照读取当前用户可见的交互，并与 `CustomBlock::interactions` 匹配。提交动作时仍需携带呈现的版本。产物审阅通过 `Conversation::PreviewArtifactAsync` 获得授权后的指定版本，预览包含名称、类型和当前访问修订。宿主按产物类型选择渲染，动作走 `DispatchArtifactActionAsync`。默认对话组件可以接收宿主的产物渲染回调，并提供通用预览。
 
-宿主启动前用 `RegisterArtifactRenderer` 按产物类型登记渲染器，重复登记返回 `Conflict`。`Conversation::PreviewArtifactAsync` 读取指定版本，在权限复查后从产物记录填入 `name` 和 `type`，并附上运行时的 `access_revision`。`RenderArtifact` 接收同一会话取得的预览，核对可见引用与访问修订后调用注册的渲染器，未匹配时返回空。`AgentChat` 在审阅页并列显示名称和版本，并优先使用宿主显式提供的审阅视图，再使用注册的产物渲染器和通用预览。授权刷新后关闭持有旧访问修订的审阅，重新打开时重新授权。渲染器动作只接受该 `ArtifactRef` 的 `ArtifactAction`，下游动作仍按当前授权校验。
-
-`CustomBlockAction` 可由默认渲染入口或自定义宿主调用 `Conversation::DispatchContentActionAsync`。组件渲染器的 `RenderInput::dispatch` 接收与该 `CustomBlockRef` 匹配的 `CustomBlockAction`。运行时先按当前会话读取权限和 `UseContentAction` 检查主体，再核对完整消息的版本、块、动作 ID 及 payload，随后调用宿主的准备处理器。处理器读取已授权的组件数据，返回用户输入、调整指定活动 Run 的请求、已有交互回复或产物动作。实际提交复用触发目标的授权、版本检查和审批。工具或宿主发布时声明该块可访问的交互及产物引用。运行时核对它们的可见性和归属，实际动作只能使用这些绑定。对活动 Run 的调整须满足该会话现有的 `SteerAsync` 约束。响应表单的操作经 `SubmitAsync`，工具副作用由对应 Run 中的宿主编排通过原工具入口执行。例如，导出卡片可提交绑定到导出表单的决定，随后由等待该决定的 Run 准备并审批导出工具。
+宿主使用与所显示区块匹配的 `CustomBlockRef` 构造 `CustomBlockAction`，并调用 `Conversation::DispatchContentActionAsync`。运行时先按当前会话读取权限和 `UseContentAction` 检查主体，再核对完整消息的版本、块、动作 ID 及 payload，随后调用宿主的准备处理器。处理器读取已授权的组件数据，返回用户输入、调整指定活动 Run 的请求、已有交互回复或产物动作。实际提交复用触发目标的授权、版本检查和审批。工具或宿主发布时声明该块可访问的交互及产物引用。运行时核对它们的可见性和归属，实际动作只能使用这些绑定。对活动 Run 的调整须满足该会话现有的 `SteerAsync` 约束。响应表单的操作经 `SubmitAsync`，工具副作用由对应 Run 中的宿主编排通过原工具入口执行。例如，导出卡片可提交绑定到导出表单的决定，随后由等待该决定的 Run 准备并审批导出工具。
 
 策略回调通过 `PolicyRequest::content_action`、`artifact_action` 和 `target.interaction` 识别本次动作及下游目标。产物动作启动任务时只接受该版本的资料引用。组件启动或补充任务时，可引用自身消息及组件绑定的产物。会话公开回执携带初始受理标记或待批准交互。已受理后的实际 Run、补充消息和表单消费记录从原命令进度读取。
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <huxerui/agentkit/runtime.h>
+#include <huxerui/view.h>
 
 namespace agentkit_preview {
 inline const huxerui::agentkit::ToolId RunCodeTests{"preview.code.ctest"};

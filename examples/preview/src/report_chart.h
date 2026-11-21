@@ -10,6 +10,9 @@ inline const huxerui::agentkit::ToolId PublishReportChart{"preview.report.chart.
 inline const huxerui::agentkit::ToolId ExportReportChart{"preview.report.chart.export"};
 inline constexpr std::string_view ReportChartStage = "report-chart";
 
+huxerui::View RenderReportChart(huxerui::agentkit::CustomBlockRef origin, const huxerui::agentkit::CustomBlock& block,
+                              std::shared_ptr<huxerui::agentkit::Conversation> conversation);
+
 huxerui::agentkit::AgentResult<void> RegisterReportChart(
     const std::shared_ptr<huxerui::agentkit::AgentRuntime>& runtime, huxerui::File exports);
 huxerui::agentkit::ToolResourceResolver ReportChartResources(huxerui::File exports);

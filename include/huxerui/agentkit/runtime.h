@@ -14,7 +14,6 @@
 #include <huxerui/agentkit/project.h>
 #include <huxerui/agentkit/goals.h>
 #include <huxerui/agentkit/skill.h>
-#include <huxerui/app.h>
 
 namespace huxerui::agentkit {
 
@@ -307,28 +306,6 @@ struct WorkspaceRequest {
 /// @brief Resolves or allocates a workspace for a session operation. Success with an empty value leaves it unbound.
 using WorkspaceResolver = std::function<Async<std::optional<WorkspaceId>>(WorkspaceRequest)>;
 
-/// @brief Supported actions that a rendered component can dispatch through the bound conversation.
-using RenderAction = std::variant<InteractionReply, ArtifactAction, CustomBlockAction>;
-
-/// @brief Immutable render payload with action dispatch and currently visible interactions.
-/// @tparam T CustomBlock or ArtifactPreview.
-template<class T>
-struct RenderInput {
-  /// Shared content or artifact preview supplied to the renderer.
-  std::shared_ptr<const T> value;
-  /// Specific message block binding, when rendering custom transcript content.
-  std::optional<CustomBlockRef> origin;
-  /// Submits an action under a caller-supplied command ID.
-  std::function<Async<CommandReceipt>(CommandId, RenderAction)> dispatch;
-  /// Visible interactions associated with the render input.
-  std::vector<InteractionSnapshot> interactions;
-};
-
-/// @brief Host callback building a View for a registered custom message block.
-using ContentRenderer = std::function<huxerui::View(RenderInput<CustomBlock>)>;
-/// @brief Host callback building a View for an authorized artifact preview.
-using ArtifactRenderer = std::function<huxerui::View(RenderInput<ArtifactPreview>)>;
-
 /// @brief Authorized context for preparing a registered message-component action.
 struct ContentActionContext {
   /// User invoking the component action.
@@ -356,15 +333,13 @@ struct ContentActionRegistration {
   ContentActionHandler prepare;
 };
 
-/// @brief Validation, rendering and action bindings for one custom message type version.
+/// @brief Schema and actions for one version of a custom message type.
 struct ContentComponentRegistration {
   /// Registered ContentTypeRef for custom blocks.
   ContentTypeRef type;
   /// Schema for values of this block type.
   JsonSchema data_schema;
-  /// Host renderer for matching visible blocks, when provided.
-  ContentRenderer render;
-  /// Actions exposed to the renderer and validated on dispatch.
+  /// Named actions validated on dispatch.
   std::vector<ContentActionRegistration> actions;
 };
 
@@ -495,11 +470,6 @@ public:
   /// @brief Registers schemas, rendering and actions for a custom transcript type and version.
   /// @param component Versioned block schema, renderer and action handlers.
   AgentResult<void> RegisterContentComponent(ContentComponentRegistration component);
-
-  /// @brief Registers a renderer keyed by artifact metadata type.
-  /// @param type Artifact metadata type routed to this renderer.
-  /// @param renderer Host callback building a view from a resolved preview.
-  AgentResult<void> RegisterArtifactRenderer(std::string type, ArtifactRenderer renderer);
 
   /// @brief Registers a version-aware action for an artifact type.
   /// @param action Artifact type, action name, payload schema and input preparation callback.

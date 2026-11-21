@@ -1,3 +1,5 @@
+#include "chat_chrome.h"
+#include "side_chat.h"
 #include <app_resources.h>
 
 #include "design.h"
@@ -85,7 +87,7 @@ View ReviewDesignImpact(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_
   if (target->part) initial.emplace(std::pair{target->artifact.id, target->artifact.version}, *target->part);
   const auto pages = UseState(std::move(initial));
   kit::AgentChatOptions options{
-      .review_request = kit::AgentChatReviewRequest{target->artifact, 1}, .close_review_window = std::move(close)};
+      .review_request = kit::AgentChatReviewRequest{target->artifact, 1}, .review_only = true};
   ConfigurePreviewArtifactReview(options, runtime, pages);
   if (target->diff) {
     options.render_artifact = [target](const kit::ArtifactPreview& preview, std::shared_ptr<kit::Conversation>,
@@ -94,7 +96,11 @@ View ReviewDesignImpact(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_
       return AppliedFileDiff(target->artifact, *target->part, *target->diff);
     };
   }
-  return kit::AgentChat(target->owner, std::move(options));
+  auto chrome = std::make_shared<const ChatHeader>(
+      [close = std::move(close)](const kit::AgentChatPage&, std::optional<View>) -> std::optional<View> {
+        return Row{Button(::app::strings::ui_close_review).OnClick(close), Spacer()}.With(Padding(14.0F));
+      });
+  return ProvideEnvironment(ChatChrome{std::move(chrome)}, PreviewChat(target->owner, std::move(options)));
 }
 
 } // namespace
@@ -457,7 +463,7 @@ View DesignChat(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr
     if (auto design = RenderDesignArtifact(item)) return design;
     return fallback ? fallback(item, std::move(session), draft) : std::nullopt;
   };
-  if (options.close_review_window) return kit::AgentChat(conversation, std::move(options));
+  if (options.review_only) return PreviewChat(conversation, std::move(options));
   options.open_artifact_review = [show_published, source_focus, request_id, impact, impact_message,
       fallback = base_options.open_artifact_review](const kit::ArtifactPreview& item, std::optional<ViewHandle> origin) {
     if (item.type != DesignArtifactType) return fallback && fallback(item, std::move(origin));
@@ -501,7 +507,7 @@ View DesignChat(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr
         open(current);
       }));
   if (!error->empty()) conversation_page.push_back(Text(error.Get(), TextRole::Label));
-  conversation_page.push_back(kit::AgentChat(conversation, std::move(options)).With(Grow()));
+  conversation_page.push_back(PreviewChat(conversation, std::move(options)).With(Grow()));
   const auto select = [selected, review_nodes, artifact = review->artifact, impact, impact_message, request_id](std::string id) {
     request_id += 1;
     if (artifact) {
@@ -522,7 +528,7 @@ View DesignChat(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr
       close();
       return_focus = composer_focus;
     };
-    source_actions = kit::AgentChatSourceActions(conversation, std::move(source), draft_sources, std::move(return_to_draft))
+    source_actions = PreviewSourceActions(conversation, std::move(source), draft_sources, std::move(return_to_draft))
         .Key(review->artifact->id.value + "/" + std::to_string(review->artifact->version) + "/" + selected.Get());
   }
   std::function<void()> restore;

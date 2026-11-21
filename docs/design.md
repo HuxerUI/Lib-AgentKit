@@ -140,11 +140,11 @@ Run 的状态为 `Running`、`WaitingForInput`、`WaitingForReply`、`WaitingFor
 
 ### 第三方注册与策略
 
-第三方应用链接 `HuxerUI::AgentKit`，在应用级服务初始化时建立 `AgentRuntime`。用 `RegisterModel`、`RegisterContextProvider` 和 `RegisterTool` 登记模型、上下文和业务工具，可用 `RegisterToolCatalog` 登记动态目录，再用 `RegisterAgent` 组装一个专用或通用角色。注册使用带宿主命名空间的稳定 ID。工具定义携带版本、参数和输出 schema、效果、准备与执行处理器。Agent 定义以 ID 引用这些注册项，并声明协作对象及可用操作。注册时校验重复 ID 和定义格式。启用角色前统一校验注册项引用、协作对象和所需的模型能力，支持应用先登记相互协作的多个角色。宿主也可以把自己的配置文件解析为这些定义。
+第三方应用链接 `HuxerUI::AgentKitRuntime` 或带默认视图的 `HuxerUI::AgentKit`，在应用级服务初始化时建立 `AgentRuntime`。用 `RegisterModel`、`RegisterContextProvider` 和 `RegisterTool` 登记模型、上下文和业务工具，可用 `RegisterToolCatalog` 登记动态目录，再用 `RegisterAgent` 组装一个专用或通用角色。注册使用带宿主命名空间的稳定 ID。工具定义携带版本、参数和输出 schema、效果、准备与执行处理器。Agent 定义以 ID 引用这些注册项，并声明协作对象及可用操作。注册时校验重复 ID 和定义格式。启用角色前统一校验注册项引用、协作对象和所需的模型能力，支持应用先登记相互协作的多个角色。宿主也可以把自己的配置文件解析为这些定义。
 
 宿主用 `AgentRuntime::Create(RuntimeOptions)` 建立运行时。通过 `RegisterAgent` 登记 `AgentRegistration`，再用 `ValidateRegistration()` 校验引用关系，`StartAsync()` 成功后开放会话入口。注册使用 `ModelId`、`ContextProviderId` 等明确的 ID 类型。权限策略由 `RuntimeOptions` 接入，并由执行器在运行时调用。配置至少明确哪些主体和 Agent 能读哪些资源、能调用哪些工具、能发现或联系哪些会话、能否唤醒接收方，以及哪些目标需要用户确认。工具、协作和项目能力取定义声明、当前用户授权和宿主策略的交集。工具策略按实际参数、效果和目标返回允许、拒绝或要求用户确认。已准备的工具计划也可由策略交给宿主审查。接收侧独立检查自己的项目权限和资源版本。
 
-启动后，宿主通过 `Sessions().CreateAsync` 提交会话选项，取得 `SessionCreated` 后通过 `Sessions().OpenAsync` 打开 `Conversation`，供 `AgentChat` 或子组件使用。业务渲染器通过 `RegisterContentComponent` 和 `RegisterArtifactRenderer` 按类型注册，也可由宿主提供自己的组件。新增领域可复用已有会话、审批、项目依赖和产物机制，通过新的工具、上下文、编排及渲染接入。
+启动后，宿主通过 `Sessions().CreateAsync` 提交会话选项，取得 `SessionCreated` 后通过 `Sessions().OpenAsync` 打开 `Conversation`，供 `AgentChat` 或子组件使用。运行时通过 `RegisterContentComponent` 登记组件的 schema 和动作。宿主根据可见消息和产物预览选择业务界面。新增领域可复用已有会话、审批、项目依赖和产物机制，通过新的工具、上下文、编排及渲染接入。
 
 ### 模型轮次与宿主编排
 
@@ -380,7 +380,7 @@ Preview 在验证报告的原位概要中提供「查找受影响的幻灯片」
 
 ## 构建与平台交付
 
-库以 `Lib-AgentKit` 独立发布，公共命名空间为 `huxerui::agentkit`，入口头文件为 `<huxerui/agentkit.h>`。应用通过 `HuxerUI::AgentKit` 静态库目标接入。会话与执行、UI、协议适配器分开组织公开头文件。提供商与外部协议适配器按需启用，库内复用一个私有 JSON 编解码实现。默认 UI 使用本地会话，模型可由宿主配置为本地或云端提供商。库通过公开 SDK 构建，带 composable 标记的实现交给现有 codegen。
+库以 `Lib-AgentKit` 独立发布，公共命名空间为 `huxerui::agentkit`，入口头文件为 `<huxerui/agentkit.h>`。应用可独立链接 `HuxerUI::AgentKitRuntime`，需要默认 UI 时链接 `HuxerUI::AgentKit`。会话与执行、UI、协议适配器分开组织公开头文件。提供商与外部协议适配器按需启用，库内复用一个私有 JSON 编解码实现。默认 UI 使用本地会话，模型可由宿主配置为本地或云端提供商。库通过公开 SDK 构建，带 composable 标记的实现交给现有 codegen。
 
 ```cmake
 huxerui_use_library(my_app

@@ -1,6 +1,6 @@
 #include "sqlite_session_store.h"
 
-#include <huxerui/agentkit.h>
+#include <huxerui/agentkit/runtime.h>
 #include <huxerui/huxerui.h>
 #include <huxerui/sqlite.h>
 #include <huxerui/testing/ui_test.h>

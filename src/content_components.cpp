@@ -49,17 +49,6 @@ AgentResult<void> AgentRuntime::RegisterContentComponent(ContentComponentRegistr
   return AgentResult<void>::Success();
 }
 
-AgentResult<void> AgentRuntime::RegisterArtifactRenderer(std::string type, ArtifactRenderer renderer) {
-  if (state_->stage != detail::RuntimeState::Stage::Registering) {
-    return detail::Fail<void>(ErrorCode::InvalidState, "Registration closed");
-  }
-  if (!ActionName(type) || !renderer) return detail::Fail<void>(ErrorCode::InvalidArgument, "Invalid artifact renderer");
-  if (!state_->artifact_renderers.emplace(std::move(type), std::move(renderer)).second) {
-    return detail::Fail<void>(ErrorCode::Conflict, "Artifact renderer already registered");
-  }
-  return AgentResult<void>::Success();
-}
-
 AgentResult<void> AgentRuntime::RegisterArtifactAction(ArtifactActionRegistration action) {
   if (state_->stage != detail::RuntimeState::Stage::Registering) {
     return detail::Fail<void>(ErrorCode::InvalidState, "Registration closed");
@@ -72,71 +61,6 @@ AgentResult<void> AgentRuntime::RegisterArtifactAction(ArtifactActionRegistratio
     return detail::Fail<void>(ErrorCode::Conflict, "Artifact action already registered");
   }
   return AgentResult<void>::Success();
-}
-
-std::optional<huxerui::View> Conversation::RenderContent(CustomBlockRef ref, const CustomBlock& block) const {
-  const auto user = state_->User();
-  if (!user.Succeeded() || user.Value() != principal_ || !state_->visible_sessions.contains({principal_, id_})) return {};
-  const auto component = state_->content_components.find({block.type.id, block.type.schema_version});
-  if (component == state_->content_components.end() || !component->second.render) return {};
-  try {
-    std::vector<InteractionSnapshot> interactions;
-    const auto session = state_->sessions.find(id_);
-    if (session != state_->sessions.end() && ref.message.session == id_) {
-      if (const auto* image = state_->Published(session->second)) {
-        const auto message = std::ranges::find(image->messages, ref.message, &Message::ref);
-        if (message != image->messages.end()) {
-          const auto entry = std::ranges::find(message->blocks, ref.block, &ContentBlock::id);
-          const auto* published = entry == message->blocks.end() ? nullptr : std::get_if<CustomBlock>(&entry->body);
-          if (published && published->type == block.type) {
-            for (const auto& id : block.interactions) {
-              if (std::ranges::find(published->interactions, id) == published->interactions.end()) continue;
-              const auto interaction = std::ranges::find(image->interactions, id, &InteractionSnapshot::id);
-              if (interaction != image->interactions.end() && interaction->recipient == principal_) {
-                interactions.push_back(*interaction);
-              }
-            }
-          }
-        }
-      }
-    }
-    auto dispatch = [state = state_, session = id_, user = principal_, binding = ref](CommandId command, RenderAction request) {
-      return [](std::shared_ptr<detail::RuntimeState> owner, SessionId session, PrincipalId user, CustomBlockRef binding,
-                CommandId command, RenderAction request) -> Async<CommandReceipt> {
-        auto* action = std::get_if<CustomBlockAction>(&request);
-        if (!action || action->target != binding)
-          co_return detail::Fail<CommandReceipt>(ErrorCode::PermissionDenied, "This renderer is bound to a different component action");
-        co_return co_await owner->DispatchRenderedAction(session, user, std::move(command), std::move(*action));
-      }(state, session, user, binding, std::move(command), std::move(request));
-    };
-    return component->second.render(
-        {std::make_shared<const CustomBlock>(block), std::move(ref), std::move(dispatch), std::move(interactions)});
-  } catch (...) {
-    state_->ReportException(std::current_exception());
-    return {};
-  }
-}
-
-std::optional<huxerui::View> Conversation::RenderArtifact(const ArtifactPreview& preview) const {
-  const auto renderer = state_->artifact_renderers.find(preview.type);
-  if (renderer == state_->artifact_renderers.end() || preview.access_revision != state_->access_revision) return {};
-  const auto snapshot = Snapshot();
-  if (!snapshot || !detail::ShowsArtifact(*snapshot, preview.artifact)) return {};
-  try {
-    auto dispatch = [state = state_, session = id_, user = principal_, binding = preview.artifact](CommandId command, RenderAction request) {
-      return [](std::shared_ptr<detail::RuntimeState> owner, SessionId session, PrincipalId user, ArtifactRef binding,
-                CommandId command, RenderAction request) -> Async<CommandReceipt> {
-        auto* action = std::get_if<ArtifactAction>(&request);
-        if (!action || action->artifact != binding)
-          co_return detail::Fail<CommandReceipt>(ErrorCode::PermissionDenied, "This renderer is bound to a different artifact version");
-        co_return co_await owner->DispatchRenderedAction(session, user, std::move(command), std::move(*action));
-      }(state, session, user, binding, std::move(command), std::move(request));
-    };
-    return renderer->second({std::make_shared<const ArtifactPreview>(preview), {}, std::move(dispatch), {}});
-  } catch (...) {
-    state_->ReportException(std::current_exception());
-    return {};
-  }
 }
 
 namespace detail {

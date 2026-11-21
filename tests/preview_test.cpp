@@ -3078,7 +3078,7 @@ void VerifyReviewApproval(const File& root) {
     if (fixture->stale.Get()) { ++second.ticket; ++second.approval->version; }
     auto pane = [&](std::shared_ptr<kit::Conversation> conversation, kit::AgentChatReviewRequest request, const char* key) {
       kit::AgentChatOptions options{.draft_sources = fixture->draft_sources, .review_request = std::move(request),
-          .close_review_window = [] {}};
+          .review_only = true};
       return Column{agentkit_preview::CodeChat(std::move(conversation), fixture->runtime, std::move(options))}.With(Grow()).Key(key);
     };
     return Row{pane(opened->first, opened->request, "first-review"), pane(opened->second, second, "second-review")};

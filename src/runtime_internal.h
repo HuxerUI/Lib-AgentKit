@@ -546,7 +546,6 @@ public:
   std::map<SkillSourceId, std::shared_ptr<SkillSource>> skill_sources;
   std::map<AgentId, AgentDefinition> agents;
   std::map<std::pair<std::string, Revision>, ContentComponentRegistration> content_components;
-  std::map<std::string, ArtifactRenderer> artifact_renderers;
   std::map<std::pair<std::string, std::string>, ArtifactActionRegistration> artifact_actions;
   Async<void> ValidateToolBlocks(const SessionData& session, const RunExecution& run, std::vector<ContentBlock>& blocks);
   std::map<AgentId, HostWorkflow> workflows;

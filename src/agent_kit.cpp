@@ -1,4 +1,4 @@
-#include <huxerui/agentkit.h>
+#include <huxerui/agentkit/runtime.h>
 
 #include "runtime_internal.h"
 
@@ -515,7 +515,5 @@ SessionService AgentRuntime::Sessions() { return SessionService(state_); }
 InteractionService AgentRuntime::Interactions() { return InteractionService(state_); }
 
 ArtifactChanges AgentRuntime::Artifacts() { return ArtifactChanges(state_); }
-
-void Install(ApplicationContext&) {}
 
 } // namespace huxerui::agentkit

@@ -130,7 +130,7 @@ public:
   }
 };
 
-using Dispatch = std::function<Async<CommandReceipt>(CommandId, RenderAction)>;
+using DispatchReceipt = std::function<Async<Receipt<RunAccepted>>(CommandId, ArtifactAction)>;
 using DraftSources = State<AgentChatDraftSources>;
 
 struct Inventory {
@@ -142,7 +142,7 @@ struct Inventory {
 
 struct Workshop {
   std::shared_ptr<Inventory> ledger = std::make_shared<Inventory>();
-  Dispatch dispatch_receipt;
+  DispatchReceipt dispatch_receipt;
   std::shared_ptr<AgentRuntime> runtime;
   std::shared_ptr<Conversation> chat;
   std::optional<DraftSources> draft_sources;
@@ -194,39 +194,11 @@ std::shared_ptr<AgentRuntime> ConfigureWorkshop(const std::shared_ptr<Workshop>&
         "The provider received an unauthorized or different context request");
     co_return AgentResult<ContextSnapshot>::Success({.fragments = {{policy, {ModelContent::Role::Context, std::string(policy_text)}}}});
   }));
-  const auto dispatch = [tasks, host](Dispatch action, RenderAction request) {
-    tasks.Launch([action = std::move(action), request = std::move(request), host]() mutable -> Task<void> {
-      try { Take(co_await action(NewCommandId(), std::move(request))); }
-      catch (...) { if (auto shop = host.lock()) shop->failure = std::current_exception(); }
-    });
-  };
   Take(runtime->RegisterContentComponent({reservation, FieldSchema("equipment"),
-      [dispatch](RenderInput<CustomBlock> input) -> View {
-        Check(input.origin && input.origin->message.version, "The reservation card did not receive a versioned origin");
-        return Column {
-          Text("Reserved equipment: " + Field(input.value->data, "equipment")),
-          Button("Explain reservation").OnClick([dispatch, action = std::move(input.dispatch), target = *input.origin] {
-            dispatch(action, CustomBlockAction{target, "explain", JsonValue{true}});
-          }),
-        };
-      }, {{"explain", {JsonValue{true}}, [](ContentActionContext context, JsonValue) -> Async<ContentActionPlan> {
+      {{"explain", {JsonValue{true}}, [](ContentActionContext context, JsonValue) -> Async<ContentActionPlan> {
         Check(Field(context.block->data, "equipment") == "caliper", "The component action was bound to a different item");
         co_return AgentResult<ContentActionPlan>::Success(SendInput{.text = "Explain this reservation"});
       }}}}));
-  Take(runtime->RegisterArtifactRenderer(receipt_type, [dispatch, host](RenderInput<ArtifactPreview> input) -> View {
-    Check(input.value->type == receipt_type && input.value->structured && !input.origin,
-        "The artifact renderer did not receive the authorized receipt projection");
-    auto shop = host.lock();
-    Check(shop && shop->draft_sources, "The workshop review did not receive a draft");
-    shop->dispatch_receipt = input.dispatch;
-    return Column {
-      Text("Workshop receipt: " + Field(*input.value->structured, "equipment")),
-      Button("Audit receipt").OnClick([dispatch, action = std::move(input.dispatch), ref = input.value->artifact] {
-        dispatch(action, ArtifactAction{ref, "audit", JsonValue{true}});
-      }),
-      AgentChatSourceActions(shop->chat, SourceSlice{input.value->artifact}, *shop->draft_sources),
-    };
-  }));
   Take(runtime->RegisterArtifactAction({receipt_type, "audit", {JsonValue{true}},
       [](ArtifactActionContext context, JsonValue) -> Async<SendInput> {
         co_return AgentResult<SendInput>::Success({.text = "Audit this receipt", .context = {{context.artifact}}});
@@ -300,9 +272,49 @@ void VerifyWorkshop() {
   const Application app{[]() -> View {
     const auto visible = UseService<VisibleChat>();
     if (visible && visible->Get()) {
+      const auto host = std::weak_ptr{UseService<Workshop>()};
       return ProvideEnvironment(AgentChatLayoutStyle{.show_run_activity = true},
           AgentChat(visible->Get(), {
               .draft_sources = *UseService<DraftSources>(),
+              .render_artifact = [host](const ArtifactPreview& preview, std::shared_ptr<Conversation> chat,
+                  DraftSources draft) -> std::optional<View> {
+                if (preview.type != receipt_type || !preview.structured) return {};
+                auto registered = host.lock();
+                Check(registered && registered->draft_sources, "The workshop review did not receive a draft");
+                const auto dispatch = [chat, ref = preview.artifact](CommandId id, ArtifactAction action) -> Async<Receipt<RunAccepted>> {
+                  if (action.artifact != ref)
+                    co_return AgentResult<Receipt<RunAccepted>>::Failure({ErrorCode::PermissionDenied, "Different receipt version"});
+                  co_return co_await chat->DispatchArtifactActionAsync(std::move(id), std::move(action));
+                };
+                registered->dispatch_receipt = dispatch;
+                const auto tasks = UseApplicationTaskScope();
+                return Column{
+                  Text("Workshop receipt: " + Field(*preview.structured, "equipment")),
+                  Button("Audit receipt").OnClick([tasks, dispatch, ref = preview.artifact, host] {
+                    tasks.Launch([dispatch, ref, host]() -> Task<void> {
+                      try { Take(co_await dispatch(NewCommandId(), {ref, "audit", JsonValue{true}})); }
+                      catch (...) { if (auto shop = host.lock()) shop->failure = std::current_exception(); }
+                    });
+                  }),
+                  AgentChatSourceActions(chat, SourceSlice{preview.artifact}, draft),
+                };
+              },
+              .render_block = [host](const Message& message, const ContentBlock& block,
+                  std::shared_ptr<Conversation> chat) -> std::optional<View> {
+                const auto* card = std::get_if<CustomBlock>(&block.body);
+                if (!card || card->type != reservation) return {};
+                Check(message.ref.version, "The reservation card did not receive a versioned origin");
+                const auto tasks = UseApplicationTaskScope();
+                return Column{
+                  Text("Reserved equipment: " + Field(card->data, "equipment")),
+                  Button("Explain reservation").OnClick([tasks, chat, origin = CustomBlockRef{message.ref, block.id}, host] {
+                    tasks.Launch([chat, origin, host]() -> Task<void> {
+                      try { Take(co_await chat->DispatchContentActionAsync(NewCommandId(), {origin, "explain", JsonValue{true}})); }
+                      catch (...) { if (auto shop = host.lock()) shop->failure = std::current_exception(); }
+                    });
+                  }),
+                };
+              },
               .tool_label = [](const ToolRef& tool) -> std::string {
                 return tool.id == reserve ? "Equipment reservation" : std::string{};
               }}));
@@ -315,6 +327,7 @@ void VerifyWorkshop() {
     shop->draft_sources = *sources;
     context.Provide(sources);
     context.Provide(visible);
+    context.Provide(shop);
     context.Provide(selection);
     tasks = UseApplicationTaskScope();
     tasks->Launch([shop, visible, selection, scope = *tasks] { return OpenWorkshop(shop, scope, visible, selection); });
