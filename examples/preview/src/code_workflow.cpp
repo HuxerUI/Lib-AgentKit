@@ -134,13 +134,15 @@ View CodeEditorDialog(DialogContext dialog, CodeWorkspace workspace, std::string
       CrossAlign(CrossAxisAlignment::Stretch));
 }
 
-std::optional<View> ScopeView(const kit::InteractionSnapshot& request, std::shared_ptr<kit::Conversation> session,
-                              State<ScopeDraft> state, TaskScope tasks) {
-  const auto* form = std::get_if<kit::FormRequest>(&request.body);
-  if (!form || form->presentation != JsonValue{std::string(scope_form)}) return std::nullopt;
+[[huxerui::composable]]
+View ScopeView(const kit::InteractionSnapshot& request, std::shared_ptr<kit::Conversation> session,
+               State<ScopeDraft> state, TaskScope tasks, std::optional<CodeWorkspace> workspace) {
   auto current = state->interaction == request.id ? state.Get() :
       ScopeDraft{.interaction = request.id, .text = TextEditingValue::FromText({})};
-  auto submit = [state, tasks, session = std::move(session), current, version = request.version]() mutable {
+  const auto picker = UseService<FilePicker>();
+  const auto colors = UseTheme().colors;
+  const auto outside = UseString(::app::strings::ui_choose_files_inside_the_workspace);
+  auto submit = [state, tasks, session, current, version = request.version]() mutable {
     if (state->interaction == current.interaction && state->submitting) return;
     std::istringstream lines(current.text.text);
     JsonValue::Array files;
@@ -165,19 +167,58 @@ std::optional<View> ScopeView(const kit::InteractionSnapshot& request, std::shar
       state = std::move(updated);
     });
   };
-  return Column{
-      Text(form->title, TextRole::Title),
-      Text(::app::strings::ui_these_files_will_be_sent_to_the),
+  auto field = ProvideEnvironment(PreviewFormFieldStyle(UseEnvironment<TextFieldStyle>(), colors),
       TextField(current.text).Label(::app::strings::ui_workspace_relative_paths_one_per_line)
+          .Variant(TextFieldVariant::Outlined)
           .LineLimits(TextFieldLineLimits::MultiLine(2, 4))
           .OnChanged([state, current](const TextEditingValue& value) mutable {
             current.text = value;
             current.error.clear();
             state = current;
-          }).Key("code-scope"),
-      Row{Text(current.error, TextRole::Label), Spacer(),
-          Button(::app::strings::ui_share_files).OnClick(std::move(submit)).With(Enabled(!current.submitting))}.With(Spacing(8.0F)),
-  }.With(Spacing(8.0F), Padding(12.0F));
+          }).Key("code-scope"));
+  auto secondary = PreviewSecondaryButton(UseEnvironment<ButtonStyle>(), colors);
+  std::vector<View> actions;
+  if (workspace && workspace->NativeFolder() && picker->CanOpenFiles()) {
+    actions.push_back(ProvideEnvironment(secondary, Button(::app::strings::ui_choose_workspace_files)
+        .OnClick([tasks, picker, state, workspace = *workspace, current, outside] {
+          tasks.Launch([picker, state, workspace, current, outside]() mutable -> Task<void> {
+            const auto files = co_await picker->OpenFilesAsync();
+            if (files.empty() || (state->interaction == current.interaction && state->submitting)) co_return;
+            std::string paths;
+            for (const auto& picked : files) {
+              const auto file = picked.AsFile();
+              if (!file) { current.error = outside; state = current; co_return; }
+              const auto relative = std::filesystem::u8path(file->Path()).lexically_relative(workspace.root).generic_u8string();
+              const std::string path(relative.begin(), relative.end());
+              if (!ResolveCodeFile(workspace, path).Succeeded()) { current.error = outside; state = current; co_return; }
+              if (!paths.empty()) paths += '\n';
+              paths += path;
+            }
+            current.text = TextEditingValue::FromText(std::move(paths));
+            current.error.clear();
+            state = std::move(current);
+          });
+        }).With(Enabled(!current.submitting))));
+  }
+  actions.push_back(Spacer());
+  if (request.run) {
+    actions.push_back(ProvideEnvironment(secondary, Button(::app::strings::ui_cancel).OnClick([tasks, session, run = *request.run] {
+      tasks.Launch([session, run]() -> Task<void> { static_cast<void>(co_await session->CancelAsync(kit::NewCommandId(), run)); });
+    })));
+  }
+  actions.push_back(ProvideEnvironment(PreviewPrimaryButton(UseEnvironment<ButtonStyle>(), colors),
+      Button(::app::strings::ui_share_files).OnClick(std::move(submit))
+          .With(Enabled(!current.text.text.empty() && !current.submitting))));
+  std::vector<View> content{
+      Text(::app::strings::ui_share_workspace_files, TextRole::Title)
+          .Style({Font::System(16.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}),
+      Text(::app::strings::ui_these_files_will_be_sent_to_the, TextRole::Label).With(Foreground(colors.on_surface_variant)),
+      std::move(field),
+      Row(std::move(actions)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)),
+  };
+  if (!current.error.empty()) content.push_back(Text(current.error, TextRole::Label).With(Foreground(colors.error)));
+  return Column(std::move(content)).With(Spacing(8.0F), Padding(12.0F), CrossAlign(CrossAxisAlignment::Stretch),
+      CornerRadius(10.0F), Background(colors.surface_container_low), Border{colors.outline});
 }
 
 kit::Async<kit::RunCompletion> VerifyImplementation(kit::RunContext run, kit::CollaborationMessageId request,
@@ -230,7 +271,15 @@ kit::Async<kit::RunCompletion> VerifyImplementation(kit::RunContext run, kit::Co
 } // namespace
 
 kit::Async<kit::RunCompletion> RunCode(
-    kit::RunContext context, kit::RunInput input, std::optional<kit::RunCheckpoint> checkpoint, bool tests_configured) {
+    kit::RunContext context, kit::RunInput input, std::optional<kit::RunCheckpoint> checkpoint, bool tests_configured,
+    std::weak_ptr<kit::AgentRuntime> runtime, std::shared_ptr<CodeWorkspaces> workspaces, std::shared_ptr<RunSettings> settings) {
+  if (checkpoint && checkpoint->stage == WorkspaceAnswerStage && checkpoint->schema_version == 1)
+    co_return co_await AnswerWithWorkspaceTools(context, checkpoint->state == JsonValue{true}, true);
+  if (!checkpoint && !input.work_request && !input.artifact_action && input.trigger != kit::RunTrigger::ForkComparison) {
+    auto allowed = co_await AllowsWorkspaceTools(context, CodeAgent, runtime, *workspaces, *settings);
+    if (!allowed.Succeeded()) co_return Completion::Failure(allowed.Error());
+    if (allowed.Value()) co_return co_await AnswerWithWorkspaceTools(context, tests_configured, false);
+  }
   if (checkpoint && (checkpoint->schema_version != 1 ||
       (checkpoint->stage != "scope" && checkpoint->stage != "patch" && checkpoint->stage != "verify"))) {
     co_return Completion::Failure({.code = kit::ErrorCode::Unsupported, .message = "Unknown code checkpoint"});
@@ -410,7 +459,7 @@ View CodeRevertReview(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
   }
   const bool enabled = current && !selected.empty() && !preparing.Get() && !waiting;
   std::vector<View> content;
-  if (original.tool.id == ApplyCodePatch && (original.reconciliation || original.state == kit::ToolCallState::PartiallyApplied)) {
+  if (IsCodePatchTool(original.tool.id) && (original.reconciliation || original.state == kit::ToolCallState::PartiallyApplied)) {
     for (const auto& effect : original.effects) {
       const auto label = effect.state == kit::ResourceEffectState::Applied ? "Applied: " : "Skipped: ";
       content.push_back(Text(label + File(effect.resource.value).Name(), TextRole::Label));
@@ -476,6 +525,8 @@ View CodeRevertReview(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
 static View CodeWorkspaceConversation(std::shared_ptr<kit::Conversation> conversation, kit::AgentChatOptions base_options,
     std::shared_ptr<kit::AgentRuntime> runtime, CodeWorkspace workspace, std::optional<File> evidence, std::function<void()> edit) {
   const auto tasks = UseTaskScope();
+  const auto menu = UseMenu();
+  const auto menu_anchor = UseViewHandle();
   const auto status = UseState(std::string{});
   const auto checking = UseState(false);
   const auto verification = UseState(std::optional<std::pair<kit::ToolCallId, kit::CommandId>>{});
@@ -485,13 +536,13 @@ static View CodeWorkspaceConversation(std::shared_ptr<kit::Conversation> convers
     return recover ? ObserveCodeSession(conversation, tasks, observed, status) : std::function<void()>{};
   }, conversation, evidence.has_value());
   const auto snapshot = observed.Get();
-  std::vector<View> actions{Button(::app::strings::ui_edit_workspace_file).OnClick(std::move(edit))};
+  std::vector<MenuEntry> actions{MenuItem(::app::strings::ui_edit_workspace_file, std::move(edit))};
   std::optional<View> recovery_review;
   if (snapshot && evidence) {
     for (const auto& call : snapshot->tools) {
-      if (call.tool.id != ApplyCodePatch) continue;
+      if (!IsCodePatchTool(call.tool.id)) continue;
       if (call.state == kit::ToolCallState::ResultUnknown && call.issued_targets) {
-        actions.push_back(Button(::app::strings::ui_check_patch_result).OnClick([runtime, tasks, session = snapshot->summary.id, call,
+        actions.emplace_back(MenuItem(::app::strings::ui_check_patch_result, [runtime, tasks, session = snapshot->summary.id, call,
             workspace, evidence = *evidence, checking, status, verification] {
           if (checking.Get()) return;
           if (!verification.Get() || verification.Get()->first != call.id)
@@ -504,7 +555,7 @@ static View CodeWorkspaceConversation(std::shared_ptr<kit::Conversation> convers
             if (!result.Succeeded()) status = result.Error().message;
             checking = false;
           });
-        }).With(Enabled(!checking.Get() && !snapshot->summary.active_run)).Key(call.id.value));
+        }).Enabled(!checking.Get() && !snapshot->summary.active_run));
       } else if (call.artifacts.empty() && (call.reconciliation || call.state == kit::ToolCallState::PartiallyApplied)) {
         if (reviewed.Get() == call.id) {
           recovery_review = Column{
@@ -514,14 +565,19 @@ static View CodeWorkspaceConversation(std::shared_ptr<kit::Conversation> convers
           }.With(Grow(), Spacing(12.0F), Padding(20.0F));
         }
         const auto label = call.reconciliation ? ::app::strings::ui_review_recovered_patch : ::app::strings::ui_review_partial_patch;
-        actions.push_back(Button(label).OnClick([reviewed, id = call.id] { reviewed = id; }).Key(call.id.value));
+        actions.emplace_back(MenuItem(label, [reviewed, id = call.id] { reviewed = id; }));
       }
     }
   }
-  if (!status.Get().empty()) actions.push_back(Text(status.Get(), TextRole::Label));
   const auto page = recovery_review ? 1U : 0U;
-  auto chat = PreviewChat(std::move(conversation), base_options,
-      Flow(std::move(actions)).With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Center)));
+  std::vector<View> body{PreviewChat(std::move(conversation), base_options,
+      IconButton(::app::images::more, ::app::strings::ui_workspace_actions).OnClick([menu, menu_anchor, actions] {
+        menu.Show(menu_anchor, actions);
+      }).With(menu_anchor, Tooltip(::app::strings::ui_workspace_actions)).Key("workspace-actions")).With(Grow())};
+  if (!status.Get().empty()) {
+    body.push_back(Text(status.Get(), TextRole::Label).With(Padding(EdgeInsets::Symmetric(14.0F, 4.0F))));
+  }
+  auto chat = Column(std::move(body)).With(Grow(), CrossAlign(CrossAxisAlignment::Stretch));
   return IndexedPages({std::move(chat), recovery_review ? std::move(*recovery_review) : View{Spacer()}}, page).With(Grow());
 }
 
@@ -728,9 +784,11 @@ View CodeChat(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<k
   };
   auto options = base_options;
   options.review_attachment_label = CodeReviewAttachmentLabel;
-  options.render_form = [editor, tasks](
-      const kit::InteractionSnapshot& request, std::shared_ptr<kit::Conversation> session) {
-    return ScopeView(request, std::move(session), editor, tasks);
+  options.render_form = [editor, tasks, workspace](
+      const kit::InteractionSnapshot& request, std::shared_ptr<kit::Conversation> session) -> std::optional<View> {
+    const auto* form = std::get_if<kit::FormRequest>(&request.body);
+    if (!form || form->presentation != JsonValue{std::string(scope_form)}) return {};
+    return ScopeView(request, std::move(session), editor, tasks, workspace);
   };
   options.render_artifact = [runtime, fallback = base_options.render_artifact, open_editor, workspace, evidence](
                             const kit::ArtifactPreview& preview, std::shared_ptr<kit::Conversation> session,

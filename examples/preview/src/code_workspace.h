@@ -74,4 +74,6 @@ private:
 
 huxerui::agentkit::AgentResult<huxerui::File> ResolveCodeFile(const CodeWorkspace& workspace, std::string_view relative);
 
+huxerui::agentkit::AgentResult<huxerui::File> ResolveCodeDirectory(const CodeWorkspace& workspace, std::string_view relative);
+
 } // namespace agentkit_preview

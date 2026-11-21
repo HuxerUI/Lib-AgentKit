@@ -294,6 +294,7 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HU
     add_test(NAME huxerui_agentkit_preview_tests COMMAND huxerui_agentkit_preview_tests)
     add_test(NAME huxerui_agentkit_localization_tests COMMAND huxerui_agentkit_preview_tests --localization)
     add_test(NAME huxerui_agentkit_code_turn_activity_tests COMMAND huxerui_agentkit_preview_tests --code-turn-activity)
+    add_test(NAME huxerui_agentkit_workspace_tools_tests COMMAND huxerui_agentkit_preview_tests --workspace-tools)
     if (HUXERUI_AGENTKIT_TEST_BROWSER)
         add_test(NAME huxerui_agentkit_goal_completion_revision_tests COMMAND huxerui_agentkit_preview_tests --goal-completion-revision)
         add_test(NAME huxerui_agentkit_goal_completion_automatic_tests COMMAND huxerui_agentkit_preview_tests --goal-completion-automatic)

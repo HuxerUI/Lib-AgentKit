@@ -2,6 +2,7 @@
 
 #include "general_workflow.h"
 
+#include "code_tools.h"
 #include "design.h"
 #include "presentation.h"
 #include "presentation_tools.h"
@@ -10,6 +11,7 @@
 #include "release_skill.h"
 #include "report_chart.h"
 #include "release_workflow.h"
+#include "run_settings.h"
 #include "workflow_sessions.h"
 
 #include <huxerui/huxerui.h>
@@ -217,7 +219,9 @@ kit::AgentResult<void> RegisterGeneralTools(const std::shared_ptr<kit::AgentRunt
 }
 
 kit::Async<kit::RunCompletion> RunGeneral(kit::RunContext run, kit::RunInput input,
-    std::optional<kit::RunCheckpoint> checkpoint, bool release_available, std::string export_directory) {
+    std::optional<kit::RunCheckpoint> checkpoint, bool release_available, std::string export_directory,
+    std::shared_ptr<CodeWorkspaces> workspaces, std::shared_ptr<RunSettings> settings, bool tests_configured,
+    std::weak_ptr<kit::AgentRuntime> runtime) {
   if (input.artifact_action && input.artifact_action->action == ExportStagedPresentation)
     co_return co_await RunPresentation(std::move(run), std::move(input), std::move(checkpoint), std::move(export_directory));
   if (input.goal) {
@@ -232,6 +236,8 @@ kit::Async<kit::RunCompletion> RunGeneral(kit::RunContext run, kit::RunInput inp
   }
   if (checkpoint) {
     if (checkpoint->schema_version != 1) co_return Fail<kit::RunCompletion>(kit::ErrorCode::Unsupported, "Unknown General checkpoint");
+    if (checkpoint->stage == WorkspaceAnswerStage)
+      co_return co_await AnswerWithWorkspaceTools(run, checkpoint->state == JsonValue{true}, true);
     if (checkpoint->stage == ReleaseSkillStage || checkpoint->stage == "brief" || checkpoint->stage == "outline") {
       co_return co_await RunSkillPresentation(std::move(run), std::move(input), std::move(checkpoint), std::move(export_directory));
     }
@@ -283,6 +289,9 @@ kit::Async<kit::RunCompletion> RunGeneral(kit::RunContext run, kit::RunInput inp
   }
   const bool release = route == WorkspaceRelease;
   if (route != "design-briefing" && !release) {
+    auto allowed = co_await AllowsWorkspaceTools(run, GeneralAgent, runtime, *workspaces, *settings);
+    if (!allowed.Succeeded()) co_return Completion::Failure(allowed.Error());
+    if (allowed.Value()) co_return co_await AnswerWithWorkspaceTools(run, tests_configured, false);
     auto reply = co_await run.CompleteAsync({.instruction = std::string(GeneralAnswerInstruction)});
     if (!reply.Succeeded()) co_return Completion::Failure(reply.Error());
     if (reply.Value().text.empty())

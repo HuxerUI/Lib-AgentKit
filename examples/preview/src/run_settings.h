@@ -72,8 +72,6 @@ void ShowAddModel(const huxerui::DialogHandle& dialog, AddModelProfile add_model
 
 class RunSettings {
 public:
-  explicit RunSettings(std::function<huxerui::agentkit::TimePoint()> clock = {});
-
   void AddModel(const huxerui::agentkit::ModelRegistration& registration, std::string label = {},
       ModelLimits limits = {});
   void SetDefaults(huxerui::agentkit::ModelProviderRef general, std::optional<huxerui::agentkit::ModelProviderRef> code);
@@ -84,7 +82,7 @@ public:
   huxerui::agentkit::ModelCapabilities Capabilities(const std::optional<huxerui::agentkit::ModelProviderRef>& ref,
       const huxerui::agentkit::AgentId& agent) const;
   std::string Describe(const huxerui::agentkit::RunStartBinding& binding, const huxerui::Resources& resources) const;
-  bool NeedsRenewal(const huxerui::agentkit::ExecutionProfileRef& profile,
+  bool HasFullAccess(const huxerui::agentkit::ExecutionProfileRef& profile,
                     const std::optional<huxerui::agentkit::WorkspaceId>& workspace) const;
 
   huxerui::agentkit::ExecutionProfileRef GrantFullAccess(huxerui::agentkit::WorkspaceId workspace);
@@ -92,15 +90,10 @@ public:
       const huxerui::agentkit::PolicyRequest& request, bool needs_confirmation, bool workspace_available) const;
 
 private:
-  struct FullAccessGrant {
-    huxerui::agentkit::WorkspaceId workspace;
-    huxerui::agentkit::TimePoint expires;
-  };
-  std::function<huxerui::agentkit::TimePoint()> clock_;
   std::vector<ModelChoice> models_;
   huxerui::agentkit::ModelProviderRef general_ = DemoModel;
   std::optional<huxerui::agentkit::ModelProviderRef> code_;
-  std::map<huxerui::agentkit::ExecutionProfileId, FullAccessGrant, std::less<>> full_access_;
+  std::map<huxerui::agentkit::ExecutionProfileId, huxerui::agentkit::WorkspaceId, std::less<>> full_access_;
 };
 
 huxerui::agentkit::ToolReviewer ChartExportReviewer(huxerui::File export_folder,

@@ -45,9 +45,8 @@ struct SelectionToolbarAnchor {
 struct SelectedText {
   SourceSlice source;
   std::string text;
-  TextSelection selection;
   std::vector<SourceSlice> additional_sources;
-  std::optional<detail::MarkdownRange> markdown_range;
+  std::optional<detail::MarkdownRange> range;
   std::optional<SelectionToolbarAnchor> toolbar_anchor;
 };
 
@@ -162,42 +161,40 @@ std::optional<AgentChatCitation> LastCompletedReply(const std::vector<Message>& 
 }
 
 [[huxerui::composable]]
-View SelectionField(SourceRef source, std::variant<BlockId, PartId> leaf, std::string text,
+View SelectableText(SourceRef source, std::variant<BlockId, PartId> leaf, std::string text,
                     State<std::optional<SelectedText>> selection, std::string key,
                     std::optional<ViewHandle> target = {}, bool fit_content = false) {
   const auto local_target = UseViewHandle();
   const auto anchor = target.value_or(local_target);
+  const auto theme = UseTheme();
+  const TextStyle style{Font::System(14.0F), theme.colors.on_surface};
+  const TextShapingOptions shaping{.locale = std::string(UseEnvironment<Locale>().LanguageTag())};
   Frame frame;
   if (fit_content) {
-    const auto style = UseEnvironment<TextFieldStyle>();
-    const auto metrics = UseTextMeasurer().MeasureText(std::string_view{text}, style.text_style,
-        std::numeric_limits<float>::infinity(),
-        {.shaping = {.locale = std::string(UseEnvironment<Locale>().LanguageTag())}, .wrap = TextWrap::NoWrap});
-    frame.max_width = std::ceil(metrics.size.width) + style.padding.left + style.padding.right + style.caret_width;
+    const auto metrics = UseTextMeasurer().MeasureText(std::string_view{text}, style, std::numeric_limits<float>::infinity(),
+        {.shaping = shaping, .wrap = TextWrap::NoWrap});
+    frame.max_width = std::ceil(metrics.size.width);
   }
-  TextEditingValue value{.text = text};
-  if (const auto selected = selection.Get(); selected && selected->source.source == source &&
-      selected->source.text_range->leaf == leaf) value.selection = selected->selection;
-  return TextField(std::move(value)).Variant(TextFieldVariant::Standard)
-      .LineLimits(TextFieldLineLimits::MultiLine())
-      .InputConfiguration({.multiline = true, .autocorrect = false, .keyboard_policy = SoftwareKeyboardPolicy::Manual})
-      .On<ViewEvents::PointerIntercept>([anchor](const PointerEvent& event) {
-        if (event.type == PointerEventType::Down &&
-            (event.changed_button == PointerButton::None || event.changed_button == PointerButton::Primary))
-          anchor.RequestFocus();
-        return false;
-      })
-      .OnChanged([selection, anchor, source = std::move(source), leaf = std::move(leaf), original = std::move(text)](
-                     const TextEditingValue& state) {
-        if (state.text != original || state.composition) return;
-        const auto range = state.selection.Range();
-        const auto start = detail::Utf8Offset(state.text, range.start);
-        const auto end = detail::Utf8Offset(state.text, range.end);
-        if (!start || !end || *start > *end) return;
-        selection = SelectedText{.source = {source, {}, SourceTextRange{leaf, *start, *end}},
-            .text = state.text.substr(*start, *end - *start), .selection = state.selection,
-            .toolbar_anchor = SelectionToolbarAnchor{anchor}};
-      }).With(frame, anchor, Semantics{.read_only = true}).Key(std::move(key));
+  const auto owns_selection = [source, leaf](const std::optional<SelectedText>& selected) {
+    return selected && selected->source.source == source &&
+        selected->source.text_range && selected->source.text_range->leaf == leaf;
+  };
+  const auto selected = selection.Get();
+  auto highlight = theme.colors.primary;
+  highlight.alpha = 0.30F;
+  return detail::SelectablePlainText(std::move(text), style, shaping, highlight, anchor,
+      owns_selection(selected) ? selected->range : std::nullopt,
+      [selection, anchor, source = std::move(source), leaf = std::move(leaf), owns_selection](
+          std::optional<detail::MarkdownExcerpt> excerpt) {
+        if (!excerpt || excerpt->source.source_bytes.empty()) {
+          if (owns_selection(selection.Get())) selection = std::nullopt;
+          return;
+        }
+        const auto [begin, end] = excerpt->source.source_bytes.front();
+        selection = SelectedText{.source = {source, {}, SourceTextRange{leaf, begin, end}},
+            .text = std::move(excerpt->source.text), .range = excerpt->range,
+            .toolbar_anchor = SelectionToolbarAnchor{anchor, excerpt->active_caret, excerpt->pointer_selecting}};
+      }).With(frame).Key(std::move(key));
 }
 
 StringVariant AuthorLabel(MessageAuthor author, std::string_view agent) {
@@ -477,7 +474,8 @@ View ChatRunActivity(RunSnapshot run, std::vector<ToolCallSnapshot> tools, std::
         Padding(EdgeInsets::Symmetric(7.0F, 0.0F)), CornerRadius(6.0F), Background(colors.surface_container_low),
         Focusable{}, Semantics{.role = SemanticRole::Button, .label = title, .expanded = open}).Key(std::move(key));
   };
-  const bool has_work = !tools.empty() || !delegates.empty() || !run.reasoning_summary.empty() || waiting >= Duration{1000};
+  const bool show_wait = run.state != RunState::WaitingForInput && waiting >= Duration{1000};
+  const bool has_work = !tools.empty() || !delegates.empty() || !run.reasoning_summary.empty() || show_wait;
   const bool open = expanded.Get().value_or(!finished);
   std::optional<View> disclosure;
   if (has_work) disclosure = toggle(ui_work_activity, "chat-run-activity", open, [expanded, open] { expanded = !open; });
@@ -501,7 +499,7 @@ View ChatRunActivity(RunSnapshot run, std::vector<ToolCallSnapshot> tools, std::
     for (const auto& child : delegates)
       entries.push_back(Text(child.agent.id.value + " · " + UseString(ActivityStateLabel(child.state)), TextRole::Label)
           .Style(note).Key(child.id.value));
-    if (waiting >= Duration{1000}) entries.push_back(Text(FormatRunTime(ui_run_input_wait, waiting), TextRole::Label).Style(note));
+    if (show_wait) entries.push_back(Text(FormatRunTime(ui_run_input_wait, waiting), TextRole::Label).Style(note));
     content.push_back(Row{
         Canvas([line = colors.outline](PaintContext& context, Size size) {
           context.DrawRect({0, 0, size.width, size.height}, line);
@@ -518,7 +516,6 @@ View MarkdownMessageBlock(MessageRef message, BlockId block, std::string source,
                           State<std::optional<SelectedText>> selection,
                           std::shared_ptr<const AgentChatLinkHandler> links) {
   const auto theme = UseTheme();
-  const auto field_style = ChatFieldStyle(UseEnvironment<TextFieldStyle>(), theme);
   const auto parser = UseState(std::make_shared<markdown::MarkdownParseSession>(detail::MarkdownSelectionParseOptions()));
   const auto link_error = UseState(std::string{});
   const auto images = OptionalChatService<AgentChatImageLoader>();
@@ -538,8 +535,7 @@ View MarkdownMessageBlock(MessageRef message, BlockId block, std::string source,
   }
   const bool can_select = complete && can_reference && !source.empty();
   const auto source_field = [&] {
-    return ProvideEnvironment(field_style,
-        SelectionField(message, block, source, selection, "markdown-selection/" + block.value, source_focus));
+    return SelectableText(message, block, source, selection, "markdown-selection/" + block.value, source_focus);
   };
   if (!document || detail::IsPlainMarkdown(*document, source)) {
     if (can_select) return source_field();
@@ -589,7 +585,7 @@ View MarkdownMessageBlock(MessageRef message, BlockId block, std::string source,
       }
       auto& source_excerpt = excerpt->source;
       const auto [begin, end] = source_excerpt.source_bytes.front();
-      SelectedText selected{{message, {}, SourceTextRange{block, begin, end}}, std::move(source_excerpt.text), {},
+      SelectedText selected{{message, {}, SourceTextRange{block, begin, end}}, std::move(source_excerpt.text),
                             {}, excerpt->range, SelectionToolbarAnchor{source_focus, excerpt->active_caret, excerpt->pointer_selecting}};
       for (const auto& [first, last] : std::views::drop(source_excerpt.source_bytes, 1)) {
         selected.additional_sources.push_back({message, {}, SourceTextRange{block, first, last}});
@@ -598,7 +594,7 @@ View MarkdownMessageBlock(MessageRef message, BlockId block, std::string source,
     };
     auto highlight = theme.colors.primary;
     highlight.alpha = 0.30F;
-    const auto retained = owns_selection(selection.Get()) ? selection.Get()->markdown_range : std::nullopt;
+    const auto retained = owns_selection(selection.Get()) ? selection.Get()->range : std::nullopt;
     detail::MarkdownImageLoad load;
     if (complete && images && images->load) load = [images, message, block](std::string destination) {
       return images->load({message, block, std::move(destination)});
@@ -699,7 +695,7 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
                  const OpenArtifactReview& open_artifact,
                  State<std::optional<SelectedText>> selection, bool selectable, std::optional<SteerState> steer,
                  std::optional<View> recover, std::optional<View> selection_actions, std::string agent,
-                 const ThemeSpec& theme, const TextFieldStyle& selection_style,
+                 const ThemeSpec& theme,
                  Revision access_revision, const std::shared_ptr<const AgentChatLinkHandler>& links,
                  const std::optional<InlineArtifactSummary>& inline_summary,
                  const decltype(AgentChatOptions::render_block)& render_block, std::optional<Image> model_avatar,
@@ -729,8 +725,7 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
         content.push_back(MarkdownMessageBlock(message.ref, block.id, text->text, message.state == MessageState::Complete,
             selectable, selection, links).Key(block.id.value));
       } else if (selectable && message.state == MessageState::Complete && !text->text.empty()) {
-        content.push_back(ProvideEnvironment(selection_style,
-            SelectionField(message.ref, block.id, text->text, selection, block.id.value, {}, bubble && user)));
+        content.push_back(SelectableText(message.ref, block.id, text->text, selection, block.id.value, {}, bubble && user));
       } else {
         content.push_back(Text(text->text).Style({Font::System(14.0F), colors.on_surface}).Key(block.id.value));
       }
@@ -799,18 +794,24 @@ std::vector<ArtifactRef> VisibleApprovalAttachments(const ApprovalPreview& previ
 }
 
 View ApprovalActions(std::shared_ptr<Conversation> conversation, TaskScope tasks, State<std::string> error,
-                     AgentChatApprovalRef approval, std::string deny, std::string approve,
-                     const ButtonStyle& secondary_style, Color outline) {
+                     AgentChatApprovalRef approval, StringVariant deny, StringVariant approve,
+                     const ButtonStyle& secondary_style, const ColorScheme& colors) {
   auto submit = [tasks, conversation = std::move(conversation), error, approval](ApprovalDecision choice) {
     tasks.Launch([conversation, error, approval, choice]() -> Task<void> {
       auto reply = co_await conversation->SubmitAsync(NewCommandId(), {approval.id, approval.version, choice});
       error = reply.Succeeded() ? "" : reply.Error().message;
     });
   };
+  auto secondary = secondary_style;
+  secondary.padding = EdgeInsets::Symmetric(12.0F, 5.0F);
+  secondary.corner_radii = CornerRadii{7.0F};
+  auto primary = secondary;
+  primary.background = colors.primary_container;
+  primary.label_style.foreground = colors.on_primary_container;
   return Row{Spacer(), Flow{
-      ProvideEnvironment(secondary_style, Button(std::move(deny)).OnClick([submit] { submit(ApprovalDecision::Deny); })
-          .With(Border{outline})),
-      Button(std::move(approve)).OnClick([submit] { submit(ApprovalDecision::Approve); }),
+      ProvideEnvironment(secondary, Button(std::move(deny)).OnClick([submit] { submit(ApprovalDecision::Deny); })
+          .With(Border{colors.outline})),
+      ProvideEnvironment(primary, Button(std::move(approve)).OnClick([submit] { submit(ApprovalDecision::Approve); })),
   }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center))};
 }
 
@@ -850,7 +851,8 @@ View PendingApprovalView(const InteractionSnapshot& item, std::shared_ptr<Conver
   }
   if (item.state == InteractionState::Pending) {
     details.push_back(Divider().With(LayoutPriority(1.0F)));
-    details.push_back(ApprovalActions(std::move(conversation), tasks, error, approval, "Deny", "Approve", action_style, colors.outline)
+    details.push_back(ApprovalActions(std::move(conversation), tasks, error, approval,
+        huxerui_agentkit::strings::ui_deny_action, huxerui_agentkit::strings::ui_approve_action, action_style, colors)
         .With(LayoutPriority(2.0F)));
   }
   return Column(std::move(details)).With(Spacing(8.0F), Padding(12.0F), CrossAlign(CrossAxisAlignment::Stretch),
@@ -885,8 +887,8 @@ View ReviewedApproval(const SessionSnapshot& snapshot, ArtifactRef artifact, Age
           .Style({Font::System(13.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}).With(LayoutPriority(1.0F)),
       ScrollView(Column(std::move(details)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch)))
           .With(Frame{.max_height = 88.0F}, ScrollBar()),
-      ApprovalActions(conversation, tasks, error, approval, "Deny reviewed change", "Approve reviewed change",
-          action_style, colors.outline).With(Enabled(!loading), LayoutPriority(2.0F)),
+      ApprovalActions(conversation, tasks, error, approval, huxerui_agentkit::strings::ui_deny_reviewed_change,
+          huxerui_agentkit::strings::ui_approve_reviewed_change, action_style, colors).With(Enabled(!loading), LayoutPriority(2.0F)),
   }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
@@ -1362,9 +1364,9 @@ View AgentChatArtifactText(std::shared_ptr<Conversation> conversation, ArtifactR
   const auto selection = UseState(std::optional<SelectedText>{});
   const auto selected = selection.Get();
   return Column{
-      ScrollView(SelectionField(artifact, part, std::move(text), selection, "artifact-text"))
+      ScrollView(SelectableText(artifact, part, std::move(text), selection, "artifact-text"))
           .With(Grow(), ScrollBar()),
-      // Keep the read alive when focusing a button collapses the editor's selection.
+      // Keep the read alive when an action takes focus from the selected text.
       AgentChatSourceActions(conversation,
           selected && !selected->text.empty() ? std::optional{selected->source} : std::nullopt, draft),
   }.With(Grow(), Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
@@ -1434,7 +1436,6 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
   const auto theme = UseTheme();
   const auto layout_style = UseEnvironment<AgentChatLayoutStyle>();
   const auto avatar_for = layout_style.chat_bubbles ? OptionalChatService<AgentChatModelAvatar>() : nullptr;
-  const auto field_style = ChatFieldStyle(UseEnvironment<TextFieldStyle>(), theme);
   const auto action_style = ChatActionStyle(UseEnvironment<ButtonStyle>(), theme);
   const auto viewport_class = UseViewportClass();
   const bool compact = viewport_class == ViewportClass::Compact;
@@ -1780,7 +1781,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
   }, options.selection.has_value(), conversation, current->access_revision, range_anchor.Get(),
      ready_selection ? std::optional{SelectionBounds(*selected)} : std::nullopt,
      ready_selection ? selected->toolbar_anchor : std::nullopt,
-     ready_selection ? std::optional{selected->selection} : std::nullopt);
+     ready_selection ? selected->range : std::nullopt);
   const std::size_t earlier = current->older_history && !current->messages.empty() ? 1 : 0;
   const auto return_to_chat = [close_review, review_origin, return_focus] {
     close_review();
@@ -1842,7 +1843,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
       feed && feed->conversation == conversation && feed->access == *activity_access ? feed.get() : nullptr)) : nullptr;
   auto history = VirtualList(current->messages.size() + earlier,
       [conversation, open_artifact, selection, selection_enabled, side_chat, current, snapshot, range_anchor, earlier,
-       history_loading, history_window, loading = history_loading.Get(), theme, field_style, action_style, restore,
+       history_loading, history_window, loading = history_loading.Get(), theme, action_style, restore,
        can_restore = empty_draft && !recovering.Get(),
        agent_label = options.agent_label, avatar_for, links, selected, draft_sources, selection_focus, focus_cited_draft,
        inline_summary = std::move(inline_summary), render_block = options.render_block,
@@ -1885,7 +1886,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
     auto view = MessageView(message, conversation, open_artifact, selection,
         selection_enabled && (!side_chat || message.author == MessageAuthor::Agent), steer, std::move(recover),
         std::move(selection_actions),
-        std::move(agent), theme, field_style, current->access_revision, links, inline_summary, render_block,
+        std::move(agent), theme, current->access_revision, links, inline_summary, render_block,
         std::move(model_avatar), bubbles, narrow)
         .Key(message.ref.message.value);
     if (!activity) return std::move(view).With(Padding(EdgeInsets{.top = 2.0F, .bottom = 18.0F}));

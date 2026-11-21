@@ -3,6 +3,7 @@
 #include "run_settings.h"
 
 #include "code_tools.h"
+#include "general_workflow.h"
 #include "preview_json.h"
 #include "preview_theme.h"
 #include "report_chart.h"
@@ -170,9 +171,6 @@ kit::Async<kit::ToolReviewResult> ReviewChartWithModel(const kit::ModelRegistrat
 
 } // namespace
 
-RunSettings::RunSettings(std::function<kit::TimePoint()> clock)
-    : clock_(clock ? std::move(clock) : [] { return std::chrono::time_point_cast<kit::Duration>(std::chrono::system_clock::now()); }) {}
-
 void RunSettings::AddModel(const kit::ModelRegistration& registration, std::string label, ModelLimits limits) {
   if (std::ranges::find(models_, registration.ref, &ModelChoice::ref) != models_.end()) return;
   const auto& endpoint = registration.endpoint;
@@ -238,15 +236,14 @@ std::string RunSettings::Describe(const kit::RunStartBinding& binding, const Res
   return resources.GetString(ModelLabel(binding.model)) + separator + resources.GetString(ProfileLabel(binding.execution_profile));
 }
 
-bool RunSettings::NeedsRenewal(const kit::ExecutionProfileRef& profile, const std::optional<kit::WorkspaceId>& workspace) const {
-  if (!profile.id.value.starts_with(full_access_prefix)) return false;
+bool RunSettings::HasFullAccess(const kit::ExecutionProfileRef& profile, const std::optional<kit::WorkspaceId>& workspace) const {
   const auto grant = full_access_.find(profile.id);
-  return grant == full_access_.end() || profile.version != 1 || workspace != grant->second.workspace || clock_() >= grant->second.expires;
+  return grant != full_access_.end() && profile.version == 1 && workspace == grant->second;
 }
 
 kit::ExecutionProfileRef RunSettings::GrantFullAccess(kit::WorkspaceId workspace) {
   kit::ExecutionProfileId id{std::string(full_access_prefix) + kit::NewCommandId().value};
-  full_access_.emplace(id, FullAccessGrant{std::move(workspace), clock_() + 30min});
+  full_access_.emplace(id, std::move(workspace));
   return {std::move(id), 1};
 }
 
@@ -270,18 +267,13 @@ kit::AgentResult<kit::PolicyDecision> RunSettings::Decide(const kit::PolicyReque
   if (!profile->id.value.starts_with(full_access_prefix)) {
     return Result::Failure({.code = kit::ErrorCode::Conflict, .message = "Permission preset changed. Choose permissions again."});
   }
-  const auto grant = full_access_.find(profile->id);
-  if (grant == full_access_.end() || profile->version != 1 || request.workspace != grant->second.workspace ||
-      !request.agent || request.agent->id != CodeAgent) {
+  if (!HasFullAccess(*profile, request.workspace) || !request.agent) {
     return Result::Failure({.code = kit::ErrorCode::Conflict, .message = "Full Access is unavailable for this task. Choose permissions again."});
-  }
-  if (clock_() >= grant->second.expires) {
-    return Result::Failure({.code = kit::ErrorCode::DeadlineExceeded, .message = "Full Access expired. Choose permissions again."});
   }
   if (!workspace_available) {
     return Result::Failure({.code = kit::ErrorCode::PermissionDenied, .message = "Full Access workspace is unavailable"});
   }
-  if (needs_confirmation && request.tool->id == ApplyCodePatch && std::ranges::none_of(request.sources, [](const auto& slice) {
+  if (needs_confirmation && IsCodePatchTool(request.tool->id) && std::ranges::none_of(request.sources, [](const auto& slice) {
         const auto* resource = std::get_if<kit::ResourceRef>(&slice.source);
         return resource && resource->version.starts_with(CodeEditorVersionPrefix);
       })) decision = kit::AccessDecision::Allow;
@@ -681,7 +673,8 @@ View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserR
   const auto effective_profile = next->execution_profile.value_or(AskProfile);
   const bool next_model = current && effective_model != current->model;
   const bool next_permission = show_permissions && current && effective_profile != current->execution_profile.value_or(AskProfile);
-  const bool full_access = agent == CodeAgent && workspace && workspace_root;
+  const bool full_access = workspace && workspace_root;
+  const bool full_access_selected = full_access && settings->HasFullAccess(effective_profile, workspace);
   const auto select_model = [next, changed](kit::ModelProviderRef ref) {
     auto selected = next.Get();
     selected.model = std::move(ref);
@@ -705,7 +698,7 @@ View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserR
     }
     if (!items.empty()) model_menu.Show(model_anchor, std::move(items), {.placement = {AnchorSide::Above, AnchorAlignment::Start}});
   };
-  const auto choose_permission = [permission_menu, permission_anchor, dialogs, settings, next, effective_profile, full_access,
+  const auto choose_permission = [permission_menu, permission_anchor, dialogs, settings, next, effective_profile, full_access, full_access_selected,
                                   workspace, workspace_root, changed] {
     const auto set = [next, changed](kit::ExecutionProfileRef profile) {
       auto selected = next.Get();
@@ -716,29 +709,33 @@ View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserR
     permission_menu.Show(permission_anchor, {
         MenuItem(::app::strings::ui_ask, [set] { set(AskProfile); }).Checked(effective_profile == AskProfile),
         MenuItem(::app::strings::ui_auto_review, [set] { set(ReviewProfile); }).Checked(effective_profile == ReviewProfile),
-        MenuItem(::app::strings::ui_full_access, [dialogs, settings, workspace, workspace_root, set] {
-          if (!workspace || !workspace_root) return;
+        MenuItem(::app::strings::ui_full_access, [dialogs, settings, workspace, workspace_root, set, full_access_selected] {
+          if (!workspace || !workspace_root || full_access_selected) return;
           ShowPreviewDialog(dialogs, DialogFactory{[settings, workspace = *workspace, root = *workspace_root, set](DialogContext dialog) {
+            const auto colors = UseTheme().colors;
+            const auto style = UseEnvironment<ButtonStyle>();
             return Column{
                 Text(::app::strings::ui_allow_patches_in_this_workspace, TextRole::Title),
                 Text(root.Path()),
-                Text(::app::strings::ui_for_30_minutes_this_assistant_can_apply),
-                Row{Spacer(), Button(::app::strings::ui_cancel).OnClick([dialog] { dialog.Dismiss(); }),
-                    Button(::app::strings::ui_allow_for_30_minutes).OnClick([settings, workspace, set, dialog] {
-                      set(settings->GrantFullAccess(workspace));
-                      dialog.Dismiss();
-                    })}.With(Spacing(8.0F)),
+                Text(::app::strings::ui_full_access_description),
+                Row{Spacer(),
+                    ProvideEnvironment(PreviewSecondaryButton(style, colors),
+                        Button(::app::strings::ui_cancel).OnClick([dialog] { dialog.Dismiss(); })),
+                    ProvideEnvironment(PreviewPrimaryButton(style, colors),
+                        Button(::app::strings::ui_allow_full_access).OnClick([settings, workspace, set, dialog] {
+                          set(settings->GrantFullAccess(workspace));
+                          dialog.Dismiss();
+                        }))}.With(Spacing(8.0F)),
             }.With(Frame{.max_width = 470.0F}, Padding(20.0F), Spacing(12.0F));
           }});
-        }).Checked(effective_profile.id.value.starts_with(full_access_prefix)).Enabled(full_access),
+        }).Checked(full_access_selected).Enabled(full_access),
     }, {.placement = {AnchorSide::Above, AnchorAlignment::Start}});
   };
-  auto permission = settings->NeedsRenewal(effective_profile, workspace)
-      ? UseString(::app::strings::ui_renew_full_access) : UseString(ProfileLabel(effective_profile));
+  auto permission = effective_profile.id.value.starts_with(full_access_prefix) && !full_access_selected
+      ? UseString(::app::strings::ui_confirm_full_access) : UseString(ProfileLabel(effective_profile));
   if (next_model) model += std::string(separator) + UseString(::app::strings::ui_next);
   if (next_permission) permission += std::string(separator) + UseString(::app::strings::ui_next);
-  const auto permission_ink = effective_profile.id.value.starts_with(full_access_prefix)
-      ? colors.on_primary_container : colors.on_surface_variant;
+  const auto permission_ink = full_access_selected ? colors.on_primary_container : colors.on_surface_variant;
   std::vector<View> controls{
       RunOptionTrigger(std::move(model), ::app::strings::ui_model, "run-model", model_anchor, choose_model,
           colors.on_surface_variant, !choices.empty() || bool(add_model), selected_brand),

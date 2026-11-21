@@ -272,9 +272,12 @@ std::optional<CodeWorkspace> CodeWorkspaces::Find(kit::WorkspaceId id) const {
   return workspace;
 }
 
-kit::AgentResult<File> ResolveCodeFile(const CodeWorkspace& workspace, std::string_view relative) {
+namespace {
+
+kit::AgentResult<File> ResolveCodePath(const CodeWorkspace& workspace, std::string_view relative, bool directory) {
   if (workspace.root.empty()) return Unavailable<File>("A native workspace is needed for this action");
-  if (relative.empty() || relative.find_first_of("\\:\"<>|?*\r\n") != relative.npos ||
+  if (directory && relative == ".") relative = {};
+  if ((!directory && relative.empty()) || relative.find_first_of("\\:\"<>|?*\r\n") != relative.npos ||
       relative.find('\0') != relative.npos || relative.starts_with('/') || relative.ends_with('/')) {
     return Unavailable<File>("Use a workspace-relative file path");
   }
@@ -298,14 +301,25 @@ kit::AgentResult<File> ResolveCodeFile(const CodeWorkspace& workspace, std::stri
       return Unavailable<File>("A workspace file is unavailable or uses a linked path");
     }
   }
-  if (!std::filesystem::is_regular_file(full, error) || error) {
-    return Unavailable<File>("Choose an existing regular file in the workspace");
+  const bool exists = directory ? std::filesystem::is_directory(full, error) : std::filesystem::is_regular_file(full, error);
+  if (!exists || error) {
+    return Unavailable<File>(directory ? "Choose an existing workspace directory" : "Choose an existing regular file in the workspace");
   }
   const auto canonical = std::filesystem::canonical(full, error);
   if (error) return Unavailable<File>("The workspace file could not be resolved");
   auto beneath = canonical.lexically_relative(workspace.root);
   if (beneath.empty() || *beneath.begin() == "..") return Unavailable<File>("The file is outside the editable workspace");
   return kit::AgentResult<File>::Success(File(canonical.u8string()));
+}
+
+} // namespace
+
+kit::AgentResult<File> ResolveCodeFile(const CodeWorkspace& workspace, std::string_view relative) {
+  return ResolveCodePath(workspace, relative, false);
+}
+
+kit::AgentResult<File> ResolveCodeDirectory(const CodeWorkspace& workspace, std::string_view relative) {
+  return ResolveCodePath(workspace, relative, true);
 }
 
 } // namespace agentkit_preview

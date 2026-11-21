@@ -47,6 +47,10 @@ View SelectableMarkdown(markdown::MarkdownDocument document, markdown::MarkdownO
                         std::function<void(std::optional<MarkdownExcerpt>)> changed,
                         std::function<void(const markdown::MarkdownLinkActivation&)> activate, MarkdownImageLoad load);
 
+View SelectablePlainText(std::string text, TextStyle style, TextShapingOptions shaping, Color highlight,
+                         ViewHandle focus, std::optional<MarkdownRange> selection,
+                         std::function<void(std::optional<MarkdownExcerpt>)> changed);
+
 std::optional<std::size_t> Utf8Offset(std::string_view text, TextOffset units);
 
 } // namespace huxerui::agentkit::detail

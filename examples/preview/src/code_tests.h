@@ -5,6 +5,7 @@
 
 namespace agentkit_preview {
 inline const huxerui::agentkit::ToolId RunCodeTests{"preview.code.ctest"};
+inline const huxerui::agentkit::ToolId RunWorkspaceTests{"run_tests"};
 inline const huxerui::agentkit::AgentId VerificationAgent{"preview.verify"};
 inline const huxerui::agentkit::JsonValue VerifyCandidateTests{std::string("verify-candidate")};
 

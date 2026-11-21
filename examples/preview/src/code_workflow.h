@@ -6,9 +6,13 @@
 
 namespace agentkit_preview {
 
+class RunSettings;
+
 huxerui::agentkit::Async<huxerui::agentkit::RunCompletion> RunCode(
     huxerui::agentkit::RunContext context, huxerui::agentkit::RunInput input,
-    std::optional<huxerui::agentkit::RunCheckpoint> checkpoint, bool tests_configured);
+    std::optional<huxerui::agentkit::RunCheckpoint> checkpoint, bool tests_configured,
+    std::weak_ptr<huxerui::agentkit::AgentRuntime> runtime, std::shared_ptr<CodeWorkspaces> workspaces,
+    std::shared_ptr<RunSettings> settings);
 
 huxerui::View CodeChat(std::shared_ptr<huxerui::agentkit::Conversation> conversation,
     std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime,

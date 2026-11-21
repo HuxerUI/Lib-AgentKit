@@ -233,7 +233,7 @@ std::optional<View> RenderCTestDiagnostics(const kit::Message& message, const ki
 
 kit::AgentResult<void> RegisterCodeTests(
     const std::shared_ptr<kit::AgentRuntime>& runtime, File executable, File logs, File evidence) {
-  return runtime->RegisterTool({
+  kit::ToolDefinition definition{
       .id = RunCodeTests, .version = 1, .description = "Run the workspace's configured CTest suite",
       .input_schema = {JsonValue{JsonValue::Object{{"enum", JsonValue{JsonValue::Array{JsonValue{}, JsonValue{true}, VerifyCandidateTests}}}}}},
       .effect = kit::ToolEffect::ExternalSubmit,
@@ -299,7 +299,13 @@ kit::AgentResult<void> RegisterCodeTests(
         }
         const auto log = logs.Child(context.CallId().value + ".log");
         co_return co_await ExecuteTests(std::move(context), executable, log, evidence, implementation, capture, call.change.inputs);
-      }});
+      }};
+  auto registered = runtime->RegisterTool(definition);
+  if (!registered.Succeeded()) return registered;
+  definition.id = RunWorkspaceTests;
+  definition.input_schema = {JsonValue{JsonValue::Object{{"type", JsonValue{std::string("object")}},
+      {"properties", JsonValue{JsonValue::Object{}}}, {"additionalProperties", JsonValue{false}}}}};
+  return runtime->RegisterTool(std::move(definition));
 }
 
 kit::Async<kit::RunCompletion> RunVerification(kit::RunContext run, kit::RunInput input,

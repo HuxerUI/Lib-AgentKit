@@ -130,13 +130,15 @@ std::pair<AttributedText, StringVariant> StyledCode(const markdown::MarkdownNode
   return {std::move(text), language->label};
 }
 
-#ifdef HUXERUI_MARKDOWN_SOURCE_MAPPING
 struct ParagraphText {
   AttributedText text;
   TextStyle style;
   TextAlign alignment;
+#ifdef HUXERUI_MARKDOWN_SOURCE_MAPPING
   std::vector<markdown::MarkdownSourceSegment> source;
+#endif
   bool image = false;
+  TextShapingOptions shaping;
 };
 
 struct ParagraphKey {
@@ -149,6 +151,7 @@ void AppendSourceRange(MarkdownSourceExcerpt& excerpt, std::size_t begin, std::s
   else excerpt.source_bytes.emplace_back(begin, end);
 }
 
+#ifdef HUXERUI_MARKDOWN_SOURCE_MAPPING
 void CollectSourceExcerpt(const markdown::MarkdownNode& node, std::size_t begin, std::size_t end,
                           MarkdownSourceExcerpt& excerpt) {
   using markdown::NodeKind;
@@ -213,6 +216,7 @@ View DecorateParagraph(View view, const markdown::MarkdownNode& node, const Attr
   for (auto& image : images) children.push_back(RenderMarkdownImage(std::move(image), load, Column(std::vector<View>{})));
   return Column(std::move(children)).With(CrossAlign(CrossAxisAlignment::Stretch));
 }
+#endif
 
 Rect InOwner(const ViewNode& owner, const ViewNode& node, Rect rect) {
   const auto first = owner.WindowToLocal(node.LocalToWindow({rect.x, rect.y}));
@@ -225,7 +229,7 @@ struct SelectionBehavior;
 
 struct SelectionModifier {
   using Extension = SelectionBehavior;
-  markdown::MarkdownDocument document;
+  std::variant<markdown::MarkdownDocument, AttributedText> source;
   Color highlight;
   ViewHandle focus;
   std::optional<MarkdownRange> selection;
@@ -244,8 +248,7 @@ struct SelectionBehavior final : NodeExtension, TextSelectionClient {
   SelectionBehavior(ViewNode&, const SelectionModifier& spec) : spec_(spec), range_(spec.selection) {}
 
   void Update(ViewNode&, const SelectionModifier& spec) {
-    const bool same_document = spec_.document == spec.document;
-    if (!same_document) {
+    if (spec_.source != spec.source) {
       pressed_ = false;
       range_.reset();
     }
@@ -266,9 +269,10 @@ struct SelectionBehavior final : NodeExtension, TextSelectionClient {
         const auto index = next.size();
         auto previous = index < paragraphs_.size() ? &paragraphs_[index] : nullptr;
         const auto layout = previous && previous->width == bounds.width && previous->content->text == (*content)->text &&
-            previous->content->style == (*content)->style && previous->content->alignment == (*content)->alignment
+            previous->content->style == (*content)->style && previous->content->alignment == (*content)->alignment &&
+            previous->content->shaping == (*content)->shaping
             ? previous->layout : measurer.CreateTextLayout((*content)->text, (*content)->style, bounds.width,
-                {.align = (*content)->alignment});
+                {.shaping = (*content)->shaping, .align = (*content)->alignment});
         const auto local = InOwner(owner, node, bounds);
         next.push_back({*content, layout, local, clip.Intersection(local), bounds.width});
         return;
@@ -487,10 +491,22 @@ private:
       excerpt.source.text += paragraph.text.TextInRange(selected);
       const auto begin = Utf8Offset(paragraph.text.PlainText(), selected.start);
       const auto end = Utf8Offset(paragraph.text.PlainText(), selected.end);
-      const auto ranges = begin && end ? markdown::ResolveMarkdownSourceRanges(
-          paragraph.text.PlainText(), paragraph.source, *begin, *end) : std::nullopt;
-      if (!ranges) mapped = false;
-      else for (const auto& [lo, hi] : *ranges) AppendSourceRange(excerpt.source, lo, hi);
+      if (!begin || !end) {
+        mapped = false;
+        continue;
+      }
+      if (std::holds_alternative<AttributedText>(spec_.source)) {
+        AppendSourceRange(excerpt.source, *begin, *end);
+        continue;
+      }
+#ifdef HUXERUI_MARKDOWN_SOURCE_MAPPING
+      const auto ranges = markdown::ResolveMarkdownSourceRanges(paragraph.text.PlainText(), paragraph.source, *begin, *end);
+      if (ranges) {
+        for (const auto& [lo, hi] : *ranges) AppendSourceRange(excerpt.source, lo, hi);
+        continue;
+      }
+#endif
+      mapped = false;
     }
     if (!mapped) excerpt.source.source_bytes.clear();
     return excerpt;
@@ -513,7 +529,6 @@ private:
   bool dragging_ = false;
 };
 
-#endif
 } // namespace
 
 std::optional<MarkdownSourceExcerpt> ReadMarkdownSourceRange(std::string_view source, std::size_t begin, std::size_t end) {
@@ -579,6 +594,19 @@ View SelectableMarkdown(markdown::MarkdownDocument document, markdown::MarkdownO
   }
 #endif
   return body;
+}
+
+View SelectablePlainText(std::string text, TextStyle style, TextShapingOptions shaping, Color highlight,
+                         ViewHandle focus, std::optional<MarkdownRange> selection,
+                         std::function<void(std::optional<MarkdownExcerpt>)> changed) {
+  AttributedText content(std::move(text));
+  auto paragraph = std::make_shared<ParagraphText>(ParagraphText{
+      .text = content, .style = style, .alignment = TextAlign::Leading, .shaping = shaping});
+  return Column{
+      Text(content).Style(std::move(style)).Shaping(std::move(shaping))
+          .LayoutValue<ParagraphKey>(std::move(paragraph)).Key("chat-selectable-text"),
+  }.With(CrossAlign(CrossAxisAlignment::Stretch), Focusable{}, focus,
+      SelectionModifier{std::move(content), highlight, focus, selection, std::move(changed)});
 }
 
 } // namespace huxerui::agentkit::detail

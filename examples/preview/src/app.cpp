@@ -894,12 +894,20 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
           co_return kit::AgentResult<kit::PolicyDecision>::Success({kit::AccessDecision::RequireConfirmation, {}});
         }
         const auto tool = request.tool ? request.tool->id : kit::ToolId{};
+        const auto workspace = request.workspace ? workspaces->Find(*request.workspace) : std::nullopt;
+        const bool workspace_available = workspace && workspace->NativeFolder();
+        if (agentkit_preview::IsWorkspaceTool(tool) && !workspace_available &&
+            (request.capability == kit::Capability::DiscoverTool || request.capability == kit::Capability::ExecuteTool)) {
+          co_return kit::AgentResult<kit::PolicyDecision>::Failure({
+              .code = kit::ErrorCode::PermissionDenied, .message = "Choose a native workspace for this conversation"});
+        }
         const bool needs_confirmation = request.capability == kit::Capability::ExecuteTool &&
             request.tool && tool != agentkit_preview::GeneratePresentation && tool != agentkit_preview::ReadCodeFiles &&
+            tool != agentkit_preview::ReadWorkspaceFiles && tool != agentkit_preview::ListWorkspaceFiles &&
+            tool != agentkit_preview::SearchWorkspaceFiles &&
             tool != agentkit_preview::ReadDesign && tool != agentkit_preview::PublishDesign &&
             tool != agentkit_preview::ReadReport && tool != agentkit_preview::PrepareReleaseOutline &&
             tool != agentkit_preview::PublishReportChart;
-        const bool workspace_available = request.workspace && workspaces->Find(*request.workspace).has_value();
         co_return settings->Decide(request, needs_confirmation, workspace_available);
       },
       .tool_reviewer = agentkit_preview::ChartExportReviewer(files.exports, std::move(review_model)),
@@ -911,8 +919,7 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
         if (agentkit_preview::HasDesignTargets(invocation.prepared_targets))
           co_return co_await design(std::move(invocation));
         if (invocation.reverts || (invocation.candidate_artifact && agentkit_preview::HasCodeTargets(invocation.prepared_targets)) ||
-            invocation.tool.id == agentkit_preview::ReadCodeFiles || invocation.tool.id == agentkit_preview::ApplyCodePatch ||
-            invocation.tool.id == agentkit_preview::RunCodeTests) {
+            agentkit_preview::IsWorkspaceTool(invocation.tool.id)) {
           co_return co_await code(std::move(invocation));
         }
         if (invocation.tool.id == agentkit_preview::ExportReportChart) co_return co_await charts(std::move(invocation));
@@ -960,17 +967,61 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
     Require(registered->RegisterModel(std::move(model)));
   }
   settings->SetDefaults(general, code);
+  const bool workspace_tests = test_runner.has_value() && (code || can_add_models);
+  const auto register_workspace_agent = [&](kit::AgentRegistration agent) {
+    auto tools = agentkit_preview::WorkspaceModelTools(workspace_tests);
+    agent.definition.tools.insert(agent.definition.tools.end(), tools.begin(), tools.end());
+    Require(registered->RegisterAgent(std::move(agent)));
+  };
+  using SpecialistWorkflow = std::function<kit::Async<kit::RunCompletion>(
+      kit::RunContext, kit::RunInput, std::optional<kit::RunCheckpoint>)>;
+  const auto register_specialist = [&](kit::AgentDefinition definition, std::string deliverable, SpecialistWorkflow workflow) {
+    auto start = [agent = definition.ref.id, deliverable = std::move(deliverable), workflow = std::move(workflow),
+                  runtime_ref, workspaces, settings, workspace_tests](
+                     kit::RunContext run, kit::RunInput input,
+                     std::optional<kit::RunCheckpoint> checkpoint) -> kit::Async<kit::RunCompletion> {
+      using Result = kit::AgentResult<kit::RunCompletion>;
+      if (checkpoint && checkpoint->stage == agentkit_preview::WorkspaceAnswerStage && checkpoint->schema_version == 1)
+        co_return co_await agentkit_preview::AnswerWithWorkspaceTools(run, checkpoint->state == kit::JsonValue{true}, true);
+      const bool user_request = input.trigger == kit::RunTrigger::UserInput || input.trigger == kit::RunTrigger::Retry ||
+          input.trigger == kit::RunTrigger::Regenerate;
+      if (!checkpoint && user_request && !input.artifact_action) {
+        auto allowed = co_await agentkit_preview::AllowsWorkspaceTools(run, agent, *runtime_ref, *workspaces, *settings);
+        if (!allowed.Succeeded()) co_return Result::Failure(allowed.Error());
+        if (allowed.Value()) {
+          auto route = co_await run.CompleteAsync({
+              .instruction = "Classify the user's current request. Use the specialist workflow to " + deliverable +
+                  " when explicitly requested. Use answer for questions, inspecting or editing the current project, "
+                  "and other tasks. Return only the route.",
+              .output_schema = kit::JsonSchema{agentkit_preview::DecodeJson(nlohmann::json{
+                  {"type", "object"}, {"required", {"route"}}, {"additionalProperties", false},
+                  {"properties", {{"route", {{"type", "string"}, {"enum", {"specialist", "answer"}}}}}}})}});
+          if (!route.Succeeded()) co_return Result::Failure(route.Error());
+          if (agentkit_preview::EncodeJson(*route.Value().structured).at("route") == "answer")
+            co_return co_await agentkit_preview::AnswerWithWorkspaceTools(run, workspace_tests, false);
+        }
+      }
+      co_return co_await workflow(std::move(run), std::move(input), std::move(checkpoint));
+    };
+    register_workspace_agent({.definition = std::move(definition),
+        .run = [start](kit::RunContext run, kit::RunInput input) {
+          return start(std::move(run), std::move(input), {});
+        },
+        .restore = [start](kit::RunContext run, kit::RunInput input, kit::RunResume resume) {
+          return start(std::move(run), std::move(input), std::move(resume.checkpoint));
+        }});
+  };
   Require(registered->RegisterAgent({.definition = {
       .ref = {selection_agent, 1}, .display_name = "Side chat",
       .instructions = instructions(std::string(selection_instructions)), .model = selected, .requires_model = {.text_stream = true},
       .budget = {.tokens = 6000, .model_turns = 2, .context_bytes = 128 << 10, .deadline = std::chrono::seconds(90)}}}));
+  Require(agentkit_preview::RegisterCodeTools(registered, evidence, workspaces));
   if (code || can_add_models) {
     auto code_provider = code ? code->id : selected;
     if (code_model) {
       settings->AddModel(*code_model);
       Require(registered->RegisterModel(std::move(*code_model)));
     }
-    Require(agentkit_preview::RegisterCodeTools(registered, evidence, workspaces));
     std::vector<kit::ToolId> tools{agentkit_preview::ReadCodeFiles, agentkit_preview::ApplyCodePatch};
     std::vector<kit::AgentId> targets;
     if (test_runner) {
@@ -989,21 +1040,22 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
           }}));
     }
     const bool tests_configured = test_runner.has_value();
-    Require(registered->RegisterAgent({
+    register_workspace_agent({
         .definition = {.ref = {agentkit_preview::CodeAgent, 1}, .display_name = "Code assistant",
-            .instructions = instructions("Review code within the user's confirmed workspace scope."),
+            .instructions = instructions("Work within the current workspace and respect its approvals."),
             .model = std::move(code_provider), .tools = std::move(tools), .context = {agentkit_preview::CodeEditorContext},
             .collaboration_targets = std::move(targets),
             .capabilities = {kit::Capability::ReadGoal, kit::Capability::ReadProject, kit::Capability::ManageTask,
                 kit::Capability::DiscoverSession, kit::Capability::ReadSession, kit::Capability::CreateSession,
                 kit::Capability::SendMessage, kit::Capability::Reply, kit::Capability::WaitForResult},
             .requires_model = {.text_stream = true, .structured_output = true}},
-        .run = [tests_configured](kit::RunContext run, kit::RunInput input) {
-          return agentkit_preview::RunCode(std::move(run), std::move(input), {}, tests_configured);
+        .run = [tests_configured, runtime_ref, workspaces, settings](kit::RunContext run, kit::RunInput input) {
+          return agentkit_preview::RunCode(std::move(run), std::move(input), {}, tests_configured, *runtime_ref, workspaces, settings);
         },
-        .restore = [tests_configured](kit::RunContext run, kit::RunInput input, kit::RunResume resume) {
-          return agentkit_preview::RunCode(std::move(run), std::move(input), std::move(resume.checkpoint), tests_configured);
-        }}));
+        .restore = [tests_configured, runtime_ref, workspaces, settings](kit::RunContext run, kit::RunInput input, kit::RunResume resume) {
+          return agentkit_preview::RunCode(std::move(run), std::move(input), std::move(resume.checkpoint),
+              tests_configured, *runtime_ref, workspaces, settings);
+        }});
   }
   Require(registered->RegisterTool({
       .id = agentkit_preview::ConfirmPreview, .version = 1, .description = "Confirm a preview action",
@@ -1031,12 +1083,12 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
   const auto export_directory = files.exports.Path();
   std::vector<kit::AgentId> general_targets{agentkit_preview::DesignAgent, agentkit_preview::PptAgent};
   if (release_available) general_targets.push_back(agentkit_preview::CodeAgent);
-  Require(registered->RegisterAgent({
+  register_workspace_agent({
       .definition = {.ref = {agentkit_preview::GeneralAgent, 1}, .display_name = "General assistant",
           .instructions = instructions({}), .model = selected,
           .tools = {agentkit_preview::ConfirmPreview, agentkit_preview::ReadReport, agentkit_preview::PrepareReleaseOutline,
-              agentkit_preview::PublishReportChart, agentkit_preview::ExportReportChart,
-              agentkit_preview::GeneratePresentation, agentkit_preview::ExportPresentation},
+              agentkit_preview::PublishReportChart, agentkit_preview::ExportReportChart, agentkit_preview::GeneratePresentation,
+              agentkit_preview::ExportPresentation},
           .skill_sources = {agentkit_preview::PreviewSkills},
           .content_types = std::move(general_content),
           .collaboration_targets = std::move(general_targets),
@@ -1044,42 +1096,38 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
               kit::Capability::ReadProject, kit::Capability::ManageTask, kit::Capability::DiscoverSession, kit::Capability::ReadSession,
               kit::Capability::CreateSession, kit::Capability::SendMessage, kit::Capability::WaitForResult},
           .requires_model = {.text_stream = true, .structured_output = true}},
-      .run = [release_available, export_directory](kit::RunContext run, kit::RunInput input) {
-        return agentkit_preview::RunGeneral(std::move(run), std::move(input), {}, release_available, export_directory);
+      .run = [release_available, export_directory, workspaces, settings, workspace_tests, runtime_ref](kit::RunContext run, kit::RunInput input) {
+        return agentkit_preview::RunGeneral(std::move(run), std::move(input), {}, release_available, export_directory,
+            workspaces, settings, workspace_tests, *runtime_ref);
       },
-      .restore = [release_available, export_directory](kit::RunContext run, kit::RunInput input, kit::RunResume resume) {
+      .restore = [release_available, export_directory, workspaces, settings, workspace_tests, runtime_ref](
+                     kit::RunContext run, kit::RunInput input, kit::RunResume resume) {
         return agentkit_preview::RunGeneral(
-            std::move(run), std::move(input), std::move(resume.checkpoint), release_available, export_directory);
-      }}));
+            std::move(run), std::move(input), std::move(resume.checkpoint), release_available, export_directory,
+            workspaces, settings, workspace_tests, *runtime_ref);
+      }});
   Require(agentkit_preview::RegisterDesignTools(registered, designs));
-  Require(registered->RegisterAgent({
-      .definition = {.ref = {agentkit_preview::DesignAgent, 1}, .display_name = "Design assistant",
+  register_specialist(
+      {.ref = {agentkit_preview::DesignAgent, 1}, .display_name = "Design assistant",
           .instructions = instructions("Design local interface wireframes using the supplied component vocabulary."),
           .model = selected, .tools = {agentkit_preview::ReadDesign, agentkit_preview::PublishDesign},
           .capabilities = {kit::Capability::ReadGoal, kit::Capability::ReadProject, kit::Capability::ManageTask, kit::Capability::Reply},
           .requires_model = {.text_stream = true, .structured_output = true}},
-      .run = [](kit::RunContext context, kit::RunInput input) {
-        return agentkit_preview::RunDesign(std::move(context), std::move(input), {});
-      },
-      .restore = [](kit::RunContext context, kit::RunInput input, kit::RunResume resume) {
-        return agentkit_preview::RunDesign(std::move(context), std::move(input), std::move(resume.checkpoint));
-      }}));
+      "create or revise an interface wireframe", agentkit_preview::RunDesign);
   Require(agentkit_preview::RegisterPresentationTools(registered, files));
-  Require(registered->RegisterAgent({
-      .definition = {.ref = {agentkit_preview::PptAgent, 1}, .display_name = "PPT assistant",
+  register_specialist(
+      {.ref = {agentkit_preview::PptAgent, 1}, .display_name = "PPT assistant",
           .instructions = instructions("Prepare slide outlines based on the user's brief. Treat reference notes as source material."),
           .model = std::move(selected), .tools = {agentkit_preview::GeneratePresentation, agentkit_preview::ExportPresentation},
           .content_types = std::move(presentation_content),
           .capabilities = {kit::Capability::ReadGoal, kit::Capability::ReadProject, kit::Capability::ReadContext,
               kit::Capability::ManageTask, kit::Capability::Reply},
           .requires_model = {.text_stream = true, .structured_output = true}},
-      .run = [export_directory](kit::RunContext context, kit::RunInput input) {
-        return agentkit_preview::RunPresentation(std::move(context), std::move(input), {}, export_directory);
-      },
-      .restore = [export_directory](kit::RunContext context, kit::RunInput input, kit::RunResume resume) {
+      "create a slide presentation", [export_directory](kit::RunContext context, kit::RunInput input,
+                                                          std::optional<kit::RunCheckpoint> checkpoint) {
         return agentkit_preview::RunPresentation(
-            std::move(context), std::move(input), std::move(resume.checkpoint), export_directory);
-      }}));
+            std::move(context), std::move(input), std::move(checkpoint), export_directory);
+      });
   return registered;
 }
 
@@ -1108,10 +1156,10 @@ std::optional<View> PreviewAttachmentAction(const std::shared_ptr<PreviewService
 std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std::optional<File> database, bool read_model_configuration,
                     std::optional<File> startup_workspace = {}, std::optional<kit::ModelRegistration> code_model = {},
                     std::optional<File> test_runner = {}, PreviewStoreAdapter adapt_store = {},
-                    std::vector<kit::ModelRegistration> additional_models = {}, std::function<kit::TimePoint()> clock = {},
+                    std::vector<kit::ModelRegistration> additional_models = {},
                     bool review_user_comparisons = false) {
   auto service = std::make_shared<PreviewService>();
-  service->run_settings = std::make_shared<agentkit_preview::RunSettings>(std::move(clock));
+  service->run_settings = std::make_shared<agentkit_preview::RunSettings>();
   auto selection = std::make_shared<agentkit_preview::PreviewSideChats>(agentkit_preview::PreviewSideChats{nullptr, selection_agent});
   context.Provide(service);
   context.Provide(std::make_shared<kit::AgentChatModelAvatar>([settings = service->run_settings](
@@ -2503,9 +2551,11 @@ View PreviewShell() {
       };
       options.tool_label = [resources](const kit::ToolRef& tool) -> std::string {
         using namespace agentkit_preview;
-        if (tool.id == ReadCodeFiles) return resources->GetString(::app::strings::ui_activity_read_files);
-        if (tool.id == ApplyCodePatch) return resources->GetString(::app::strings::ui_activity_apply_changes);
-        if (tool.id == RunCodeTests) return resources->GetString(::app::strings::ui_activity_workspace_tests);
+        if (tool.id == ReadCodeFiles || tool.id == ReadWorkspaceFiles) return resources->GetString(::app::strings::ui_activity_read_files);
+        if (tool.id == ListWorkspaceFiles) return resources->GetString(::app::strings::ui_activity_list_files);
+        if (tool.id == SearchWorkspaceFiles) return resources->GetString(::app::strings::ui_activity_search_files);
+        if (IsCodePatchTool(tool.id)) return resources->GetString(::app::strings::ui_activity_apply_changes);
+        if (tool.id == RunCodeTests || tool.id == RunWorkspaceTests) return resources->GetString(::app::strings::ui_activity_workspace_tests);
         return {};
       };
       agentkit_preview::ConfigurePreviewArtifactReview(options, service->runtime, presentation_pages, open_presentation, service->workspaces);
@@ -2574,8 +2624,6 @@ View PreviewShell() {
               }.With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Center), Tooltip(location)).Key("conversation-location"));
             }
             row.push_back(std::move(title).With(Grow()));
-            if (snapshot->summary.pending_interactions && !compact)
-              row.push_back(Text(::app::strings::ui_action_required, TextRole::Label).With(Foreground(colors.on_surface_variant)));
             row.push_back(std::move(controls));
             auto heading = Row(std::move(row)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
             return Column{std::move(heading).Key("agent-chat-heading")}
@@ -2894,12 +2942,12 @@ using ConfiguredPreviewDriver = std::function<Task<void>(
     kit::AgentResult<std::shared_ptr<kit::AgentRuntime>>, std::optional<kit::WorkspaceId>, kit::ProjectId)>;
 
 ApplicationHook MakeRunSettingsTestInstaller(File database, File workspace, std::vector<kit::ModelRegistration> models,
-                                            std::function<kit::TimePoint()> clock, ConfiguredPreviewDriver drive,
+                                            ConfiguredPreviewDriver drive,
                                             bool review_user_comparisons, PreviewStoreAdapter adapt_store) {
   return [database = std::move(database), workspace = std::move(workspace), models = std::move(models),
-          clock = std::move(clock), drive = std::move(drive), review_user_comparisons,
+          drive = std::move(drive), review_user_comparisons,
           adapt_store = std::move(adapt_store)](ApplicationContext& context) {
-    auto service = InstallPreview(context, database, false, workspace, {}, {}, adapt_store, models, clock, review_user_comparisons);
+    auto service = InstallPreview(context, database, false, workspace, {}, {}, adapt_store, models, review_user_comparisons);
     UseApplicationTaskScope().Launch([service, drive]() -> Task<void> {
       auto started = co_await WaitForRuntime(service);
       co_await drive(std::move(started), service->startup_workspace, ProjectFor(service->startup_workspace));

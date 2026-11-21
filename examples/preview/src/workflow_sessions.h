@@ -6,18 +6,23 @@
 namespace agentkit_preview {
 
 inline huxerui::agentkit::Async<huxerui::agentkit::SessionSummary> FindRunSession(
-    huxerui::agentkit::RunContext run, huxerui::agentkit::AgentId agent) {
+    huxerui::agentkit::SessionService sessions, huxerui::agentkit::RunId run, huxerui::agentkit::AgentId agent) {
   namespace kit = huxerui::agentkit;
   using Result = kit::AgentResult<kit::SessionSummary>;
   std::optional<kit::PageCursor> cursor;
   do {
-    auto next = co_await run.Sessions().ListAsync({.agent = agent}, cursor);
+    auto next = co_await sessions.ListAsync({.agent = agent}, cursor);
     if (!next.Succeeded()) co_return Result::Failure(next.Error());
-    auto own = std::ranges::find_if(next.Value().sessions, [&](const auto& item) { return item.active_run == run.Id(); });
+    auto own = std::ranges::find_if(next.Value().sessions, [&](const auto& item) { return item.active_run == run; });
     if (own != next.Value().sessions.end()) co_return Result::Success(*own);
     cursor = next.Value().next;
   } while (cursor);
   co_return Result::Failure({.code = kit::ErrorCode::NotFound, .message = "The running conversation is unavailable"});
+}
+
+inline huxerui::agentkit::Async<huxerui::agentkit::SessionSummary> FindRunSession(
+    huxerui::agentkit::RunContext run, huxerui::agentkit::AgentId agent) {
+  return FindRunSession(run.Sessions(), run.Id(), std::move(agent));
 }
 
 inline huxerui::agentkit::Async<huxerui::agentkit::ProjectTaskSnapshot> FindProjectTask(
