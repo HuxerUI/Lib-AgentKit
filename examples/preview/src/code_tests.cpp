@@ -1,3 +1,5 @@
+#include <app_resources.h>
+
 #include "code_tests.h"
 #include "code_tools.h"
 #include "workspace_evidence.h"
@@ -89,7 +91,7 @@ View CTestDiagnostics(std::string text) {
   style.padding = EdgeInsets::Symmetric(8.0F, 4.0F);
   style.minimum_height = 32.0F;
   std::vector<View> body{Row{ProvideEnvironment(style,
-      Button(expanded.Get() ? "Hide test output" : "Show test output")
+      Button(expanded.Get() ? ::app::strings::ui_hide_test_output : ::app::strings::ui_show_test_output)
           .OnClick([expanded] { expanded = !expanded.Get(); })
           .With(Semantics{.expanded = expanded.Get()}).Key("ctest-output-toggle")), Spacer()}};
   if (expanded.Get()) {

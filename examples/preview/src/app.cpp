@@ -1,5 +1,6 @@
 #include <huxerui/huxerui.h>
 #include <huxerui/agentkit.h>
+#include <app_resources.h>
 
 #include "code_tools.h"
 #include "attachment_imports.h"
@@ -22,8 +23,6 @@
 #include "preview_settings.h"
 #include "preview_store.h"
 #include "preview_theme.h"
-#include "../../../src/chat_control_icons.h"
-#include "../../../src/chat_layout_style.h"
 #include "workspace_evidence.h"
 #include "worktree.h"
 
@@ -55,6 +54,9 @@ namespace kit = huxerui::agentkit;
 
 namespace {
 using namespace std::chrono_literals;
+
+constexpr kit::AgentChatLayoutStyle preview_chat_layout{
+    .content_width = 754.0F, .heading_size = 17.0F, .chat_bubbles = true, .show_run_activity = true};
 
 const kit::AgentId selection_agent{"preview.side-chat"};
 constexpr std::string_view selection_label = "Selected passage:\n";
@@ -93,9 +95,11 @@ public:
 
   kit::Async<std::unique_ptr<kit::ModelTurnStream>> StartTurnAsync(kit::ModelTurnRequest request) override {
     std::string latest;
+    std::string previous;
     const kit::ModelToolResult* result = nullptr;
     for (const auto& item : request.items) {
       if (const auto* input = std::get_if<kit::ModelContent>(&item); input && input->role == kit::ModelContent::Role::User) {
+        previous = std::move(latest);
         latest = std::get<std::string>(input->body);
         result = nullptr;
       }
@@ -118,7 +122,7 @@ public:
       }
       if (fields && fields->contains("route")) {
         constexpr std::string_view marker = "Classify this request:\n";
-        constexpr std::string_view instructions = "\nReturn route and answer.";
+        constexpr std::string_view instructions = "\nReturn only the route.";
         auto request = latest.starts_with(marker) ? latest.substr(marker.size()) : latest;
         if (auto end = request.rfind(instructions); end != std::string::npos) request.resize(end);
         const auto route = request.starts_with("Outline this report:") ? "outline" :
@@ -127,8 +131,7 @@ public:
             request.starts_with("Workspace release:") ? agentkit_preview::WorkspaceRelease :
             request.starts_with("Design briefing:") ? "design-briefing" : "answer";
         events = {kit::ModelStructuredOutput{kit::JsonValue{kit::JsonValue::Object{
-            {"route", kit::JsonValue{std::string(route)}},
-            {"answer", route == "answer" ? kit::JsonValue{"Received: " + request} : kit::JsonValue{}}}}}};
+            {"route", kit::JsonValue{std::string(route)}}}}}};
       } else if (fields && fields->contains("categories")) {
         constexpr std::string_view marker = "Pie chart:";
         auto start = latest.find(marker);
@@ -229,6 +232,8 @@ public:
                 kit::ModelStructuredOutput{agentkit_preview::WritePresentationOutline({
                     std::move(topic), {{"Overview", {"Describe the purpose and audience"}},
                                        {"Next steps", {"Summarize decisions and owners"}}}})}};
+    } else if (latest == agentkit_preview::GeneralAnswerInstruction) {
+      events = {kit::ModelTextDelta{"Received: "}, kit::ModelTextDelta{std::move(previous)}};
     } else if (request.instructions == selection_instructions) {
       for (const auto& item : request.items) {
         const auto* content = std::get_if<kit::ModelContent>(&item);
@@ -418,6 +423,7 @@ struct PreviewModelOptions {
   bool image_input = false;
   bool file_input = false;
   std::string credential_environment;
+  bool reasoning_summary = false;
 };
 
 std::optional<kit::ModelRegistration> ConfiguredModel(PreviewModelOptions options, std::string_view slot) {
@@ -436,6 +442,8 @@ std::optional<kit::ModelRegistration> ConfiguredModel(PreviewModelOptions option
       protocol == "generate-content" || protocol == "interactions" ? "gemini" : "openai";
   if ((options.image_input || options.file_input) && protocol != "generate-content" && protocol != "interactions")
     throw std::invalid_argument("Attachments require Gemini GenerateContent or Interactions");
+  if (options.reasoning_summary && (provider != "openai" || protocol != "responses"))
+    throw std::invalid_argument("Reasoning summaries require a supporting OpenAI Responses model");
   const auto connect = [](auto registration) {
     if (!registration.Succeeded()) throw std::invalid_argument(registration.Error().message);
     return std::move(registration).Value();
@@ -466,10 +474,12 @@ std::optional<kit::ModelRegistration> ConfiguredModel(PreviewModelOptions option
     if (provider != "openai" || persist) {
       provider_prefix += provider + "/" + std::to_string(store) + "/" + std::to_string(persist) + "/";
     }
+    if (options.reasoning_summary) provider_prefix += "summary/";
     const auto identity = identity_for(provider_prefix + std::to_string(url.size()) + "/" + url + model);
     return connect(kit::MakeResponsesModel({.ref = identity, .model = std::move(model), .base_url = std::move(url),
         .bearer_token = std::move(credential), .allow_persist_resume_state = persist,
-        .output_format = kit::ResponsesOutputFormat::JsonObject, .dialect = dialect->second, .allow_server_state = store}));
+        .output_format = kit::ResponsesOutputFormat::JsonObject, .dialect = dialect->second, .allow_server_state = store,
+        .reasoning_summary = options.reasoning_summary}));
   }
   if (protocol == "messages") {
     const std::map<std::string_view, kit::MessagesDialect> dialects{
@@ -600,7 +610,7 @@ kit::ModelRegistration MakeProfileModel(const agentkit_preview::ModelProfileInpu
   auto model = ConfiguredModel({.model = profile.model, .base_url = profile.base_url, .provider = profile.provider,
       .protocol = profile.protocol, .api_key = environment.empty() ? profile.api_key : std::string{},
       .image_input = profile.image_input, .file_input = profile.file_input,
-      .credential_environment = std::move(environment)}, {});
+      .credential_environment = std::move(environment), .reasoning_summary = profile.reasoning_summary}, {});
   return std::move(model).value();
 }
 
@@ -637,7 +647,8 @@ Task<void> LoadModelProfiles(const std::shared_ptr<PreviewService>& service, con
       auto model = MakeProfileModel({.model = record.at("model").get<std::string>(),
           .base_url = record.at("base_url").get<std::string>(), .protocol = record.at("protocol").get<std::string>(),
           .provider = record.at("provider").get<std::string>(), .api_key = std::move(api_key),
-          .image_input = record.value("image_input", false), .file_input = record.value("file_input", false)},
+          .image_input = record.value("image_input", false), .file_input = record.value("file_input", false),
+          .reasoning_summary = record.value("reasoning_summary", false)},
           std::move(environment));
       if (std::ranges::find(models, model.ref, &kit::ModelRegistration::ref) == models.end()) {
         models.push_back(std::move(model));
@@ -672,7 +683,7 @@ kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewServic
   const auto pending = service->model_profiles->Child(name + ".pending");
   auto record = nlohmann::json{{"model", profile.model}, {"base_url", profile.base_url},
       {"protocol", profile.protocol}, {"provider", profile.provider},
-      {"image_input", profile.image_input}, {"file_input", profile.file_input}};
+      {"image_input", profile.image_input}, {"file_input", profile.file_input}, {"reasoning_summary", profile.reasoning_summary}};
   const bool direct = !profile.api_key.empty() && environment.empty();
   if (!environment.empty()) record["api_key_reference"] = profile.api_key;
 #ifdef _WIN32
@@ -709,7 +720,7 @@ std::optional<kit::ModelRegistration> ConfiguredEnvironmentModel(std::string_vie
   const auto read = [&prefix](std::string_view name) { return Environment((prefix + std::string(name)).c_str()); };
   return ConfiguredModel({read("MODEL"), read("BASE_URL"), read("PROVIDER"), read("PROTOCOL"), read("API_KEY"),
       read("ANTHROPIC_VERSION"), read("ALLOW_SERVER_STATE") == "1", read("PERSIST_RESUME_STATE") == "1",
-      read("IMAGE_INPUT") == "1", read("FILE_INPUT") == "1"}, slot);
+      read("IMAGE_INPUT") == "1", read("FILE_INPUT") == "1", {}, read("REASONING_SUMMARY") == "1"}, slot);
 }
 
 std::vector<kit::ModelRegistration> ConfiguredModels() {
@@ -1312,51 +1323,50 @@ View CopyWorktreeDialog(DialogContext dialog, std::shared_ptr<PreviewService> se
       dialog.Dismiss();
     });
   };
-  std::vector<View> content{Text(comparison_cleanup ? "Remove unused candidate checkout" :
-      discard.Get() ? "Discard unfinished copy" : "Copy to worktree", TextRole::Title)};
+  std::vector<View> content{Text(comparison_cleanup ? ::app::strings::ui_remove_unused_candidate_checkout :
+      discard.Get() ? ::app::strings::ui_discard_unfinished_copy : ::app::strings::ui_copy_to_worktree, TextRole::Title)};
   if (preview.Get()) {
     const auto& plan = *preview.Get();
-    content.push_back(Text("Repository\n" + plan.source));
-    content.push_back(Text("Commit\n" + plan.commit));
-    content.push_back(Text("New branch\n" + plan.branch));
-    content.push_back(Text("Destination\n" + plan.directory));
+    content.push_back(Text(StringVariant::Format(::app::strings::ui_repository_n_0, plan.source)));
+    content.push_back(Text(StringVariant::Format(::app::strings::ui_commit_n_0, plan.commit)));
+    content.push_back(Text(StringVariant::Format(::app::strings::ui_new_branch_n_0, plan.branch)));
+    content.push_back(Text(StringVariant::Format(::app::strings::ui_destination_n_0, plan.directory)));
     if (discard.Get()) {
       if (plan.recovery_error) content.push_back(Text(plan.recovery_error->message, TextRole::Label));
-      content.push_back(Text("Remove the checkout and its workspace registration after verifying that no conversation uses them. "
-          "The Git branch will remain.", TextRole::Label));
+      content.push_back(Text(::app::strings::ui_remove_the_checkout_and_its_workspace_registration, TextRole::Label));
     } else {
-      content.push_back(Text("The copy starts with Ask permissions.", TextRole::Label));
+      content.push_back(Text(::app::strings::ui_the_copy_starts_with_ask_permissions, TextRole::Label));
     }
   } else {
-    content.push_back(TextField(revision).Label("Commit or revision").Key("worktree-revision")
+    content.push_back(TextField(revision).Label(::app::strings::ui_commit_or_revision).Key("worktree-revision")
         .OnChanged([revision](const auto& value) { revision = value; }));
-    content.push_back(TextField(branch).Label("New branch").Key("worktree-branch")
+    content.push_back(TextField(branch).Label(::app::strings::ui_new_branch).Key("worktree-branch")
         .OnChanged([branch](const auto& value) { branch = value; }));
-    content.push_back(TextField(directory).Label("Absolute destination path").Key("worktree-directory")
+    content.push_back(TextField(directory).Label(::app::strings::ui_absolute_destination_path).Key("worktree-directory")
         .OnChanged([directory](const auto& value) { directory = value; }));
   }
   if (!error.Get().empty()) content.push_back(Text(error.Get(), TextRole::Label));
   std::vector<View> buttons;
   if (preview.Get() && !recovered) {
-    buttons.push_back(Button("Edit details").OnClick([preview, error] {
+    buttons.push_back(Button(::app::strings::ui_edit_details).OnClick([preview, error] {
       preview = std::shared_ptr<agentkit_preview::WorktreePreview>{};
       error = "";
     }).With(Enabled(!busy.Get())));
   }
   if (recovered && !recovered->cleanup_started && !comparison_cleanup) {
-    buttons.push_back(Button(discard.Get() ? "Back" : "Discard copy").OnClick([discard, error] {
+    buttons.push_back(Button(discard.Get() ? ::app::strings::ui_back : ::app::strings::ui_discard_copy).OnClick([discard, error] {
       discard = !discard.Get();
       error = "";
     }).With(Enabled(!busy.Get())));
   }
   buttons.push_back(Spacer());
-  buttons.push_back(Button("Close").OnClick([dialog] { dialog.Dismiss(); }).With(Enabled(!busy.Get())));
+  buttons.push_back(Button(::app::strings::ui_close).OnClick([dialog] { dialog.Dismiss(); }).With(Enabled(!busy.Get())));
   if (discard.Get()) {
-    buttons.push_back(Button("Remove checkout").OnClick(remove).With(Enabled(!busy.Get())));
+    buttons.push_back(Button(::app::strings::ui_remove_checkout).OnClick(remove).With(Enabled(!busy.Get())));
   } else if (preview.Get()) {
-    buttons.push_back(Button("Create worktree and copy").OnClick(confirm).With(Enabled(!busy.Get())));
+    buttons.push_back(Button(::app::strings::ui_create_worktree_and_copy).OnClick(confirm).With(Enabled(!busy.Get())));
   } else {
-    buttons.push_back(Button("Review worktree").OnClick(prepare)
+    buttons.push_back(Button(::app::strings::ui_review_worktree).OnClick(prepare)
         .With(Enabled(!busy.Get() && !revision->text.empty() && !branch->text.empty() && !directory->text.empty())));
   }
   content.push_back(Row(std::move(buttons)).With(Spacing(8.0F)));
@@ -1366,84 +1376,27 @@ View CopyWorktreeDialog(DialogContext dialog, std::shared_ptr<PreviewService> se
 enum class NavigationSymbol { New, Folder, Inbox, Plus, Down, Right, Panel, More, Chat, Code, Slides, Design, Layers, Settings };
 
 View NavigationIcon(NavigationSymbol symbol, Color ink) {
-  return Canvas([symbol, ink](PaintContext& context, Size) {
-    const StrokeStyle stroke{.width = 1.35F, .cap = StrokeCap::Round, .join = StrokeJoin::Round};
-    const auto line = [&](float x, float y, float end_x, float end_y) {
-      context.DrawLine({x, y}, {end_x, end_y}, ink, stroke);
-    };
-    switch (symbol) {
-      case NavigationSymbol::New:
-        line(9, 3, 2.5F, 3); line(2.5F, 3, 2.5F, 13.5F); line(2.5F, 13.5F, 13, 13.5F);
-        line(13, 13.5F, 13, 7); line(6.5F, 9.5F, 13.5F, 2.5F); line(6.5F, 9.5F, 6, 6.8F);
-        break;
-      case NavigationSymbol::Folder:
-        line(2, 12.5F, 2, 4.5F); line(2, 4.5F, 6.5F, 4.5F); line(6.5F, 4.5F, 8, 6);
-        line(8, 6, 14, 6); line(14, 6, 14, 12.5F); line(14, 12.5F, 2, 12.5F);
-        break;
-      case NavigationSymbol::Inbox:
-        line(4, 3, 12, 3); line(4, 3, 2, 8); line(12, 3, 14, 8); line(2, 8, 2, 13);
-        line(14, 8, 14, 13); line(2, 13, 14, 13); line(2, 8, 6, 8); line(10, 8, 14, 8);
-        line(6, 8, 7, 10); line(7, 10, 9, 10); line(9, 10, 10, 8);
-        break;
-      case NavigationSymbol::Plus:
-        line(4, 8, 12, 8); line(8, 4, 8, 12); break;
-      case NavigationSymbol::Down:
-        line(5, 6, 8, 9); line(8, 9, 11, 6); break;
-      case NavigationSymbol::Right:
-        line(6, 5, 9, 8); line(9, 8, 6, 11); break;
-      case NavigationSymbol::Panel:
-        context.DrawBorder({2, 3, 12, 10}, ink, stroke, CornerRadii{2});
-        line(6, 3.5F, 6, 12.5F); break;
-      case NavigationSymbol::More:
-        for (const float x : {4.0F, 8.0F, 12.0F}) context.DrawCircle({x, 8}, 1.05F, ink);
-        break;
-      case NavigationSymbol::Chat:
-        context.DrawBorder({2, 3, 12, 9}, ink, stroke, CornerRadii{2});
-        line(5, 12, 5, 14); line(5, 14, 8, 12);
-        break;
-      case NavigationSymbol::Code:
-        line(5, 5, 2, 8); line(2, 8, 5, 11); line(11, 5, 14, 8); line(14, 8, 11, 11);
-        line(9.5F, 4.5F, 6.5F, 11.5F);
-        break;
-      case NavigationSymbol::Slides:
-        context.DrawBorder({2, 3, 12, 8.5F}, ink, stroke, CornerRadii{1});
-        line(8, 11.5F, 8, 14); line(5.5F, 14, 10.5F, 14);
-        break;
-      case NavigationSymbol::Design:
-        context.DrawBorder({2.5F, 2.5F, 11, 11}, ink, stroke, CornerRadii{1.5F});
-        line(6.5F, 3, 6.5F, 13); line(6.5F, 7, 13, 7);
-        break;
-      case NavigationSymbol::Layers: {
-        Path layers;
-        layers.MoveTo({2, 6}).LineTo({8, 3}).LineTo({14, 6}).LineTo({8, 9}).Close();
-        layers.MoveTo({2, 9.5F}).LineTo({8, 12.5F}).LineTo({14, 9.5F});
-        context.StrokePath(std::move(layers), ink, stroke);
-        break;
-      }
-      case NavigationSymbol::Settings: {
-        Path gear;
-        gear.MoveTo({7, 2}).LineTo({9, 2}).LineTo({10, 4}).LineTo({12, 4}).LineTo({13.5F, 6.5F})
-            .LineTo({12.5F, 8}).LineTo({13.5F, 9.5F}).LineTo({12, 12}).LineTo({10, 12}).LineTo({9, 14})
-            .LineTo({7, 14}).LineTo({6, 12}).LineTo({4, 12}).LineTo({2.5F, 9.5F}).LineTo({3.5F, 8})
-            .LineTo({2.5F, 6.5F}).LineTo({4, 4}).LineTo({6, 4}).Close();
-        context.StrokePath(std::move(gear), ink, stroke);
-        context.DrawArc({8, 8}, 2.0F, 0.0F, 6.283185F, ink, stroke);
-        break;
-      }
-    }
-  }).With(Frame{.width = 16.0F, .height = 16.0F});
+  using namespace ::app::images;
+  static const std::array<const ImageResource*, 14> icons{
+      &new_conversation, &folder, &inbox, &add, &chevron_down, &chevron_right,
+      &sidebar, &more, &chat, &code, &slides, &design, &layers, &settings,
+  };
+  return Image(*icons.at(static_cast<std::size_t>(symbol))).Tint(ink).With(Frame{.width = 16.0F, .height = 16.0F});
 }
 
 [[huxerui::composable]]
-View NavigationAction(std::string label, NavigationSymbol symbol, std::function<void()> action,
+View NavigationAction(StringVariant label, NavigationSymbol symbol, std::function<void()> action,
     bool enabled = true, bool selected = false, std::string count = {}, std::optional<bool> expanded = {}) {
   const auto colors = UseTheme().colors;
   const auto hovered = UseState(false);
   const bool new_conversation = symbol == NavigationSymbol::New;
+  const bool folder_heading = expanded.has_value();
   const auto ink = selected ? colors.on_primary_container : colors.on_surface;
-  std::vector<View> content{NavigationIcon(symbol, ink),
-      Text(label).Style({Font::System(13.0F).WithWeight(symbol == NavigationSymbol::New ?
-          FontWeight::SemiBold : FontWeight::Regular), ink}).LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow())};
+  std::vector<View> content{NavigationIcon(symbol, folder_heading ? colors.on_surface_variant : ink)};
+  if (folder_heading) content.push_back(NavigationIcon(NavigationSymbol::Folder, colors.on_surface_variant));
+  content.push_back(Text(label).Style({Font::System(13.0F).WithWeight(new_conversation ?
+      FontWeight::SemiBold : folder_heading ? FontWeight::Medium : FontWeight::Regular), ink})
+      .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow()));
   if (!count.empty()) content.push_back(Text(count).Style({Font::System(12.0F), colors.on_surface_variant})
       .Key("pending-navigation-count"));
   return Row(std::move(content))
@@ -1452,7 +1405,8 @@ View NavigationAction(std::string label, NavigationSymbol symbol, std::function<
     action();
     return true;
   }).On<ViewEvents::Hover>([hovered](const HoverEvent& event) { hovered = event.type != HoverEventType::Leave; })
-      .With(Frame{.height = new_conversation ? 42.0F : 36.0F}, Padding(EdgeInsets::Symmetric(10.0F, 0.0F)), Spacing(9.0F),
+      .With(Frame{.height = new_conversation ? 42.0F : folder_heading ? 34.0F : 36.0F},
+            Padding(EdgeInsets::Symmetric(folder_heading ? 6.0F : 10.0F, 0.0F)), Spacing(folder_heading ? 6.0F : 9.0F),
             CrossAlign(CrossAxisAlignment::Center), CornerRadius(9.0F), Focusable{}, Enabled(enabled),
             Background(hovered.Get() && enabled ? colors.surface_container_highest : selected ? colors.primary_container :
                 new_conversation ? colors.surface_container_high : Color::Transparent()),
@@ -1461,7 +1415,7 @@ View NavigationAction(std::string label, NavigationSymbol symbol, std::function<
 }
 
 [[huxerui::composable]]
-View DraftChoice(NavigationSymbol icon, std::string label, std::string value, std::string hint, std::string key,
+View DraftChoice(NavigationSymbol icon, StringVariant label, std::string value, std::string hint, std::string key,
     std::function<std::vector<MenuEntry>()> choices, bool enabled) {
   const auto colors = UseTheme().colors;
   const auto anchor = UseViewHandle();
@@ -1486,25 +1440,19 @@ View DraftChoice(NavigationSymbol icon, std::string label, std::string value, st
 }
 
 View PreviewWordmark(const ColorScheme& colors) {
-  auto mark = Canvas([ink = colors.on_primary_container](PaintContext& context, Size) {
-    const StrokeStyle stroke{.width = 1.5F, .cap = StrokeCap::Round, .join = StrokeJoin::Round};
-    Path trace;
-    trace.MoveTo({5, 19}).LineTo({10, 8}).LineTo({15, 19}).LineTo({20, 8});
-    trace.MoveTo({7.5F, 14}).LineTo({17.5F, 14});
-    context.StrokePath(std::move(trace), ink, stroke);
-    context.DrawCircle({20, 8}, 1.5F, ink);
-  }).With(Frame{.width = 26.0F, .height = 26.0F}, Background(colors.primary_container), CornerRadius(7.0F));
+  auto mark = Image(::app::images::agentkit_mark).Tint(colors.on_primary_container)
+      .With(Frame{.width = 26.0F, .height = 26.0F}, Background(colors.primary_container), CornerRadius(7.0F));
   return Row{
       std::move(mark),
-      Text("AgentKit").Style({Font::System(14.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}),
+      Text(::app::strings::ui_agentkit).Style({Font::System(14.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}),
   }.With(Spacing(9.0F), CrossAlign(CrossAxisAlignment::Center));
 }
 
-std::string PreviewAgentLabel(const kit::AgentRef& agent) {
-  if (agent.id == agentkit_preview::CodeAgent) return "Code assistant";
-  if (agent.id == agentkit_preview::PptAgent) return "PPT assistant";
-  if (agent.id == agentkit_preview::DesignAgent) return "Design assistant";
-  if (agent.id == agentkit_preview::GeneralAgent) return "General assistant";
+StringVariant PreviewAgentLabel(const kit::AgentRef& agent) {
+  if (agent.id == agentkit_preview::CodeAgent) return ::app::strings::ui_code_assistant;
+  if (agent.id == agentkit_preview::PptAgent) return ::app::strings::ui_ppt_assistant;
+  if (agent.id == agentkit_preview::DesignAgent) return ::app::strings::ui_design_assistant;
+  if (agent.id == agentkit_preview::GeneralAgent) return ::app::strings::ui_general_assistant;
   return {};
 }
 
@@ -1516,7 +1464,7 @@ View SessionRow(kit::SessionSummary item, bool selected, bool grouped, std::func
   const auto target = UseViewHandle();
   const auto hovered = UseState(false);
   const auto focused = UseState(false);
-  auto agent = PreviewAgentLabel(item.agent);
+  auto agent = UseString(PreviewAgentLabel(item.agent));
   if (agent.empty()) agent = item.agent.id.value;
   const auto activate = [open, id = item.id] { open(id); };
   const auto ink = selected ? theme.on_primary_container : theme.on_surface;
@@ -1551,7 +1499,7 @@ View SessionRow(kit::SessionSummary item, bool selected, bool grouped, std::func
         return true;
       }).On<ViewEvents::FocusChanged>([focused](bool active) { focused = active; })
       .With(target, Focusable{}, Frame{.width = 30.0F, .height = 32.0F}, MainAlign(MainAxisAlignment::Center),
-          CrossAlign(CrossAxisAlignment::Center), Semantics{.role = SemanticRole::Button, .label = "Conversation actions"})
+          CrossAlign(CrossAxisAlignment::Center), Semantics{.role = SemanticRole::Button, .label = ::app::strings::ui_conversation_actions})
       .Key("session-actions/" + item.id.value);
   return Row{std::move(item_button), std::move(more)}
       .On<ViewEvents::Hover>([hovered](const HoverEvent& event) { hovered = event.type != HoverEventType::Leave; })
@@ -1566,8 +1514,11 @@ View SessionRow(kit::SessionSummary item, bool selected, bool grouped, std::func
 }
 
 [[huxerui::composable]]
-View NavigationNameDialog(DialogContext dialog, std::string title, std::string initial, std::function<void(std::string)> apply) {
+View NavigationNameDialog(DialogContext dialog, StringVariant title, std::string initial, std::function<void(std::string)> apply) {
   const auto name = UseState(TextEditingValue::FromText(std::move(initial)));
+  const auto colors = UseTheme().colors;
+  const auto buttons = UseEnvironment<ButtonStyle>();
+  const auto fields = agentkit_preview::PreviewFormFieldStyle(UseEnvironment<TextFieldStyle>(), colors);
   const auto save = [dialog, name, apply] {
     const auto first = name->text.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return;
@@ -1575,11 +1526,16 @@ View NavigationNameDialog(DialogContext dialog, std::string title, std::string i
     dialog.Dismiss();
   };
   return Column{
-      Text(title, TextRole::Title),
-      TextField(name).Label("Name").OnChanged([name](const TextEditingValue& value) { name = value; }).OnSubmitted(save).Key("navigation-name"),
-      Row{Spacer(), Button("Cancel").OnClick([dialog] { dialog.Dismiss(); }),
-          Button("Save").OnClick(save).With(Enabled(name->text.find_first_not_of(" \t\r\n") != std::string::npos))}.With(Spacing(8.0F)),
-  }.With(Frame{.width = 380.0F}, Padding(24.0F), Spacing(14.0F), CrossAlign(CrossAxisAlignment::Stretch));
+      Text(title, TextRole::Title).Style({Font::System(19.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}),
+      ProvideEnvironment(fields, TextField(name).Label(::app::strings::ui_name).Variant(TextFieldVariant::Outlined)
+          .OnChanged([name](const TextEditingValue& value) { name = value; }).OnSubmitted(save).Key("navigation-name")),
+      Row{Spacer(),
+          ProvideEnvironment(agentkit_preview::PreviewSecondaryButton(buttons, colors),
+              Button(::app::strings::ui_cancel).OnClick([dialog] { dialog.Dismiss(); })),
+          ProvideEnvironment(agentkit_preview::PreviewPrimaryButton(buttons, colors),
+              Button(::app::strings::ui_save).OnClick(save).With(Enabled(name->text.find_first_not_of(" \t\r\n") != std::string::npos)))}
+          .With(Spacing(8.0F)),
+  }.With(Frame{.width = 380.0F}, Padding(20.0F), Spacing(14.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
 void EditGroup(const std::shared_ptr<PreviewService>& service, std::string id,
@@ -1626,8 +1582,8 @@ View ConversationGroupRow(ConversationGroup group, std::function<void()> toggle,
   }).With(Grow(), Focusable{}, Spacing(3.0F), CrossAlign(CrossAxisAlignment::Center),
       Semantics{.role = SemanticRole::Button, .label = group.name, .expanded = !group.collapsed});
   return Row{std::move(label),
-      ProvideEnvironment(style, Button("\xe2\x80\xa6").With(anchor, Semantics{.label = "Group actions", .identifier = actions_id}).Key(actions_id)
-          .OnClick([menu, anchor, actions] { menu.Show(anchor, actions()); })),
+      IconButton(::app::images::more, ::app::strings::ui_group_actions).With(anchor, Semantics{.identifier = actions_id}).Key(actions_id)
+          .OnClick([menu, anchor, actions] { menu.Show(anchor, actions()); }),
   }.On<ViewEvents::ContextMenuRequested>([menu, actions](Point location) { menu.ShowAt(location, actions()); })
       .With(Frame{.height = 32.0F}, Padding(EdgeInsets::Symmetric(8.0F, 0.0F)), CrossAlign(CrossAxisAlignment::Center));
 }
@@ -1648,11 +1604,11 @@ View PendingRequests(std::shared_ptr<kit::AgentRuntime> runtime, State<std::shar
       }, item.interaction.body);
       rows.push_back(Row{
           Column{Text(label), Text(item.session.title, TextRole::Label)}.With(Grow(), Spacing(4.0F)),
-          Button("Open request").OnClick([open, item] { open(item); }).Key("pending/" + item.interaction.id.value),
+          Button(::app::strings::ui_open_request).OnClick([open, item] { open(item); }).Key("pending/" + item.interaction.id.value),
       }.With(Spacing(12.0F), Padding(12.0F), CrossAlign(CrossAxisAlignment::Center)).Key(item.interaction.id.value));
     }
-    if (current->items.empty()) rows.push_back(Text("No pending requests.", TextRole::Label));
-    if (current->next) rows.push_back(Button("Load more requests").OnClick([runtime, tasks, page, page_error, loading_more, current] {
+    if (current->items.empty()) rows.push_back(Text(::app::strings::ui_no_pending_requests, TextRole::Label));
+    if (current->next) rows.push_back(Button(::app::strings::ui_load_more_requests).OnClick([runtime, tasks, page, page_error, loading_more, current] {
       if (loading_more.Get()) return;
       loading_more = true;
       page_error = "";
@@ -1671,14 +1627,14 @@ View PendingRequests(std::shared_ptr<kit::AgentRuntime> runtime, State<std::shar
       });
     }).With(Enabled(!loading_more.Get())));
   } else if (load_error.empty()) {
-    rows.push_back(Text("Loading pending requests...", TextRole::Label));
+    rows.push_back(Text(::app::strings::ui_loading_pending_requests, TextRole::Label));
   }
   if (!load_error.empty()) {
     rows.push_back(Text(std::move(load_error), TextRole::Label));
-    rows.push_back(Button("Retry loading requests").OnClick(std::move(retry)));
+    rows.push_back(Button(::app::strings::ui_retry_loading_requests).OnClick(std::move(retry)));
   }
   if (!page_error.Get().empty()) rows.push_back(Text(page_error.Get(), TextRole::Label));
-  return Column{Text("Pending requests", TextRole::Title),
+  return Column{Text(::app::strings::ui_pending_requests, TextRole::Title),
       ScrollView(Column(std::move(rows)).With(Spacing(6.0F))).With(Grow(), ScrollBar())}
       .With(Grow(), Padding(24.0F), Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
@@ -1737,9 +1693,10 @@ View DetachedArtifactReview(std::shared_ptr<kit::Conversation> conversation, std
       ? service->workspaces->Find(*snapshot->summary.workspace) : std::nullopt;
   const auto theme = agentkit_preview::PreviewTheme(agentkit_preview::PreviewBrightness(
       service ? service->settings->appearance : agentkit_preview::PreviewAppearance::Dark, UseSystemThemeBrightness()));
-  return MaterialTheme(theme,
-      PreviewConversation(std::move(agent), std::move(conversation), std::move(runtime), std::move(options),
-          std::move(workspace), service ? service->workspace_evidence : std::nullopt).With(Background(theme.colors.surface)));
+  auto chat = PreviewConversation(std::move(agent), std::move(conversation), std::move(runtime), std::move(options),
+      std::move(workspace), service ? service->workspace_evidence : std::nullopt);
+  return MaterialTheme(theme, ProvideEnvironment(preview_chat_layout,
+      kit::AgentChatWithSidePane(std::move(chat)).With(Background(theme.colors.surface))));
 }
 
 WindowHandle OpenPreviewArtifactReview(const ApplicationHandle& application, std::shared_ptr<kit::Conversation> conversation,
@@ -1824,6 +1781,7 @@ std::optional<View> BrowserDraftReport(const std::shared_ptr<PreviewService>& se
 [[huxerui::composable]]
 View PreviewShell() {
   const auto theme = UseTheme();
+  const auto resources = UseService<Resources>();
   const auto service = UseService<PreviewService>();
   const auto application = UseApplication();
   const auto picker = UseService<FilePicker>();
@@ -1842,8 +1800,13 @@ View PreviewShell() {
   const bool medium = viewport_class == ViewportClass::Medium;
   const float sidebar_width = medium ? 188.0F : 224.0F;
   const float page_gutter = compact ? 14.0F : medium ? 21.0F : 36.0F;
-  constexpr kit::detail::AgentChatLayoutStyle chat_layout{
-      .content_width = 754.0F, .heading_size = 26.0F, .chat_bubbles = true};
+  using PaneSizing = std::pair<Frame, Grow>;
+  const auto sidebar_split = UseState(std::optional<std::array<PaneSizing, 2>>{});
+  auto conversation_action_style = UseEnvironment<IconButtonStyle>();
+  conversation_action_style.icon_size = 18.0F;
+  conversation_action_style.minimum_interactive_size = 34.0F;
+  conversation_action_style.state_layer_size = 32.0F;
+  conversation_action_style.foreground = theme.colors.on_surface_variant;
   const auto showing_pending = UseState(false);
   const auto selected = UseState(Selection{});
   const auto goal_session = UseState(kit::SessionId{});
@@ -2081,7 +2044,7 @@ View PreviewShell() {
       if (auto group = GroupFor(service->navigation.Get(), source)) PlaceConversation(service, id, *group);
       open_session(std::move(id));
     };
-    dialogs.Show(DialogFactory{[service, item, recovered, open_copy, refresh_pending](DialogContext context) {
+    agentkit_preview::ShowPreviewDialog(dialogs, DialogFactory{[service, item, recovered, open_copy, refresh_pending](DialogContext context) {
       return CopyWorktreeDialog(context, service, item, recovered, open_copy, refresh_pending);
     }}, {.dismiss_on_outside_press = false, .dismiss_on_cancel = false});
   };
@@ -2130,14 +2093,14 @@ View PreviewShell() {
   const auto render_session = [&](const kit::SessionSummary& item) {
     return SessionRow(item, selected->id == item.id && !showing_pending.Get(), GroupFor(nav, item.id).has_value(), open_session,
         [item, copy_conversation, show_worktree, service, dialogs, change_metadata, transfer] {
-      std::vector<MenuEntry> entries{MenuItem("Rename conversation", [dialogs, item, change_metadata] {
-        dialogs.Show(DialogFactory{[item, change_metadata](DialogContext context) {
-          return NavigationNameDialog(context, "Rename conversation", item.title,
+      std::vector<MenuEntry> entries{MenuItem(::app::strings::ui_rename_conversation, [dialogs, item, change_metadata] {
+        agentkit_preview::ShowPreviewDialog(dialogs, DialogFactory{[item, change_metadata](DialogContext context) {
+          return NavigationNameDialog(context, ::app::strings::ui_rename_conversation, item.title,
               [item, change_metadata](std::string name) { change_metadata(item, kit::RenameSession{std::move(name)}); });
         }});
       })};
       const auto current = GroupFor(service->navigation.Get(), item.id);
-      std::vector<MenuEntry> destinations{MenuItem("Ungrouped", [item, service, current] {
+      std::vector<MenuEntry> destinations{MenuItem(::app::strings::ui_ungrouped, [item, service, current] {
         PlaceConversation(service, item.id, {}, current);
       }).Checked(!current)};
       for (const auto& group : service->navigation.Get().groups) {
@@ -2146,31 +2109,31 @@ View PreviewShell() {
         })
             .Checked(current == group.id));
       }
-      entries.emplace_back(MenuItem("Move to group", std::move(destinations)));
+      entries.emplace_back(MenuItem(::app::strings::ui_move_to_group, std::move(destinations)));
       const auto workspace = item.workspace ? service->workspaces->Find(*item.workspace) : std::nullopt;
       const bool native_workspace = workspace && workspace->NativeFolder().has_value();
       std::vector<MenuEntry> assistants;
-      for (const auto& [label, id] : {std::pair{"General assistant", agentkit_preview::GeneralAgent},
-              {"Code assistant", agentkit_preview::CodeAgent}, {"PPT assistant", agentkit_preview::PptAgent},
-              {"Design assistant", agentkit_preview::DesignAgent}}) {
+      for (const auto& [label, id] : {std::pair{::app::strings::ui_general_assistant, agentkit_preview::GeneralAgent},
+              {::app::strings::ui_code_assistant, agentkit_preview::CodeAgent}, {::app::strings::ui_ppt_assistant, agentkit_preview::PptAgent},
+              {::app::strings::ui_design_assistant, agentkit_preview::DesignAgent}}) {
         if (id == item.agent.id || (id == agentkit_preview::CodeAgent && (!native_workspace || !service->code_available.Get()))) continue;
         assistants.emplace_back(MenuItem(label, [item, transfer, id] { transfer(item, id); }));
       }
-      entries.emplace_back(MenuItem("Transfer to assistant", std::move(assistants)).Enabled(!item.active_run));
-      if (item.project) entries.emplace_back(MenuItem("Shared reports", [dialogs, runtime = service->runtime, project = *item.project] {
-        dialogs.Show(DialogFactory{[runtime, project](DialogContext dialog) {
+      entries.emplace_back(MenuItem(::app::strings::ui_transfer_to_assistant, std::move(assistants)).Enabled(!item.active_run));
+      if (item.project) entries.emplace_back(MenuItem(::app::strings::ui_shared_reports, [dialogs, runtime = service->runtime, project = *item.project] {
+        agentkit_preview::ShowPreviewDialog(dialogs, DialogFactory{[runtime, project](DialogContext dialog) {
           return agentkit_preview::SharedReportsDialog(dialog, runtime, project);
         }});
       }));
-      entries.emplace_back(MenuItem("Copy conversation", [item, copy_conversation] { copy_conversation(item); }));
+      entries.emplace_back(MenuItem(::app::strings::ui_copy_conversation, [item, copy_conversation] { copy_conversation(item); }));
       if (native_workspace && item.agent.id == agentkit_preview::CodeAgent)
-        entries.emplace_back(MenuItem("Copy to worktree", [item, show_worktree] { show_worktree(item, {}); }));
-      entries.emplace_back(MenuItem("Delete conversation", [item, dialogs, change_metadata] {
-        dialogs.Show(DialogFactory{[item, change_metadata](DialogContext context) {
-          return Column{Text("Delete conversation", TextRole::Title), Text(item.title, TextRole::Label),
-              Text("This removes the conversation and its group membership. Workspace files and exports stay in place."),
-              Row{Spacer(), Button("Cancel").OnClick([context] { context.Dismiss(); }),
-                  Button("Delete").OnClick([context, item, change_metadata] {
+        entries.emplace_back(MenuItem(::app::strings::ui_copy_to_worktree, [item, show_worktree] { show_worktree(item, {}); }));
+      entries.emplace_back(MenuItem(::app::strings::ui_delete_conversation, [item, dialogs, change_metadata] {
+        agentkit_preview::ShowPreviewDialog(dialogs, DialogFactory{[item, change_metadata](DialogContext context) {
+          return Column{Text(::app::strings::ui_delete_conversation, TextRole::Title), Text(item.title, TextRole::Label),
+              Text(::app::strings::ui_this_removes_the_conversation_and_its_group),
+              Row{Spacer(), Button(::app::strings::ui_cancel).OnClick([context] { context.Dismiss(); }),
+                  Button(::app::strings::ui_delete).OnClick([context, item, change_metadata] {
                     change_metadata(item, kit::DeleteSession{});
                     context.Dismiss();
                   })}.With(Spacing(8.0F))}.With(Frame{.width = 400.0F}, Padding(24.0F), Spacing(14.0F));
@@ -2211,10 +2174,10 @@ View PreviewShell() {
           [service, group, dialogs, scope, start_draft, before = i ? std::optional{groups[i - 1]->id} : std::nullopt,
               after = i + 1 < groups.size() ? std::optional{groups[i + 1]->id} : std::nullopt] {
             return std::vector<MenuEntry>{
-                MenuItem("New conversation in group", [start_draft, scope, id = group.id] { start_draft(scope, id); }),
-                MenuItem("Rename group", [service, group, dialogs] {
-                  dialogs.Show(DialogFactory{[service, group](DialogContext context) {
-                    return NavigationNameDialog(context, "Rename group", group.name, [service, group](std::string name) {
+                MenuItem(::app::strings::ui_new_conversation_in_group, [start_draft, scope, id = group.id] { start_draft(scope, id); }),
+                MenuItem(::app::strings::ui_rename_group, [service, group, dialogs] {
+                  agentkit_preview::ShowPreviewDialog(dialogs, DialogFactory{[service, group](DialogContext context) {
+                    return NavigationNameDialog(context, ::app::strings::ui_rename_group, group.name, [service, group](std::string name) {
                       EditGroup(service, group.id, [expected = group.name, name = std::move(name)](auto& stored) {
                         if (stored.name != expected && stored.name != name)
                           return kit::AgentResult<void>::Failure({.code = kit::ErrorCode::Conflict, .message = "This group was renamed in another window"});
@@ -2224,9 +2187,9 @@ View PreviewShell() {
                     });
                   }});
                 }),
-                MenuItem("Move up", [service, id = group.id, before] { if (before) MoveGroup(service, id, *before, false); }).Enabled(before.has_value()),
-                MenuItem("Move down", [service, id = group.id, after] { if (after) MoveGroup(service, id, *after, true); }).Enabled(after.has_value()),
-                MenuItem("Remove group", [service, id = group.id] {
+                MenuItem(::app::strings::ui_move_up, [service, id = group.id, before] { if (before) MoveGroup(service, id, *before, false); }).Enabled(before.has_value()),
+                MenuItem(::app::strings::ui_move_down, [service, id = group.id, after] { if (after) MoveGroup(service, id, *after, true); }).Enabled(after.has_value()),
+                MenuItem(::app::strings::ui_remove_group, [service, id = group.id] {
                   EditNavigation(service, [id](auto& data) {
                     std::erase_if(data.groups, [&](const auto& stored) { return stored.id == id; });
                     std::erase_if(data.memberships, [&](const auto& item) { return item.second == id; });
@@ -2248,7 +2211,7 @@ View PreviewShell() {
     return rows;
   };
   if (listing) {
-    if (listing->next) directory.push_back(Button("Load more conversations").OnClick([service, tasks, sessions, listing, loading_sessions, error] {
+    if (listing->next) directory.push_back(Button(::app::strings::ui_load_more_conversations).OnClick([service, tasks, sessions, listing, loading_sessions, error] {
       if (loading_sessions.Get()) return;
       loading_sessions = true;
       tasks.Launch([service, sessions, listing, loading_sessions, error]() -> Task<void> {
@@ -2282,7 +2245,7 @@ View PreviewShell() {
     navigation_open = false;
     error = "";
   };
-  const auto section_label = [colors](std::string label) {
+  const auto section_label = [colors](StringVariant label) {
     return Text(std::move(label)).Style({Font::System(12.0F).WithWeight(FontWeight::SemiBold), colors.on_surface_variant})
         .With(Padding(EdgeInsets{.left = 8.0F}));
   };
@@ -2299,8 +2262,8 @@ View PreviewShell() {
   const auto new_group = [dialogs, service, current_folder, folder_name, workspace_expansion] {
     const auto workspace = current_folder ? service->workspaces->Find(*current_folder) : std::nullopt;
     const auto scope = workspace ? current_folder : std::nullopt;
-    const auto title = workspace ? "New group in " + folder_name(*workspace) : "New standalone group";
-    dialogs.Show(DialogFactory{[service, scope, title, workspace_expansion](DialogContext context) {
+    const auto title = workspace ? StringVariant::Format(::app::strings::ui_new_group_in_0, folder_name(*workspace)) : StringVariant{::app::strings::ui_new_standalone_group};
+    agentkit_preview::ShowPreviewDialog(dialogs, DialogFactory{[service, scope, title, workspace_expansion](DialogContext context) {
       return NavigationNameDialog(context, title, {}, [service, scope, workspace_expansion](std::string name) {
         if (scope) {
           auto expansion = workspace_expansion.Get();
@@ -2316,7 +2279,7 @@ View PreviewShell() {
   };
   std::vector<View> sections;
   if (!folders.empty()) {
-    std::vector<View> items{section_label("Workspaces")};
+    std::vector<View> items{section_label(::app::strings::ui_workspaces)};
     for (const auto& entry : folders) {
       auto title = folder_name(entry);
       auto tooltip = title;
@@ -2336,28 +2299,23 @@ View PreviewShell() {
         workspace_expansion = std::move(expansion);
       };
       const auto create = [use_workspace, id = entry.id] { use_workspace(id); };
-      const auto new_label = "New conversation in " + title;
+      const auto new_label = StringVariant::Format(::app::strings::ui_new_conversation_in_0, title);
       auto folder_row = NavigationAction(std::move(title), open ? NavigationSymbol::Down : NavigationSymbol::Right,
-          toggle, true, entry.id == current_folder, {}, open)
+          toggle, true, false, {}, open)
           .With(Tooltip(std::move(tooltip)), Grow()).Key("workspace/" + entry.id.value);
-      auto add = Row{NavigationIcon(NavigationSymbol::Plus, colors.on_surface_variant)}
-          .OnClick(create).On<ViewEvents::KeyDown>([create](const KeyEvent& event) {
-            if (event.key != Key::Enter && event.key != Key::Space) return false;
-            if (!event.repeat) create();
-            return true;
-          }).With(Focusable{}, Frame{.width = 30.0F, .height = 36.0F}, MainAlign(MainAxisAlignment::Center),
-              CrossAlign(CrossAxisAlignment::Center), Tooltip(new_label), Semantics{.role = SemanticRole::Button, .label = new_label})
-          .Key("workspace-new/" + entry.id.value);
+      auto add = ProvideEnvironment(conversation_action_style, IconButton(::app::images::add, new_label)
+          .OnClick(create).With(Tooltip(new_label)).Key("workspace-new/" + entry.id.value));
       std::vector<View> branch{Row{std::move(folder_row), std::move(add)}.With(CrossAlign(CrossAxisAlignment::Center))};
       if (open && !children.empty()) branch.push_back(Row{
           Divider(Axis::Vertical),
           Column(std::move(children)).With(Grow(), Spacing(2.0F), CrossAlign(CrossAxisAlignment::Stretch)),
-      }.With(Padding(EdgeInsets{.left = 13.0F}), Spacing(5.0F), CrossAlign(CrossAxisAlignment::Stretch)));
-      items.push_back(Column(std::move(branch)).With(CrossAlign(CrossAxisAlignment::Stretch)).Key("workspace-tree/" + entry.id.value));
+      }.With(Padding(EdgeInsets{.left = 13.0F}), Spacing(7.0F), CrossAlign(CrossAxisAlignment::Stretch)));
+      items.push_back(Column(std::move(branch)).With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Stretch))
+          .Key("workspace-tree/" + entry.id.value));
     }
     sections.push_back(Column(std::move(items)).With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Stretch)));
   }
-  sections.push_back(section_label("Standalone"));
+  sections.push_back(section_label(::app::strings::ui_standalone));
   sections.push_back(Column(workspace_directory(std::nullopt)).With(Spacing(2.0F), CrossAlign(CrossAxisAlignment::Stretch)));
   if (!directory.empty()) sections.push_back(Column(std::move(directory)).With(Spacing(2.0F), CrossAlign(CrossAxisAlignment::Stretch)));
   const auto pending = pending_page.Get();
@@ -2371,14 +2329,14 @@ View PreviewShell() {
   };
   std::vector<View> sidebar_items;
   if (!custom_preview_chrome) sidebar_items.push_back(PreviewWordmark(colors));
-  sidebar_items.push_back(NavigationAction("New conversation", NavigationSymbol::New,
+  sidebar_items.push_back(NavigationAction(::app::strings::ui_new_conversation, NavigationSymbol::New,
       [begin_draft] { begin_draft(std::nullopt); }, true,
       !selected->conversation && !showing_pending.Get() && !showing_settings.Get()).Key("new-conversation"));
   sidebar_items.push_back(Column{
-      NavigationAction("Open folder", NavigationSymbol::Folder, pick_workspace, can_open_folder && !choosing_folder.Get())
+      NavigationAction(::app::strings::ui_open_folder, NavigationSymbol::Folder, pick_workspace, can_open_folder && !choosing_folder.Get())
           .Key("open-folder"),
-      NavigationAction("New group", NavigationSymbol::Plus, new_group, ready.Get()).Key("new-group"),
-      NavigationAction("Pending", NavigationSymbol::Inbox, open_pending, ready.Get(), showing_pending.Get(), pending_count)
+      NavigationAction(::app::strings::ui_new_group, NavigationSymbol::Plus, new_group, ready.Get()).Key("new-group"),
+      NavigationAction(::app::strings::ui_pending, NavigationSymbol::Inbox, open_pending, ready.Get(), showing_pending.Get(), pending_count)
           .Key("pending-navigation"),
   }.With(Spacing(2.0F), CrossAlign(CrossAxisAlignment::Stretch)));
   sidebar_items.push_back(ProvideEnvironment(DividerStyle{colors.outline}, Divider()));
@@ -2386,17 +2344,11 @@ View PreviewShell() {
       .Key("session-directory").With(Grow()));
   if (settings_available) sidebar_items.push_back(Column{
       ProvideEnvironment(DividerStyle{colors.outline}, Divider()),
-      NavigationAction("Settings", NavigationSymbol::Settings, show_settings, true, showing_settings.Get()).Key("open-settings"),
+      NavigationAction(::app::strings::ui_settings, NavigationSymbol::Settings, show_settings, true, showing_settings.Get()).Key("open-settings"),
   }.With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Stretch)));
-  auto sidebar_body = Column(std::move(sidebar_items)).With(Grow(),
+  auto sidebar = Column(std::move(sidebar_items)).With(
       Padding(EdgeInsets{.top = 18.0F, .right = 14.0F, .bottom = 16.0F, .left = 14.0F}), Spacing(14.0F),
-      CrossAlign(CrossAxisAlignment::Stretch), Background(colors.surface_container_low));
-  auto sidebar = Row{
-      std::move(sidebar_body),
-      Canvas([line = colors.outline](PaintContext& context, Size size) {
-        context.DrawRect({0.0F, 0.0F, size.width, size.height}, line);
-      }).With(Frame{.width = 1.0F}),
-  }.With(Frame{.width = sidebar_width}, CrossAlign(CrossAxisAlignment::Stretch)).Key("workbench-navigation");
+      CrossAlign(CrossAxisAlignment::Stretch), Background(colors.surface_container_low)).Key("workbench-navigation");
 
   View main;
   if (showing_pending.Get() && ready.Get()) {
@@ -2413,7 +2365,8 @@ View PreviewShell() {
       const bool returning = comparison->origin.conversation && comparison->review && comparison->branch == selection.id;
       std::vector<View> actions;
       if (returning || (snapshot && snapshot->summary.project)) {
-        auto compare = Button(returning ? "Back to comparison" : "Compare alternatives").OnClick([comparison, selection, returning] {
+        const auto& label = returning ? ::app::strings::ui_back_to_comparison : ::app::strings::ui_compare_alternatives;
+        auto compare = IconButton(::app::images::compare, label).OnClick([comparison, selection, returning] {
           auto route = comparison.Get();
           if (!returning) {
             if (route.origin.id != selection.id) route = ComparisonNavigation{};
@@ -2423,14 +2376,15 @@ View PreviewShell() {
           comparison = std::move(route);
         });
         if (!returning) compare = std::move(compare).With(comparison_entry);
-        actions.push_back(std::move(compare).Key("comparison-entry"));
+        actions.push_back(std::move(compare).With(Tooltip(label)).Key(returning ? "comparison-return" : "comparison-entry"));
       }
-      actions.push_back(Button("Goal").OnClick([goal_session, id = selection.id] { goal_session = id; }).Key("conversation-goal"));
+      actions.push_back(IconButton(::app::images::goal, ::app::strings::ui_goal)
+          .OnClick([goal_session, id = selection.id] { goal_session = id; }).With(Tooltip(::app::strings::ui_goal)).Key("conversation-goal"));
       kit::AgentChatOptions options{
           .draft_sources = composer.sources,
           .draft = composer.text,
           .run_controls = kit::AgentChatRunControls{composer.next,
-              [service, next = composer.next, skills = composer.skills, error = composer.preference_error, sources = composer.sources](
+              [service, resources, next = composer.next, skills = composer.skills, error = composer.preference_error, sources = composer.sources](
                   const kit::SessionSummary& summary, std::optional<kit::RunStartBinding> current) {
                 const auto folder = summary.workspace ? service->workspaces->Find(*summary.workspace) : std::nullopt;
                 std::optional<View> skill_picker;
@@ -2449,16 +2403,25 @@ View PreviewShell() {
                 }
                 auto controls = agentkit_preview::RunSettingsControls(service->run_settings, next, summary.agent.id, summary.workspace,
                     folder ? folder->NativeFolder() : std::nullopt, std::move(current),
-                    std::move(save_preference), std::move(skill_picker), AddModelAction(service), PreviewAgentLabel(summary.agent));
+                    std::move(save_preference), std::move(skill_picker), AddModelAction(service), resources->GetString(PreviewAgentLabel(summary.agent)));
                 if (error.Get().empty()) return controls;
                 return View(Column{std::move(controls), Text(error.Get(), TextRole::Label)}.With(Spacing(4.0F)));
               },
-              [settings = service->run_settings](const kit::RunStartBinding& binding) { return settings->Describe(binding); }},
+              [settings = service->run_settings, resources](const kit::RunStartBinding& binding) { return settings->Describe(binding, *resources); }},
           .recovered_references = composer.recovered,
           .draft_skills = composer.skills,
-          .review_request = selection.review, .interaction_request = selection.interaction, .agent_label = PreviewAgentLabel,
-          .header_actions = Flow(std::move(actions)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center))};
+          .review_request = selection.review, .interaction_request = selection.interaction,
+          .agent_label = [resources](const kit::AgentRef& ref) { return resources->GetString(PreviewAgentLabel(ref)); },
+          .header_actions = ProvideEnvironment(conversation_action_style,
+              Row(std::move(actions)).With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Center)))};
       options.render_text_block = agentkit_preview::RenderCTestDiagnostics;
+      options.tool_label = [resources](const kit::ToolRef& tool) -> std::string {
+        using namespace agentkit_preview;
+        if (tool.id == ReadCodeFiles) return resources->GetString(::app::strings::ui_activity_read_files);
+        if (tool.id == ApplyCodePatch) return resources->GetString(::app::strings::ui_activity_apply_changes);
+        if (tool.id == RunCodeTests) return resources->GetString(::app::strings::ui_activity_workspace_tests);
+        return {};
+      };
       agentkit_preview::ConfigurePreviewArtifactReview(options, service->runtime, presentation_pages, open_presentation, service->workspaces);
       if (application.SupportsMultipleWindows()) {
         options.open_review_window = [application, runtime = service->runtime, conversation = selection.conversation,
@@ -2474,7 +2437,8 @@ View PreviewShell() {
       auto chat = PreviewConversation(agent, selection.conversation, service->runtime, std::move(options),
           std::move(code_workspace), service->workspace_evidence);
       const auto run = snapshot && snapshot->summary.active_run ? snapshot->summary.run_state : std::nullopt;
-      return agentkit_preview::SessionWorkspace(selection.conversation, ProvideEnvironment(chat_layout, std::move(chat)),
+      return agentkit_preview::SessionWorkspace(selection.conversation,
+          ProvideEnvironment(preview_chat_layout, kit::AgentChatWithSidePane(std::move(chat))),
           service->runtime, run,
           goal_session.Get() == selection.id, [goal_session] { goal_session = kit::SessionId{}; },
           [select_session](kit::PendingApproval approval) {
@@ -2526,11 +2490,11 @@ View PreviewShell() {
     const auto native_workspace = workspace ? workspace->NativeFolder() : std::nullopt;
     std::string status = draft_error->empty() ? error.Get() : draft_error.Get();
     if (code && status.empty()) {
-      if (!service->code_available.Get()) status = "Add a model to use the code assistant.";
-      else if (!workspace) status = "Open a local folder to start.";
-      else if (!native_workspace) status = "Code changes and tests require a desktop workspace.";
+      if (!service->code_available.Get()) status = UseString(::app::strings::ui_add_a_model_to_use_the_code);
+      else if (!workspace) status = UseString(::app::strings::ui_open_a_local_folder_to_start);
+      else if (!native_workspace) status = UseString(::app::strings::ui_code_changes_and_tests_require_a_desktop);
     }
-    const std::array<const char*, 4> assistants{"General", "PPT", "Code", "Design"};
+    const std::array assistants{::app::strings::ui_general, ::app::strings::ui_ppt, ::app::strings::ui_code, ::app::strings::ui_design};
     const auto chosen_group = draft_group.Get();
     const auto group = chosen_group ? std::ranges::find(nav.groups, *chosen_group, &ConversationGroup::id) : nav.groups.end();
     const auto workspace_path = native_workspace ? native_workspace->Path() : std::string{};
@@ -2548,9 +2512,10 @@ View PreviewShell() {
       return choices;
     };
     std::vector<View> selectors{
-        DraftChoice(NavigationSymbol::Folder, "Workspace", workspace ? folder_name(*workspace) : workspace_id ? "Workspace unavailable" : "No workspace",
+        DraftChoice(NavigationSymbol::Folder, ::app::strings::ui_workspace, workspace ? folder_name(*workspace) :
+            UseString(workspace_id ? ::app::strings::ui_workspace_unavailable : ::app::strings::ui_no_workspace),
             workspace_path, "draft-workspace", [use_workspace, workspace_id, folders, folder_name] {
-              std::vector<MenuEntry> choices{MenuItem("No workspace", [use_workspace, workspace_id] {
+              std::vector<MenuEntry> choices{MenuItem(::app::strings::ui_no_workspace, [use_workspace, workspace_id] {
                 if (workspace_id) use_workspace(std::nullopt);
               }).Checked(!workspace_id)};
               for (const auto& entry : folders) {
@@ -2561,8 +2526,8 @@ View PreviewShell() {
               }
               return choices;
             }, ready.Get()),
-        DraftChoice(NavigationSymbol::Layers, "Group", group == nav.groups.end() ? "Ungrouped" : group->name, {}, "draft-group", [draft_group, service] {
-          std::vector<MenuEntry> choices{MenuItem("Ungrouped", [draft_group] { draft_group = std::nullopt; }).Checked(!draft_group.Get())};
+        DraftChoice(NavigationSymbol::Layers, ::app::strings::ui_group, group == nav.groups.end() ? UseString(::app::strings::ui_ungrouped) : group->name, {}, "draft-group", [draft_group, service] {
+          std::vector<MenuEntry> choices{MenuItem(::app::strings::ui_ungrouped, [draft_group] { draft_group = std::nullopt; }).Checked(!draft_group.Get())};
           for (const auto& entry : service->navigation.Get().groups)
             choices.emplace_back(MenuItem(entry.name, [draft_group, id = entry.id] { draft_group = id; })
                 .Checked(draft_group.Get() == entry.id));
@@ -2581,9 +2546,9 @@ View PreviewShell() {
     field_style.standard.minimum_height = 0.0F;
     field_style.padding = {};
     auto message_field = ProvideEnvironment(field_style, Row{
-        TextField(draft).Label("Message").LineLimits(TextFieldLineLimits::MultiLine(2, 5))
-            .Placeholder(code ? "Describe the change" : assistant.Get() == 1 ? "Describe your presentation" :
-                assistant.Get() == 3 ? "Describe the screen or interaction" : "Send a message")
+        TextField(draft).Label(::app::strings::ui_message).LineLimits(TextFieldLineLimits::MultiLine(2, 5))
+            .Placeholder(code ? ::app::strings::ui_describe_the_change : assistant.Get() == 1 ? ::app::strings::ui_describe_your_presentation :
+                assistant.Get() == 3 ? ::app::strings::ui_describe_the_screen_or_interaction : ::app::strings::ui_send_a_message)
             .Variant(TextFieldVariant::Standard).OnChanged([draft](const TextEditingValue& input) { draft = input; })
             .On<ViewEvents::FocusChanged>([draft_focused](bool focused) { draft_focused = focused; })
             .OnSubmitted(create).With(draft_input, Grow()).Key("new-conversation-composer"),
@@ -2604,7 +2569,7 @@ View PreviewShell() {
           report_style.padding = EdgeInsets::Symmetric(7.0F, 4.0F);
           report_style.minimum_height = 32.0F;
           compose.push_back(Row{Text(report->name, TextRole::Label).LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow()),
-              ProvideEnvironment(report_style, Button("Remove report").OnClick([new_report] { new_report = std::nullopt; }))}
+              ProvideEnvironment(report_style, Button(::app::strings::ui_remove_report).OnClick([new_report] { new_report = std::nullopt; }))}
               .With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center), Padding(EdgeInsets::Symmetric(8.0F, 0.0F)),
                     Background(colors.surface_container_high), CornerRadius(6.0F)));
         } else {
@@ -2621,16 +2586,26 @@ View PreviewShell() {
         if (draft_action) draft_action = Row{std::move(*draft_action), std::move(*picker)}.With(Spacing(8.0F));
         else draft_action = std::move(*picker);
       }
-      controls = ProvideEnvironment(kit::detail::ChatComposerAnchor{draft_composer},
+      controls = ProvideEnvironment(kit::AgentChatComposerAnchor{draft_composer},
           agentkit_preview::RunSettingsControls(service->run_settings, new_start, new_agent, workspace_id,
-              native_workspace, {}, {}, std::move(draft_action), AddModelAction(service), assistants[assistant.Get()], choose_assistant));
+              native_workspace, {}, {}, std::move(draft_action), AddModelAction(service), UseString(assistants[assistant.Get()]), choose_assistant));
     }
     compose.push_back(std::move(message_field));
     const bool can_send = ready.Get() && !creating.Get() && (!draft->text.empty() || !new_sources->attachments.empty()) &&
         !draft->composition && (!code || (service->code_available.Get() && native_workspace));
+    auto send_style = UseEnvironment<IconButtonStyle>();
+    send_style.icon_size = 20.0F;
+    send_style.minimum_interactive_size = 38.0F;
+    send_style.state_layer_size = 38.0F;
+    send_style.corner_radius = 11.0F;
+    send_style.foreground = colors.on_primary;
+    send_style.disabled_foreground = colors.on_surface_variant;
+    const auto send_label = ::app::strings::ui_send;
     compose.push_back(Row{
         controls ? View(Column{std::move(*controls)}.With(Grow(), CrossAlign(CrossAxisAlignment::Stretch))) : View(Spacer()),
-        kit::detail::ChatSendAction("Send", create, can_send, colors, UseEnvironment<IconButtonStyle>()),
+        ProvideEnvironment(send_style, IconButton(::app::images::send, send_label).OnClick(create)
+            .With(Enabled(can_send), Background(can_send ? colors.primary : colors.surface_container_high),
+                CornerRadius(11.0F), Tooltip(send_label)).Key("chat-send/Send")),
     }.With(CrossAlign(CrossAxisAlignment::Center)));
     std::vector<View> context{
         Flow(std::move(selectors)).With(Spacing(7.0F), CrossAlign(CrossAxisAlignment::Center)),
@@ -2639,7 +2614,7 @@ View PreviewShell() {
         .Style({Font::System(12.0F), colors.on_surface_variant}).LineLimit(2).Overflow(TextOverflow::Ellipsis)
         .With(Tooltip(workspace_path)).Key("draft-workspace-path"));
     std::vector<View> start_page{
-        Text("New conversation", TextRole::Title)
+        Text(::app::strings::ui_new_conversation, TextRole::Title)
             .Style({Font::System(compact ? 26.0F : 31.0F).WithWeight(FontWeight::SemiBold), colors.on_surface})
             .Key("new-conversation-heading"),
         Column(std::move(context)).With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch)).Key("draft-choices"),
@@ -2652,15 +2627,15 @@ View PreviewShell() {
         const auto style = agentkit_preview::PreviewSecondaryButton(UseEnvironment<ButtonStyle>(), colors);
         start_page.push_back(Row{
             NavigationIcon(NavigationSymbol::Chat, colors.on_primary_container),
-            Column{Text("Continue last conversation", TextRole::Label).With(Foreground(colors.on_surface_variant)),
+            Column{Text(::app::strings::ui_continue_last_conversation, TextRole::Label).With(Foreground(colors.on_surface_variant)),
                 Text(recent->title).LineLimit(1).Overflow(TextOverflow::Ellipsis)}.With(Grow(), Spacing(4.0F)),
-            ProvideEnvironment(style, Button("Continue").OnClick([open_session, id = recent->id] { open_session(id); }))
+            ProvideEnvironment(style, Button(::app::strings::ui_continue).OnClick([open_session, id = recent->id] { open_session(id); }))
                 .Key("resume-conversation"),
         }.With(Padding(11.0F), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center),
             CornerRadius(12.0F), Background(colors.surface_container_low), Border{colors.outline}));
       }
     }
-    start_page.push_back(Text("Start with a task", TextRole::Label).With(Foreground(colors.on_surface_variant)));
+    start_page.push_back(Text(::app::strings::ui_start_with_a_task, TextRole::Label).With(Foreground(colors.on_surface_variant)));
     std::vector<View> starters;
     const auto prefill = [draft, focus_draft](std::string_view text) {
       if (draft->composition) return;
@@ -2670,16 +2645,17 @@ View PreviewShell() {
       draft = TextEditingValue::FromText(std::move(message));
       focus_draft = true;
     };
-    const auto add_starter = [&](const char* label, NavigationSymbol icon, std::string_view prompt) {
+    const auto add_starter = [&](const char* key, StringResource label, NavigationSymbol icon, StringResource instruction) {
+      auto prompt = UseString(instruction);
       starters.push_back(ProvideEnvironment(DividerStyle{colors.outline}, Divider()));
-      starters.push_back(NavigationAction(label, icon, [prefill, prompt] { prefill(prompt); }).Key(label));
+      starters.push_back(NavigationAction(label, icon, [prefill, prompt = std::move(prompt)] { prefill(prompt); }).Key(key));
     };
-    add_starter("Review acceptance gaps", NavigationSymbol::Inbox,
-        "Compare the design and acceptance criteria. List remaining work, verification gaps, and the next priority.");
-    add_starter("Check Markdown references", NavigationSymbol::Chat,
-        "Check whether Markdown references preserve the original message version and exact UTF-8 byte ranges.");
-    add_starter("Walk through the workspace", NavigationSymbol::Design,
-        "Walk through the new conversation, chat, and settings screens. Check navigation and the bottom composer.");
+    add_starter("Review acceptance gaps", ::app::strings::ui_review_acceptance_gaps, NavigationSymbol::Inbox,
+        ::app::strings::ui_compare_the_design_and_acceptance_criteria_list);
+    add_starter("Check Markdown references", ::app::strings::ui_check_markdown_references, NavigationSymbol::Chat,
+        ::app::strings::ui_check_whether_markdown_references_preserve_the_original);
+    add_starter("Walk through the workspace", ::app::strings::ui_walk_through_the_workspace, NavigationSymbol::Design,
+        ::app::strings::ui_walk_through_the_new_conversation_chat_and);
     start_page.push_back(Column(std::move(starters)).With(CrossAlign(CrossAxisAlignment::Stretch)).Key("draft-task-starters"));
     std::vector<View> lane{
         ScrollView(Column(std::move(start_page)).With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch)))
@@ -2687,12 +2663,16 @@ View PreviewShell() {
     };
     if (!status.empty()) lane.push_back(Text(status, TextRole::Label)
         .With(Foreground(colors.on_surface_variant)).Key("new-draft-feedback"));
+    if (creating.Get()) lane.push_back(Row{
+        Text(::app::strings::ui_assistant, TextRole::Label),
+        Text(::app::strings::ui_sending_message, TextRole::Label).With(Foreground(colors.on_surface_variant)),
+    }.With(Spacing(8.0F)).Key("chat-sending-message"));
     lane.push_back(Column(std::move(compose)).With(draft_composer, Spacing(3.0F), CrossAlign(CrossAxisAlignment::Stretch),
         Padding(11.0F), CornerRadius(17.0F), Background(colors.surface_container),
         Border{draft_focused.Get() ? colors.on_primary_container : colors.outline}).Key("new-draft-composer"));
     main = Row{
         Spacer(),
-        Column(std::move(lane)).With(Frame{.width = chat_layout.content_width}, Spacing(10.0F),
+          Column(std::move(lane)).With(Frame{.width = preview_chat_layout.content_width}, Spacing(10.0F),
             CrossAlign(CrossAxisAlignment::Stretch)),
         Spacer(),
     }.With(Grow(), CrossAlign(CrossAxisAlignment::Stretch), Padding(EdgeInsets{
@@ -2705,9 +2685,9 @@ View PreviewShell() {
   }
   if (const auto failure = service->navigation_failure.Get()) {
     std::vector<View> controls{Text(failure->error.message, TextRole::Label).With(Grow()),
-        Button(failure->loading ? "Retry loading groups" : "Retry saving groups").OnClick([service] { SaveNavigation(service); })};
+        Button(failure->loading ? ::app::strings::ui_retry_loading_groups : ::app::strings::ui_retry_saving_groups).OnClick([service] { SaveNavigation(service); })};
     if (!failure->loading) {
-      controls.push_back(Button("Discard unsaved change").OnClick([service] {
+      controls.push_back(Button(::app::strings::ui_discard_unsaved_change).OnClick([service] {
         if (service->saving_navigation || service->navigation_edits.empty()) return;
         service->navigation_edits.pop_front();
         service->reload_navigation = true;
@@ -2726,8 +2706,8 @@ View PreviewShell() {
           open_navigation();
           return true;
         }).With(Frame{.width = 32.0F, .height = 34.0F}, MainAlign(MainAxisAlignment::Center),
-                CrossAlign(CrossAxisAlignment::Center), Focusable{}, Semantics{.role = SemanticRole::Button, .label = "Conversations"},
-                Tooltip("Open conversation list")).Key("open-navigation");
+                CrossAlign(CrossAxisAlignment::Center), Focusable{}, Semantics{.role = SemanticRole::Button, .label = ::app::strings::ui_conversations},
+                Tooltip(::app::strings::ui_open_conversation_list)).Key("open-navigation");
   };
   if (compact && !custom_preview_chrome) header.push_back(navigation_button());
   const auto group = heading_snapshot ? GroupFor(nav, heading_snapshot->summary.id) : draft_group.Get();
@@ -2736,7 +2716,7 @@ View PreviewShell() {
     if (current_folder) {
       const auto folder = service->workspaces->Find(*current_folder);
       location.push_back(NavigationIcon(NavigationSymbol::Folder, colors.on_surface_variant));
-      location.push_back(Text(folder ? folder_name(*folder) : "Workspace unavailable")
+      location.push_back(Text(folder ? folder_name(*folder) : UseString(::app::strings::ui_workspace_unavailable))
           .Style({Font::System(12.0F).WithWeight(FontWeight::SemiBold), colors.on_surface})
           .LineLimit(1).Overflow(TextOverflow::Ellipsis));
     }
@@ -2772,16 +2752,28 @@ View PreviewShell() {
   drawer_style.minimum_content_width = 370.0F;
   // Draft navigation needs the drawer to release its focus trap in the same frame.
   if (compact && focus_draft.Get() && drawer_style.motion) drawer_style.motion->close = SnapSpec{};
-  auto navigation = StartDrawer(std::move(sidebar)).Open(!compact || navigation_open.Get())
-      .OnOpenChanged([navigation_open](bool open) { navigation_open = open; });
   View settings = settings_available && showing_settings.Get()
       ? agentkit_preview::PreviewSettingsPage(service->settings, service->applied_settings, service->run_settings,
           *service->settings_file, AddModelAction(service), [showing_settings] { showing_settings = false; })
       : View(Spacer());
   auto pages = IndexedPages({Column(std::move(content)).With(CrossAlign(CrossAxisAlignment::Stretch)),
-      std::move(settings)}, showing_settings.Get() ? 1U : 0U);
-  auto workbench = ProvideEnvironment(drawer_style,
-      DrawerLayout(std::move(pages), std::move(navigation)).With(Grow(), Background(colors.surface)));
+      std::move(settings)}, showing_settings.Get() ? 1U : 0U).Key("workbench-main");
+  auto sizing = sidebar_split.Get().value_or(std::array{
+      PaneSizing{Frame{.width = sidebar_width, .min_width = 160.0F, .max_width = 340.0F}, Grow(0.0F)},
+      PaneSizing{Frame{}, Grow()},
+  });
+  sizing[1].first.min_width = compact ? std::nullopt : std::optional{medium ? 360.0F : 600.0F};
+  View columns = SplitLayout({
+      compact ? View{} : View(std::move(sidebar).With(sizing[0].first, sizing[0].second)),
+      std::move(pages).With(sizing[1].first, sizing[1].second),
+  }).OnChanged([sidebar_split, sizing](const std::vector<SplitChange>& changes) mutable {
+    for (const auto& change : changes) sizing[change.index] = {change.frame, change.grow};
+    sidebar_split = sizing;
+  });
+  auto workbench = ProvideEnvironment(drawer_style, (compact
+      ? DrawerLayout(std::move(columns), StartDrawer(std::move(sidebar)).Open(navigation_open.Get())
+          .OnOpenChanged([navigation_open](bool open) { navigation_open = open; }))
+      : DrawerLayout(std::move(columns))).With(Grow(), Background(colors.surface)));
   if (!custom_preview_chrome) return workbench;
   std::vector<View> chrome;
   if (compact) chrome.push_back(navigation_button());

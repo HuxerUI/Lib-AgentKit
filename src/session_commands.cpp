@@ -172,7 +172,7 @@ RunExecution& RuntimeState::RecordRun(SessionData& session, PrincipalId user, Se
   auto& summary = session.summary;
   RunSnapshot view{.id = id, .session = summary.id, .agent = summary.agent, .model = start.model,
                    .trigger = trigger, .retry_of = source, .state = RunState::Running, .usage = {},
-                   .execution_profile = start.execution_profile};
+                   .execution_profile = start.execution_profile, .timing = RunTiming{.started_at = Now()}};
   const auto boundary = source && trigger == RunTrigger::Regenerate
       ? std::ranges::find_if(session.messages, [&](const Message& prior) {
           return prior.run == source && prior.author == MessageAuthor::User;

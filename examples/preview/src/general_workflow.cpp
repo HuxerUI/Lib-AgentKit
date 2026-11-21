@@ -1,3 +1,5 @@
+#include <app_resources.h>
+
 #include "general_workflow.h"
 
 #include "design.h"
@@ -43,14 +45,12 @@ kit::JsonSchema RouteSchema() {
   return {JsonValue{JsonValue::Object{
       {"type", JsonValue{std::string("object")}},
       {"additionalProperties", JsonValue{false}},
-      {"required", JsonValue{JsonValue::Array{JsonValue{std::string("route")}, JsonValue{std::string("answer")}}}},
+      {"required", JsonValue{JsonValue::Array{JsonValue{std::string("route")}}}},
       {"properties", JsonValue{JsonValue::Object{
-          {"route", JsonValue{JsonValue::Object{{"enum", JsonValue{JsonValue::Array{
-              JsonValue{std::string("answer")}, JsonValue{std::string("outline")}, JsonValue{std::string("design-briefing")},
+          {"route", JsonValue{JsonValue::Object{{"type", JsonValue{std::string("string")}}, {"enum", JsonValue{JsonValue::Array{
+              JsonValue{std::string("outline")}, JsonValue{std::string("design-briefing")},
               JsonValue{std::string(WorkspaceRelease)}, JsonValue{std::string(ReportChartStage)},
-              JsonValue{ReleasePresentationSkill.value}}}}}}},
-          {"answer", JsonValue{JsonValue::Object{{"description",
-              JsonValue{std::string("Text for the answer route, or null for a workflow route.")}}}}}
+              JsonValue{ReleasePresentationSkill.value}, JsonValue{std::string("answer")}}}}}}}
       }}}
   }}};
 }
@@ -257,13 +257,14 @@ kit::Async<kit::RunCompletion> RunGeneral(kit::RunContext run, kit::RunInput inp
 
   auto decision = co_await run.CompleteAsync({
       .instruction = "Classify this request:\n" + input.input.text +
-          "\nReturn route and answer. Set answer to null for workflow routes. "
+          "\nReturn only the route. Default to answer for conversation, explanations, programming questions, and code examples. "
+          "Choose another route only when the user explicitly requests the matching deliverable. "
           "Use report-chart to show a pie chart from supplied categories and numeric values. "
           "Use outline only for a one-slide outline based on a report in the request. "
           "Use release-presentation to make a PPTX release presentation from a supplied verification report. "
           "Use design-briefing only for an interface design and a presentation of that design, when implementation and testing "
           "are outside the request. Use workspace-release for a request to design, implement, test, and create a release "
-          "presentation. Otherwise use answer and respond with the information you can provide.",
+          "presentation. For ordinary conversation or a question, return {\"route\":\"answer\"}.",
       .output_schema = RouteSchema()});
   if (!decision.Succeeded()) co_return Completion::Failure(decision.Error());
   const auto& route = TextFieldValue(*decision.Value().structured, "route");
@@ -282,10 +283,11 @@ kit::Async<kit::RunCompletion> RunGeneral(kit::RunContext run, kit::RunInput inp
   }
   const bool release = route == WorkspaceRelease;
   if (route != "design-briefing" && !release) {
-    const auto* answer = std::get_if<std::string>(&Object(*decision.Value().structured).at("answer").value);
-    if (!answer || answer->empty())
+    auto reply = co_await run.CompleteAsync({.instruction = std::string(GeneralAnswerInstruction)});
+    if (!reply.Succeeded()) co_return Completion::Failure(reply.Error());
+    if (reply.Value().text.empty())
       co_return Fail<kit::RunCompletion>(kit::ErrorCode::InvalidArgument, "The answer route requires a text response");
-    co_return Completion::Success({.summary = *answer});
+    co_return Completion::Success({});
   }
   if (release && !release_available) {
     co_return Fail<kit::RunCompletion>(kit::ErrorCode::Unsupported, "The release requires a code model and configured workspace tests");
@@ -343,11 +345,11 @@ View GeneralChat(std::shared_ptr<kit::Conversation> conversation, std::shared_pt
     };
     return Column {
       Text(form->title, TextRole::Title),
-      Text("The approved design will be sent to " + TextFieldValue(form->presentation, "target") + "."),
+      Text(StringVariant::Format(::app::strings::ui_the_approved_design_will_be_sent_to, TextFieldValue(form->presentation, "target"))),
       Text(error.Get(), TextRole::Label),
       Row {
-        Button("Dismiss briefing").OnClick([submit] { submit(false); }),
-        Button("Start design briefing").OnClick([submit] { submit(true); }),
+        Button(::app::strings::ui_dismiss_briefing).OnClick([submit] { submit(false); }),
+        Button(::app::strings::ui_start_design_briefing).OnClick([submit] { submit(true); }),
       }.With(Spacing(8.0F)),
     }.With(Spacing(8.0F));
   };

@@ -1,3 +1,5 @@
+#include <app_resources.h>
+
 #include "design.h"
 #include "code_tools.h"
 #include "code_workflow.h"
@@ -122,7 +124,7 @@ View DesignArtboard(std::shared_ptr<const DesignBoard> board, std::string highli
           node.label, {.font = Font::System(font_size),
               .foreground = primary && !selected ? Color::White() : Color::Rgb(29, 37, 41)});
     }
-  }).With(Frame{.height = height}, Semantics{.label = "Design artboard"});
+  }).With(Frame{.height = height}, Semantics{.label = ::app::strings::ui_design_artboard});
 }
 
 std::optional<View> RenderDesignArtifact(const kit::ArtifactPreview& preview) {
@@ -148,11 +150,11 @@ const kit::JsonValue* DesignForm(const kit::InteractionSnapshot& request) {
 [[huxerui::composable]]
 View DesignReviewButton(std::function<void(ViewHandle)> open) {
   const auto origin = UseViewHandle();
-  return Button("Review design").With(origin).OnClick([open, origin] { open(origin); });
+  return Button(::app::strings::ui_review_design).With(origin).OnClick([open, origin] { open(origin); });
 }
 
 [[huxerui::composable]]
-View DesignImpactButton(std::string label, std::function<void(ViewHandle)> open) {
+View DesignImpactButton(StringVariant label, std::function<void(ViewHandle)> open) {
   const auto origin = UseViewHandle();
   return Button(std::move(label)).With(origin).OnClick([open, origin] { open(origin); });
 }
@@ -172,26 +174,26 @@ View DesignDetails(const ReviewedDesign& design, const std::vector<kit::Artifact
   quiet.label_style = {Font::System(12.0F).WithWeight(FontWeight::Medium), colors.on_surface_variant};
   quiet.padding = EdgeInsets::Symmetric(6.0F, 4.0F);
   quiet.minimum_height = 30.0F;
-  std::vector<View> navigation{Button(detached ? "Close review" : "Back to conversation").OnClick(close), Spacer()};
-  if (detach) navigation.push_back(Button("Open in new window").OnClick(std::move(detach)));
+  std::vector<View> navigation{Button(detached ? ::app::strings::ui_close_review : ::app::strings::ui_back_to_conversation).OnClick(close), Spacer()};
+  if (detach) navigation.push_back(Button(::app::strings::ui_open_in_new_window).OnClick(std::move(detach)));
   std::vector<View> revisions;
   std::vector<View> decisions;
   if (design.artifact) {
     const auto current = std::ranges::find(versions, *design.artifact);
     if (current != versions.end() && current != versions.begin()) {
-      revisions.push_back(Button("Older design").OnClick([open, prior = *std::prev(current)] { open(prior); }));
+      revisions.push_back(Button(::app::strings::ui_older_design).OnClick([open, prior = *std::prev(current)] { open(prior); }));
     }
     if (current != versions.end() && std::next(current) != versions.end()) {
-      revisions.push_back(Button("Newer design").OnClick([open, after = *std::next(current)] { open(after); }));
+      revisions.push_back(Button(::app::strings::ui_newer_design).OnClick([open, after = *std::next(current)] { open(after); }));
     }
-    if (restore) revisions.push_back(Button("Restore previous version").OnClick(std::move(restore)).With(Enabled(!busy)));
-    navigation.push_back(Text("Version " + std::to_string(design.artifact->version), TextRole::Label));
+    if (restore) revisions.push_back(Button(::app::strings::ui_restore_previous_version).OnClick(std::move(restore)).With(Enabled(!busy)));
+    navigation.push_back(Text(StringVariant::Format(::app::strings::ui_version_0, design.artifact->version), TextRole::Label));
   } else if (pending) {
-    decisions.push_back(ProvideEnvironment(quiet, Button("Dismiss draft")
+    decisions.push_back(ProvideEnvironment(quiet, Button(::app::strings::ui_dismiss_draft)
         .OnClick([decide] { decide(false); }).With(Enabled(!busy))));
-    decisions.push_back(Button("Approve design").OnClick([decide] { decide(true); }).With(Enabled(!busy)));
+    decisions.push_back(Button(::app::strings::ui_approve_design).OnClick([decide] { decide(true); }).With(Enabled(!busy)));
   } else {
-    navigation.push_back(Text("Review closed", TextRole::Label));
+    navigation.push_back(Text(::app::strings::ui_review_closed, TextRole::Label));
   }
 
   std::vector<View> details{
@@ -218,7 +220,7 @@ View DesignDetails(const ReviewedDesign& design, const std::vector<kit::Artifact
     details.push_back(Text(node->note.empty() ? node->kind : node->note).Key("design-selection/" + node->id));
   }
   if (source_actions) details.push_back(ProvideEnvironment(quiet, std::move(*source_actions)));
-  if (inspect) revisions.push_back(Button("Inspect impact").OnClick(std::move(inspect)));
+  if (inspect) revisions.push_back(Button(::app::strings::ui_inspect_impact).OnClick(std::move(inspect)));
   if (!revisions.empty()) details.push_back(ProvideEnvironment(quiet, Flow(std::move(revisions)).With(Spacing(7.0F))));
   details.insert(details.end(), impact.begin(), impact.end());
   std::vector<View> page{
@@ -410,9 +412,9 @@ View DesignChat(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr
           };
         };
         const auto key = "design-impact/" + row.artifact.id.value + "/" + std::to_string(row.artifact.version);
-        if (row.parts.empty()) affected.push_back(DesignImpactButton("Review " + row.name, link({})).Key(key));
+        if (row.parts.empty()) affected.push_back(DesignImpactButton(StringVariant::Format(::app::strings::ui_review_0, row.name), link({})).Key(key));
         for (const auto& part : row.parts) {
-          affected.push_back(DesignImpactButton("Review " + part.label, link(part.id)).Key(key + "/" + part.id.value));
+          affected.push_back(DesignImpactButton(StringVariant::Format(::app::strings::ui_review_0, part.label), link(part.id)).Key(key + "/" + part.id.value));
         }
       }
     }
@@ -494,7 +496,7 @@ View DesignChat(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr
     });
   });
   if (!versions.empty() && !latest_in_history) conversation_page.push_back(
-      Button("Open latest design").With(latest_focus).OnClick([open, latest_focus, source_focus, current = versions.back()] {
+      Button(::app::strings::ui_open_latest_design).With(latest_focus).OnClick([open, latest_focus, source_focus, current = versions.back()] {
         source_focus = latest_focus;
         open(current);
       }));
@@ -571,7 +573,7 @@ View DesignChat(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr
     if (visible) return MaterialTheme(PreviewTheme(brightness), std::move(details));
     const auto message = !error->empty() ? error.Get() : review->board ? "Design review unavailable" : "Opening design review...";
     return MaterialTheme(PreviewTheme(brightness),
-        Column{Button("Close review").OnClick(close), Text(message)}.With(Grow(), Padding(24.0F), Spacing(12.0F)));
+        Column{Button(::app::strings::ui_close_review).OnClick(close), Text(message)}.With(Grow(), Padding(24.0F), Spacing(12.0F)));
   }
   return IndexedPages({
       Column(std::move(conversation_page)).With(Grow(), Spacing(8.0F)),

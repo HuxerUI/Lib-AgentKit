@@ -1,3 +1,5 @@
+#include <app_resources.h>
+
 #include "presentation_view.h"
 
 #include "general_workflow.h"
@@ -55,7 +57,7 @@ View BrowserExportCard(File file, kit::ArtifactRef artifact, std::weak_ptr<kit::
   const auto error = UseState(std::string{});
   const auto downloading = UseState(false);
   constexpr auto max_size = 32 << 20;
-  std::vector<View> body{Row{Text(file.Name()), Button("Download PowerPoint").OnClick([tasks, file, artifact, runtime, error, downloading] {
+  std::vector<View> body{Row{Text(file.Name()), Button(::app::strings::ui_download_powerpoint).OnClick([tasks, file, artifact, runtime, error, downloading] {
     if (downloading.Get()) return;
     downloading = true;
     error = "";
@@ -118,9 +120,9 @@ View ScreenshotPreview(std::shared_ptr<kit::AgentRuntime> runtime, kit::Artifact
   if (!error->empty()) return Text(error.Get());
   if (const auto asset = image.Get()) {
     return Image(*asset).Fit(ImageFit::Contain).With(Frame{.height = 220.0F},
-        Semantics{.label = "Implementation screenshot"});
+        Semantics{.label = ::app::strings::ui_implementation_screenshot});
   }
-  return Text("Loading implementation screenshot", TextRole::Label);
+  return Text(::app::strings::ui_loading_implementation_screenshot, TextRole::Label);
 }
 
 std::optional<File> PictureReviewDirectory(const ApplicationHandle& application) {
@@ -159,10 +161,10 @@ View SlideScreenshot(std::shared_ptr<kit::AgentRuntime> runtime, kit::ArtifactRe
   if (const auto picture = screenshot.Get()) {
     std::vector<View> body{Image(picture->image).Fit(ImageFit::Contain).With(Frame{.height = 220.0F},
         Semantics{.label = std::string(PresentationScreenshotLabel)})};
-    if (picture->selectable) body.push_back(Button("Select implementation screenshot").OnClick(std::move(select)));
+    if (picture->selectable) body.push_back(Button(::app::strings::ui_select_implementation_screenshot).OnClick(std::move(select)));
     return Column(std::move(body)).With(Spacing(6.0F));
   }
-  return Text("Loading implementation screenshot", TextRole::Label);
+  return Text(::app::strings::ui_loading_implementation_screenshot, TextRole::Label);
 }
 
 const std::string& ReadString(const JsonValue::Object& object, const char* key) {
@@ -205,30 +207,83 @@ ButtonStyle PresentationNavigationStyle(ButtonStyle action, Color ink) {
   return action;
 }
 
-View PageControls(std::size_t page, std::size_t count, std::function<void(std::size_t)> select, const ButtonStyle& action) {
-  auto step = ProvideEnvironment(action, Row{
-      Button("Previous slide").OnClick([select, page] { if (page > 0) select(page - 1); }).With(Enabled(page > 0)),
+View SlideStepper(std::size_t page, std::size_t count, const std::function<void(std::size_t)>& select, const ButtonStyle& action) {
+  return ProvideEnvironment(action, Row{
+      Button(::app::strings::ui_previous_slide).OnClick([select, page] { if (page > 0) select(page - 1); }).With(Enabled(page > 0)),
       Text(std::to_string(page + 1) + " / " + std::to_string(count), TextRole::Label),
-      Button("Next slide").OnClick([select, page, count] { if (page + 1 < count) select(page + 1); })
+      Button(::app::strings::ui_next_slide).OnClick([select, page, count] { if (page + 1 < count) select(page + 1); })
           .With(Enabled(page + 1 < count)),
   }.With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Center)));
-  if (count <= 1) return step;
-  std::vector<TabItem> pages;
-  for (std::size_t index = 0; index < count; ++index)
-    pages.emplace_back("Slide " + std::to_string(index + 1));
-  return Column{
-      ScrollView(Tabs(std::move(pages), page).OnChanged(std::move(select)).Key("presentation-page-tabs"))
-          .ScrollAxis(Axis::Horizontal),
-      std::move(step),
-  }.With(Spacing(2.0F), CrossAlign(CrossAxisAlignment::Stretch));
+}
+
+class OutlineColumns final : public Layout<OutlineColumns> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext& context, ViewNode& node, Constraints constraints) {
+    const float width = constraints.ConstrainWidth(constraints.HasBoundedWidth() ? constraints.max_width : 620.0F);
+    const bool split = width >= 500.0F;
+    constexpr float gap = 12.0F;
+    const float index_width = split ? std::min(198.0F, width * 0.31F) : width;
+    auto& index = node.ChildAt(0);
+    auto& editor = node.ChildAt(1);
+    const auto index_size = context.Measure(index, {
+        .min_width = index_width, .max_width = index_width, .max_height = split ? 198.0F : 95.0F});
+    const float editor_width = split ? width - index_width - gap : width;
+    const auto editor_size = context.Measure(editor, {.min_width = editor_width, .max_width = editor_width});
+    const Point editor_origin = split ? Point{index_width + gap, 0.0F} : Point{0.0F, index_size.height + gap};
+    return LayoutResult{}.Place(index, {}).Place(editor, editor_origin)
+        .SetSize(constraints.Constrain({width, std::max(index_size.height, editor_origin.y + editor_size.height)}));
+  }
+};
+
+View OutlineSlideIndex(const FormDraft& draft, std::function<void(std::size_t)> select, const ColorScheme& colors,
+                       const std::string& untitled_slide) {
+  std::vector<View> rows;
+  for (std::size_t index = 0; index < draft.slides.size(); ++index) {
+    const auto& title = draft.slides[index].title.text;
+    const auto& label = title.empty() ? untitled_slide : title;
+    const auto number = std::to_string(index + 1);
+    const bool selected = index == draft.page;
+    const auto open = [select, index] { select(index); };
+    rows.push_back(Row{
+        Text(number, TextRole::Label).Style({Font::System(11.0F), colors.on_surface_variant}).With(Frame{.width = 19.0F}),
+        Text(label).Style({Font::System(12.0F).WithWeight(selected ? FontWeight::SemiBold : FontWeight::Regular),
+            selected ? colors.on_primary_container : colors.on_surface}).LineLimit(2).Overflow(TextOverflow::Ellipsis).With(Grow()),
+    }.OnClick(open).On<ViewEvents::KeyDown>([open](const KeyEvent& event) {
+      if (event.key != Key::Enter && event.key != Key::Space) return false;
+      if (!event.repeat) open();
+      return true;
+    }).With(Focusable{}, Semantics{.role = SemanticRole::Button,
+        .label = StringVariant::Format(::app::strings::ui_slide_number_and_title, index + 1, label), .selected = selected},
+        Frame{.min_height = 34.0F}, Padding(EdgeInsets::Symmetric(7.0F, 4.0F)), Spacing(5.0F),
+        CrossAlign(CrossAxisAlignment::Center), CornerRadius(6.0F),
+        Background(selected ? colors.primary_container : Color::Transparent())).Key("outline-slide/" + number));
+  }
+  return ScrollView(Column(std::move(rows)).With(Spacing(2.0F), Padding(4.0F), CrossAlign(CrossAxisAlignment::Stretch)))
+      .With(ScrollBar(), CornerRadius(8.0F), Border{colors.outline}, Background(colors.surface)).Key("outline-slide-index");
 }
 
 View PresentationSlide(std::string deck, std::vector<View> content) {
   content.insert(content.begin(), Text(std::move(deck))
-      .Style({Font::System(12.0F).WithWeight(FontWeight::SemiBold), Color::Rgb(22, 111, 98)}));
-  return Column(std::move(content)).With(Frame{.min_height = 234.0F}, Padding(24.0F), Spacing(9.0F),
-      CrossAlign(CrossAxisAlignment::Stretch), CornerRadius(7.0F), Background(Color::Rgb(245, 247, 246)),
-      Border{Color::Rgb(213, 224, 222)}).Key("presentation-slide");
+      .Style({Font::System(11.0F).WithWeight(FontWeight::SemiBold), Color::Rgb(22, 111, 98)}).LineLimit(2).Overflow(TextOverflow::Ellipsis));
+  return Column(std::move(content)).With(Frame{.min_height = 176.0F}, Padding(20.0F), Spacing(9.0F),
+      CrossAlign(CrossAxisAlignment::Stretch), CornerRadius(8.0F), Background(Color::Rgb(247, 248, 244)),
+      Border{Color::Rgb(215, 223, 218)}).Key("presentation-slide");
+}
+
+View PreviewSlideControls(const PresentationOutline& outline, std::size_t page,
+                          const std::function<void(std::size_t)>& select, const ButtonStyle& navigation) {
+  if (outline.slides.size() == 1) return SlideStepper(page, 1, select, navigation);
+  std::vector<StringVariant> options;
+  for (std::size_t index = 0; index < outline.slides.size(); ++index)
+    options.push_back(StringVariant::Format(::app::strings::ui_slide_number_and_title, index + 1, outline.slides[index].title));
+  return Flow{
+      Select(std::move(options), page, [](const StringVariant& label) {
+        return Text(label).LineLimit(1).Overflow(TextOverflow::Ellipsis);
+      }).Label(::app::strings::ui_slide_title).OnChanged(select).With(Frame{.width = 265.0F}).Key("presentation-slide-picker"),
+      SlideStepper(page, outline.slides.size(), select, navigation),
+  }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
 }
 
 kit::PartId SlidePart(std::size_t index) { return {"slide-" + std::to_string(index + 1)}; }
@@ -287,11 +342,11 @@ View VerificationReportSummary(kit::ArtifactPreview report, std::shared_ptr<kit:
   const auto results = UseState(std::shared_ptr<const std::vector<AffectedPresentation>>{});
   const auto busy = UseState(false);
   const auto error = UseState(std::string{});
-  std::vector<View> body{Text("Verification report", TextRole::Label), Text(report.summary)};
+  std::vector<View> body{Text(::app::strings::ui_verification_report, TextRole::Label), Text(report.summary)};
   const auto current = conversation->Snapshot();
   if (!open || !current || !current->summary.project) return Column(std::move(body)).With(Spacing(6.0F));
   const auto query = ReportImpact(*current->summary.project, report.artifact);
-  body.push_back(Button(results.Get() ? "Refresh affected slides" : "Find affected slides")
+  body.push_back(Button(results.Get() ? ::app::strings::ui_refresh_affected_slides : ::app::strings::ui_find_affected_slides)
       .OnClick([tasks, runtime, query, results, busy, error] {
         if (busy.Get()) return;
         busy = true;
@@ -311,7 +366,7 @@ View VerificationReportSummary(kit::ArtifactPreview report, std::shared_ptr<kit:
     std::vector<View> rows;
     for (const auto& entry : *found) {
       rows.push_back(Text(entry.title, TextRole::Label));
-      if (entry.approximate) rows.push_back(Text("Affected scope needs review", TextRole::Label));
+      if (entry.approximate) rows.push_back(Text(::app::strings::ui_affected_scope_needs_review, TextRole::Label));
       for (const auto& [location, title] : entry.destinations) {
         rows.push_back(Button(title).OnClick([tasks, query, location, runtime, open, results, busy, error] {
           if (busy.Get()) return;
@@ -335,7 +390,7 @@ View VerificationReportSummary(kit::ArtifactPreview report, std::shared_ptr<kit:
             std::to_string(location.deck.version) + "/" + (location.part ? location.part->value : "deck")));
       }
     }
-    if (rows.empty()) body.push_back(Text("No current presentations use this report."));
+    if (rows.empty()) body.push_back(Text(::app::strings::ui_no_current_presentations_use_this_report));
     else body.push_back(ScrollView(Column(std::move(rows)).With(Spacing(6.0F)))
         .With(Frame{.max_height = 145.0F}, ScrollBar()));
   }
@@ -433,7 +488,7 @@ View ReportChoice(const ReportVersion& report, bool selected, std::function<void
   auto name = report.name + " v" + std::to_string(revision);
   if (!report.conversation.empty()) name += "  /  " + report.conversation;
   return Column{
-      Button((selected ? "Selected: " : "Use: ") + name).OnClick(std::move(choose)),
+      Button(StringVariant::Format(selected ? ::app::strings::ui_selected_0 : ::app::strings::ui_use_0, name)).OnClick(std::move(choose)),
       Text(report.conclusion),
   }.With(Spacing(4.0F)).Key((artifact ? artifact->id.value : std::get<kit::SharedContextRef>(report.ref).item.value) +
       "/" + std::to_string(revision));
@@ -478,14 +533,14 @@ View ReportReworkDialog(DialogContext dialog, std::shared_ptr<kit::AgentRuntime>
     return [loading] { loading.Cancel(); };
   }, conversation, deck, page, imports.Get());
 
-  std::vector<View> body{Text("Replace verification report", TextRole::Title),
-      Text("Slide " + std::to_string(slide) + "  /  Presentation v" + std::to_string(deck.version), TextRole::Label)};
+  std::vector<View> body{Text(::app::strings::ui_replace_verification_report, TextRole::Title),
+      Text(StringVariant::Format(::app::strings::ui_slide_0_presentation_v_1, slide, deck.version), TextRole::Label)};
   const auto available = choices.Get();
   if (accepted.Get()) {
-    body.push_back(Text("Return to the conversation to review the proposed change."));
+    body.push_back(Text(::app::strings::ui_return_to_the_conversation_to_review_the_bfe8e7));
   } else if (available && !available->previous.empty()) {
     const auto& before = available->previous[original.Get()];
-    body.push_back(Text("Current source", TextRole::Label));
+    body.push_back(Text(::app::strings::ui_current_source, TextRole::Label));
     if (available->previous.size() == 1) {
     body.push_back(Text(before.name + " v" + std::to_string(before.Version())));
       body.push_back(Text(before.conclusion));
@@ -518,22 +573,22 @@ View ReportReworkDialog(DialogContext dialog, std::shared_ptr<kit::AgentRuntime>
         body.push_back(std::move(*folder));
       body.push_back(ImportReportControl(runtime, *current->summary.project, std::move(use_report)));
     }
-    if (reports.empty()) body.push_back(Text("No other report is available in this project."));
+    if (reports.empty()) body.push_back(Text(::app::strings::ui_no_other_report_is_available_in_this));
     else {
-      body.push_back(Text("Replacement source", TextRole::Label));
+      body.push_back(Text(::app::strings::ui_replacement_source, TextRole::Label));
       body.push_back(ScrollView(Column(std::move(reports)).With(Spacing(10.0F)))
           .With(Frame{.max_height = 200.0F}, ScrollBar()));
     }
   } else if (available) {
-    body.push_back(Text("This slide has no available verification report linked to it."));
+    body.push_back(Text(::app::strings::ui_this_slide_has_no_available_verification_report));
   } else if (error->empty()) {
-    body.push_back(Text("Loading verification reports", TextRole::Label));
+    body.push_back(Text(::app::strings::ui_loading_verification_reports, TextRole::Label));
   }
   if (!error->empty()) body.push_back(Text(error.Get(), TextRole::Label));
 
-  std::vector<View> actions{Spacer(), Button(accepted.Get() ? "Done" : "Cancel").OnClick([dialog] { dialog.Dismiss(); })};
+  std::vector<View> actions{Spacer(), Button(accepted.Get() ? ::app::strings::ui_done : ::app::strings::ui_cancel).OnClick([dialog] { dialog.Dismiss(); })};
   if (replacement.Get() && !accepted.Get()) {
-    actions.push_back(Button("Prepare slide change").OnClick([runtime, tasks, conversation, deck, page, choices, original,
+    actions.push_back(Button(::app::strings::ui_prepare_slide_change).OnClick([runtime, tasks, conversation, deck, page, choices, original,
         replacement, request, busy, accepted, error] {
       if (busy.Get() || !replacement.Get()) return;
       const auto current = conversation->Snapshot();
@@ -552,14 +607,13 @@ View ReportReworkDialog(DialogContext dialog, std::shared_ptr<kit::AgentRuntime>
     }).With(Enabled(!busy.Get())));
   }
   body.push_back(Row(std::move(actions)).With(Spacing(8.0F)));
-  return Column(std::move(body)).With(Frame{.width = 520.0F}, Padding(20.0F), Spacing(10.0F),
-      Background(UseTheme().colors.surface));
+  return Column(std::move(body)).With(Frame{.width = 520.0F}, Padding(20.0F), Spacing(10.0F));
 }
 
 [[huxerui::composable]]
 View StagedExportDialog(DialogContext dialog, std::shared_ptr<kit::Conversation> conversation, kit::ArtifactRef artifact) {
   const auto tasks = UseTaskScope();
-  const auto name = UseState(TextEditingValue::FromText("Presentation-v" + std::to_string(artifact.version) + ".pptx"));
+  const auto name = UseState(TextEditingValue::FromText(UseString(StringVariant::Format(::app::strings::ui_presentation_v_0_pptx, artifact.version))));
   const auto command = UseState(std::optional<kit::CommandId>{});
   const auto busy = UseState(false);
   const auto accepted = UseState(false);
@@ -584,13 +638,13 @@ View StagedExportDialog(DialogContext dialog, std::shared_ptr<kit::Conversation>
   const auto field_style = PreviewFormFieldStyle(UseEnvironment<TextFieldStyle>(), colors);
   auto navigation = PresentationNavigationStyle(UseEnvironment<ButtonStyle>(), colors.on_surface_variant);
   navigation.minimum_height = 34.0F;
-  std::vector<View> body{Row{Text("Export PowerPoint", TextRole::Title).With(Grow()),
-      Text("Version " + std::to_string(artifact.version), TextRole::Label)}
+  std::vector<View> body{Row{Text(::app::strings::ui_export_powerpoint, TextRole::Title).With(Grow()),
+      Text(StringVariant::Format(::app::strings::ui_version_0, artifact.version), TextRole::Label)}
       .With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center))};
   if (accepted.Get()) {
-    body.push_back(Text("Return to the conversation to review the destination and approve the export."));
+    body.push_back(Text(::app::strings::ui_return_to_the_conversation_to_review_the_9860c0));
   } else {
-    body.push_back(ProvideEnvironment(field_style, TextField(name).Label("File name").Variant(TextFieldVariant::Outlined)
+    body.push_back(ProvideEnvironment(field_style, TextField(name).Label(::app::strings::ui_file_name).Variant(TextFieldVariant::Outlined)
         .OnChanged([name, command, busy, error](const TextEditingValue& value) {
           if (busy.Get()) return;
           if (name->text != value.text) command = std::nullopt;
@@ -599,13 +653,13 @@ View StagedExportDialog(DialogContext dialog, std::shared_ptr<kit::Conversation>
         }).OnSubmitted(submit).With(Enabled(!busy.Get())).Key("ppt-review-export-name")));
   }
   if (!error->empty()) body.push_back(Text(error.Get(), TextRole::Label).Style({Font::System(12.0F), colors.error}));
-  auto dismiss = Button(accepted.Get() ? "Done" : "Cancel").OnClick([dialog] { dialog.Dismiss(); }).With(Enabled(!busy.Get()));
+  auto dismiss = Button(accepted.Get() ? ::app::strings::ui_done : ::app::strings::ui_cancel).OnClick([dialog] { dialog.Dismiss(); }).With(Enabled(!busy.Get()));
   std::vector<View> actions{Spacer(), accepted.Get() ? std::move(dismiss) : ProvideEnvironment(navigation, std::move(dismiss))};
   if (!accepted.Get())
-    actions.push_back(Button("Review export").OnClick(submit).With(Enabled(!busy.Get() && !name->text.empty())));
+    actions.push_back(Button(::app::strings::ui_review_export).OnClick(submit).With(Enabled(!busy.Get() && !name->text.empty())));
   body.push_back(Row(std::move(actions)).With(Spacing(8.0F)));
   return Column(std::move(body)).With(Frame{.width = 440.0F}, Padding(18.0F), Spacing(12.0F),
-      CrossAlign(CrossAxisAlignment::Stretch), Background(colors.surface), CornerRadius(10.0F), Border{colors.outline});
+      CrossAlign(CrossAxisAlignment::Stretch));
 }
 
 [[huxerui::composable]]
@@ -621,7 +675,7 @@ View StagedPresentationReview(PresentationOutline outline, std::optional<std::si
   std::size_t index = 0;
   if (page != saved.end()) {
     const auto number = PresentationPartPage(page->second);
-    if (!number || *number > outline.slides.size()) return Text("This slide could not be found in this presentation version.");
+    if (!number || *number > outline.slides.size()) return Text(::app::strings::ui_this_slide_could_not_be_found_in);
     index = *number - 1;
   }
   const auto part = SlidePart(index);
@@ -633,7 +687,7 @@ View StagedPresentationReview(PresentationOutline outline, std::optional<std::si
   const auto navigation = PresentationNavigationStyle(UseEnvironment<ButtonStyle>(), colors.on_surface_variant);
   auto slide_title = UseEnvironment<ButtonStyle>();
   slide_title.background = Color::Transparent();
-  slide_title.label_style = {Font::System(28.0F).WithWeight(FontWeight::SemiBold), Color::Rgb(25, 40, 48)};
+  slide_title.label_style = {Font::System(23.0F).WithWeight(FontWeight::SemiBold), Color::Rgb(25, 40, 48)};
   slide_title.padding = {};
   slide_title.minimum_height = 32.0F;
   auto slide_bullet = slide_title;
@@ -664,32 +718,34 @@ View StagedPresentationReview(PresentationOutline outline, std::optional<std::si
   const auto current = conversation->Snapshot();
   const bool owns_deck = current && std::ranges::find(current->artifacts, artifact) != current->artifacts.end();
   std::vector<View> actions{
-      ProvideEnvironment(navigation, Button("Select slide")
+      ProvideEnvironment(navigation, Button(::app::strings::ui_select_slide)
           .OnClick([selection, artifact, part] { selection = kit::SourceSlice{artifact, {part}}; })),
   };
   if (owns_deck) {
     actions.push_back(ProvideEnvironment(navigation,
-        Button("Replace report on slide").OnClick([dialogs, runtime, conversation, artifact, part, index, workspaces] {
-      dialogs.Show(DialogFactory{[runtime, conversation, artifact, part, index, workspaces](DialogContext dialog) {
+        Button(::app::strings::ui_replace_report_on_slide).OnClick([dialogs, runtime, conversation, artifact, part, index, workspaces] {
+      ShowPreviewDialog(dialogs, DialogFactory{[runtime, conversation, artifact, part, index, workspaces](DialogContext dialog) {
         return ReportReworkDialog(dialog, runtime, conversation, artifact, part, index + 1, workspaces);
       }});
     })));
   }
   if (owns_deck && (current->summary.agent.id == PptAgent || current->summary.agent.id == GeneralAgent)) {
-    actions.push_back(ProvideEnvironment(navigation, Button("Export PowerPoint").OnClick([dialogs, conversation, artifact] {
-      dialogs.Show(DialogFactory{[conversation, artifact](DialogContext dialog) {
+    actions.push_back(ProvideEnvironment(PreviewSecondaryButton(UseEnvironment<ButtonStyle>(), colors),
+        Button(::app::strings::ui_export_powerpoint).OnClick([dialogs, conversation, artifact] {
+      ShowPreviewDialog(dialogs, DialogFactory{[conversation, artifact](DialogContext dialog) {
         return StagedExportDialog(dialog, conversation, artifact);
       }});
     })));
   }
   std::vector<View> content{
-      PageControls(index, outline.slides.size(), [pages, version, selection](std::size_t value) {
+      PreviewSlideControls(outline, index, [pages, version, selection](std::size_t value) {
         selection = std::nullopt;
         auto updated = pages.Get();
         updated.insert_or_assign(version, SlidePart(value));
         pages = std::move(updated);
       }, navigation),
       PresentationSlide(outline.title, std::move(slide_body)),
+      Divider(),
       Flow(std::move(actions)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)),
   };
   if (const auto selected = selection.Get()) {
@@ -704,7 +760,8 @@ View StagedPresentationReview(PresentationOutline outline, std::optional<std::si
 std::optional<View> RenderForm(const kit::InteractionSnapshot& interaction,
                                std::shared_ptr<kit::Conversation> conversation, State<Drafts> drafts,
                                TaskScope tasks, const ButtonStyle& navigation, std::shared_ptr<kit::AgentRuntime> runtime,
-                               const ColorScheme& colors, const TextFieldStyle& brief_fields) {
+                               const ColorScheme& colors, const TextFieldStyle& form_fields, const ButtonStyle& buttons,
+                               const std::string& untitled_slide) {
   const auto& form = std::get<kit::FormRequest>(interaction.body);
   const auto* data = std::get_if<JsonValue::Object>(&form.presentation.value);
   if (!data || !data->contains("kind")) return {};
@@ -737,11 +794,11 @@ std::optional<View> RenderForm(const kit::InteractionSnapshot& interaction,
     drafts = std::move(copy);
   };
   auto page = [save, draft](std::size_t value) mutable { draft.page = value; save(draft); };
-  auto text_field = [save, draft, brief](std::string key, const char* label, bool multiline = false) {
+  auto text_field = [save, draft](std::string key, StringVariant label, bool multiline = false) {
     const auto found = draft.fields.find(key);
     const auto view_key = "ppt-" + key;
     return TextField(found == draft.fields.end() ? TextEditingValue::FromText({}) : found->second).Label(label)
-        .Variant(brief ? TextFieldVariant::Outlined : TextFieldVariant::Standard)
+        .Variant(TextFieldVariant::Outlined)
         .LineLimits(multiline ? TextFieldLineLimits::MultiLine(2, 3) : TextFieldLineLimits::SingleLine())
         .OnChanged([save, draft, key = std::move(key)](const TextEditingValue& value) mutable {
           draft.fields[key] = value;
@@ -768,24 +825,25 @@ std::optional<View> RenderForm(const kit::InteractionSnapshot& interaction,
     });
   };
 
-  std::vector<View> fields{Text(form.title, TextRole::Title)};
-  std::vector<View> export_options;
-  std::string action;
+  std::vector<View> fields;
+  std::vector<View> outline_actions;
+  StringVariant action;
   JsonValue answer;
   if (edit) {
-    fields.push_back(text_field("title", "Presentation title"));
-    fields.push_back(PageControls(draft.page, draft.slides.size(), page, navigation));
+    fields.push_back(text_field("title", ::app::strings::ui_presentation_title));
+    std::vector<View> editor{SlideStepper(draft.page, draft.slides.size(), page, navigation)};
     if (data->contains("includes_screenshot") && draft.page + 1 == draft.slides.size()) {
-      fields.push_back(Text("Implementation screenshot will appear on this slide.", TextRole::Label));
+      editor.push_back(Text(::app::strings::ui_implementation_screenshot_will_appear_on_this_slide, TextRole::Label));
     }
     const auto& slide = draft.slides[draft.page];
-    fields.push_back(TextField(slide.title).Label("Slide title")
+    editor.push_back(TextField(slide.title).Label(::app::strings::ui_slide_title).Variant(TextFieldVariant::Outlined)
         .OnChanged([save, draft](const TextEditingValue& value) mutable {
           draft.slides[draft.page].title = value;
           draft.error.clear();
           save(draft);
         }).Key("slide-title-" + std::to_string(draft.page)));
-    fields.push_back(TextField(slide.bullets).Label("Bullets, one per line").LineLimits(TextFieldLineLimits::MultiLine(2, 4))
+    editor.push_back(TextField(slide.bullets).Label(::app::strings::ui_bullets_one_per_line).Variant(TextFieldVariant::Outlined)
+        .LineLimits(TextFieldLineLimits::MultiLine(3, 6))
         .OnChanged([save, draft](const TextEditingValue& value) mutable {
           draft.slides[draft.page].bullets = value;
           draft.error.clear();
@@ -795,56 +853,63 @@ std::optional<View> RenderForm(const kit::InteractionSnapshot& interaction,
       const auto& summary = ReadString(*data, "report_summary");
       auto bullets = EditedOutline(draft).slides[draft.page].bullets;
       if (bullets.size() < 6 && std::ranges::find(bullets, summary) == bullets.end()) {
-        fields.push_back(Button("Insert summary from " + ReadString(*data, "report_name")).OnClick([save, draft, summary]() mutable {
+        editor.push_back(ProvideEnvironment(navigation,
+            Button(StringVariant::Format(::app::strings::ui_insert_summary_from_0, ReadString(*data, "report_name"))).OnClick([save, draft, summary]() mutable {
           auto text = draft.slides[draft.page].bullets.text;
           if (!text.empty() && !text.ends_with('\n')) text += '\n';
           text += summary;
           draft.slides[draft.page].bullets = TextEditingValue::FromText(std::move(text));
           save(draft);
-        }).Key("ppt-insert-report-summary"));
+        }).Key("ppt-insert-report-summary")));
       }
     }
-    if (!slide_count) fields.push_back(Row{
-        Button("Add slide").OnClick([save, draft]() mutable {
+    fields.push_back(OutlineColumns{
+        OutlineSlideIndex(draft, page, colors, untitled_slide),
+        Column(std::move(editor)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch)).Key("outline-slide-editor"),
+    });
+    if (!slide_count) {
+      outline_actions.push_back(ProvideEnvironment(PreviewSecondaryButton(buttons, colors),
+          Button(::app::strings::ui_add_slide).OnClick([save, draft, untitled_slide]() mutable {
           if (draft.slides.size() >= 30) return;
           draft.page = draft.slides.size();
-          draft.slides.push_back({TextEditingValue::FromText("New slide"), TextEditingValue::FromText({})});
+          draft.slides.push_back({TextEditingValue::FromText(untitled_slide), TextEditingValue::FromText({})});
           save(draft);
-        }).With(Enabled(draft.slides.size() < 30)),
-        Button("Remove slide").OnClick([save, draft]() mutable {
+        }).With(Enabled(draft.slides.size() < 30))));
+      outline_actions.push_back(ProvideEnvironment(navigation,
+          Button(::app::strings::ui_remove_slide).OnClick([save, draft]() mutable {
           if (draft.slides.size() <= 1) return;
           draft.slides.erase(draft.slides.begin() + static_cast<std::ptrdiff_t>(draft.page));
           draft.page = std::min(draft.page, draft.slides.size() - 1);
           save(draft);
-        }).With(Enabled(draft.slides.size() > 1)),
-    }.With(Spacing(8.0F)));
-    action = "Confirm outline";
+        }).With(Enabled(draft.slides.size() > 1))));
+    }
+    action = ::app::strings::ui_confirm_outline;
     answer = WritePresentationOutline(EditedOutline(draft));
   } else if (preview) {
-    fields.push_back(PageControls(draft.page, outline.slides.size(), page, navigation));
     const auto& slide = outline.slides[draft.page];
     std::vector<View> slide_content{Text(slide.title, TextRole::Title)
-        .Style({Font::System(28.0F).WithWeight(FontWeight::SemiBold), Color::Rgb(25, 40, 48)})};
+        .Style({Font::System(23.0F).WithWeight(FontWeight::SemiBold), Color::Rgb(25, 40, 48)})};
     for (const auto& bullet : slide.bullets)
-      slide_content.push_back(Text("\xe2\x80\xa2 " + bullet).Style({Font::System(15.0F), Color::Rgb(42, 56, 65)}));
+      slide_content.push_back(Row{
+          Text("\xe2\x80\xa2").Style({Font::System(14.0F), Color::Rgb(22, 111, 98)}),
+          Text(bullet).Style({Font::System(14.0F), Color::Rgb(42, 56, 65)}).With(Grow()),
+      }.With(Spacing(7.0F)));
     if (draft.page + 1 == outline.slides.size() && data->contains("screenshot_id") && data->contains("screenshot_version")) {
       kit::ArtifactRef ref{{ReadString(*data, "screenshot_id")},
           static_cast<kit::Revision>(std::get<std::int64_t>(data->at("screenshot_version").value))};
       slide_content.push_back(ScreenshotPreview(std::move(runtime), ref).Key(ref.id.value));
     }
     fields.push_back(PresentationSlide(outline.title, std::move(slide_content)));
-    export_options.push_back(Text(ReadString(*data, "directory"), TextRole::Label));
-    export_options.push_back(text_field("file_name", "File name"));
-    action = "Review export";
+    action = ::app::strings::ui_review_export;
   } else {
-    fields.push_back(text_field("audience", "Audience"));
-    fields.push_back(text_field("style", "Style"));
-    if (slide_count) fields.push_back(Text("Goal requires " + std::to_string(*slide_count) + " slides.", TextRole::Label));
-    else fields.push_back(text_field("length", "Target slide count"));
-    fields.push_back(text_field("reference_notes", "Reference notes", true));
-    action = "Draft outline";
+    fields.push_back(Text(::app::strings::ui_presentation_brief, TextRole::Title));
+    fields.push_back(text_field("audience", ::app::strings::ui_audience));
+    fields.push_back(text_field("style", ::app::strings::ui_style));
+    if (slide_count) fields.push_back(Text(StringVariant::Format(::app::strings::ui_goal_requires_0_slides, *slide_count), TextRole::Label));
+    else fields.push_back(text_field("length", ::app::strings::ui_target_slide_count));
+    fields.push_back(text_field("reference_notes", ::app::strings::ui_reference_notes, true));
+    action = ::app::strings::ui_draft_outline;
   }
-  auto& controls = preview ? export_options : fields;
   auto submit_button = Button(action).OnClick(
       [edit, brief, submit, save, draft, answer = std::move(answer)]() mutable {
         if (edit) {
@@ -870,28 +935,44 @@ std::optional<View> RenderForm(const kit::InteractionSnapshot& interaction,
         }
         submit(answer);
       }).With(Enabled(!draft.submitting));
-  if (!brief) controls.push_back(std::move(submit_button));
-  if (!draft.error.empty()) controls.push_back(Text(draft.error, TextRole::Label));
+  auto primary_action = ProvideEnvironment(PreviewPrimaryButton(buttons, colors), std::move(submit_button));
   if (brief) {
+    if (!draft.error.empty()) fields.push_back(Text(draft.error, TextRole::Label));
     auto content = Column(std::move(fields)).With(Padding(12.0F), Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
-    return ProvideEnvironment(brief_fields, Column{
+    return ProvideEnvironment(form_fields, Column{
         ScrollView(std::move(content)).With(Frame{.max_height = 264.0F}, ScrollBar()).Key("ppt-form-scroll"),
-        Row{Spacer(), std::move(submit_button)}.With(Padding(EdgeInsets{.right = 12.0F, .bottom = 8.0F, .left = 12.0F})),
+        Row{Spacer(), std::move(primary_action)}.With(Padding(EdgeInsets{.right = 12.0F, .bottom = 8.0F, .left = 12.0F})),
     }.With(CrossAlign(CrossAxisAlignment::Stretch), Border{colors.outline}, CornerRadius(8.0F),
            Background(colors.surface_container_high)));
   }
-  auto scroll = ScrollView(Column(std::move(fields)).With(Padding(12.0F), Spacing(8.0F)))
-      .With(Frame{.max_height = preview ? 218.0F : 355.0F}, ScrollBar()).Key("ppt-form-scroll");
+  const auto heading = edit ? ::app::strings::ui_edit_presentation_outline : ::app::strings::ui_presentation_preview;
+  std::vector<View> header{Text(heading, TextRole::Title)
+      .Style({Font::System(17.0F).WithWeight(FontWeight::SemiBold), colors.on_surface})};
+  if (preview) header.push_back(PreviewSlideControls(outline, draft.page, page, navigation));
+  auto scroll = ScrollView(Column(std::move(fields)).With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch)))
+      .With(Frame{.max_height = preview ? 308.0F : 318.0F}, ScrollBar()).Key("ppt-form-scroll");
+  std::vector<View> footer;
   if (preview) {
-    return Column{
-        std::move(scroll),
-        Divider(),
-        Column(std::move(export_options)).With(Padding(EdgeInsets::Symmetric(12.0F, 4.0F)), Spacing(6.0F)),
-    }.With(CrossAlign(CrossAxisAlignment::Stretch));
+    const auto folder = ReadString(*data, "directory");
+    footer.push_back(Row{
+        Text(::app::strings::ui_export_folder, TextRole::Label).Style({Font::System(12.0F), colors.on_surface_variant}),
+        Text(folder, TextRole::Label).Style({Font::System(12.0F), colors.on_surface_variant})
+            .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow(), Tooltip(folder)),
+    }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)).Key("presentation-export-folder"));
+    footer.push_back(Row{text_field("file_name", ::app::strings::ui_file_name).With(Grow()), std::move(primary_action)}
+        .With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center)));
+  } else {
+    footer.push_back(Row{Flow(std::move(outline_actions)).With(Grow(), Spacing(6.0F), CrossAlign(CrossAxisAlignment::Center)),
+        std::move(primary_action)}.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)));
   }
-  return Column {
-    std::move(scroll),
-  };
+  if (!draft.error.empty()) footer.push_back(Text(draft.error, TextRole::Label).Style({Font::System(12.0F), colors.error}));
+  return ProvideEnvironment(form_fields, Column{
+      Column(std::move(header)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch), LayoutPriority(2.0F)),
+      std::move(scroll),
+      Column{Divider(), Column(std::move(footer)).With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch))}
+          .With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch), LayoutPriority(3.0F)).Key("presentation-form-actions"),
+  }.With(Padding(12.0F), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch),
+         ClipChildren{}, CornerRadius(10.0F), Border{colors.outline}, Background(colors.surface_container_low)));
 }
 } // namespace
 
@@ -983,7 +1064,7 @@ View SharedReportsDialog(DialogContext dialog, std::shared_ptr<kit::AgentRuntime
     });
   };
 
-  std::vector<View> body{Text("Shared reports", TextRole::Title)};
+  std::vector<View> body{Text(::app::strings::ui_shared_reports, TextRole::Title)};
   auto available = versions.Get();
   const SharedReportVersion* current = nullptr;
   if (available && !available->empty()) {
@@ -1003,9 +1084,9 @@ View SharedReportsDialog(DialogContext dialog, std::shared_ptr<kit::AgentRuntime
     body.push_back(ScrollView(Column(std::move(rows)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch)))
         .With(Frame{.max_height = 150.0F}, ScrollBar()));
   } else if (available) {
-    body.push_back(Text("No shared reports in this project."));
+    body.push_back(Text(::app::strings::ui_no_shared_reports_in_this_project));
   } else if (error->empty()) {
-    body.push_back(Text("Loading reports", TextRole::Label));
+    body.push_back(Text(::app::strings::ui_loading_reports, TextRole::Label));
   }
 
   if (current) {
@@ -1014,14 +1095,14 @@ View SharedReportsDialog(DialogContext dialog, std::shared_ptr<kit::AgentRuntime
       return entry.item.ref.item == report.ref.item && entry.item.ref.version > report.ref.version;
     });
     if (withdrawing.Get()) {
-      body.push_back(Text("Withdraw " + report.name + " v" + std::to_string(report.ref.version) + "?"));
-      body.push_back(Button("Confirm withdrawal").OnClick([change, ref = report.ref] {
+      body.push_back(Text(StringVariant::Format(::app::strings::ui_withdraw_0_v_1, report.name, report.ref.version)));
+      body.push_back(Button(::app::strings::ui_confirm_withdrawal).OnClick([change, ref = report.ref] {
         change(ref, kit::WithdrawContext{});
       }).With(Enabled(!busy.Get())));
     } else if (const auto edited = revision.Get()) {
-      body.push_back(TextField(*edited).Label("Report summary").LineLimits(TextFieldLineLimits::MultiLine(2, 5))
+      body.push_back(TextField(*edited).Label(::app::strings::ui_report_summary).LineLimits(TextFieldLineLimits::MultiLine(2, 5))
           .OnChanged([revision](const TextEditingValue& value) { revision = value; }).Key("shared-report-summary"));
-      body.push_back(Button("Save draft").OnClick([change, revision, error, item] {
+      body.push_back(Button(::app::strings::ui_save_draft).OnClick([change, revision, error, item] {
         if (!revision.Get()) return;
         const auto& summary = revision.Get()->text;
         auto valid = ValidatePresentationReportSummary(summary);
@@ -1035,19 +1116,19 @@ View SharedReportsDialog(DialogContext dialog, std::shared_ptr<kit::AgentRuntime
       std::vector<View> actions;
       if (latest) {
         if (item.state == kit::SharedContextState::Draft)
-          actions.push_back(Button("Submit for review").OnClick([change, ref = report.ref] { change(ref, kit::RequestContextReview{}); }));
+          actions.push_back(Button(::app::strings::ui_submit_for_review).OnClick([change, ref = report.ref] { change(ref, kit::RequestContextReview{}); }));
         if (item.state == kit::SharedContextState::PendingReview)
-          actions.push_back(Button("Publish version").OnClick([change, ref = report.ref] { change(ref, kit::PublishContext{}); }));
-        actions.push_back(Button("New version").OnClick([revision, summary = report.summary] {
+          actions.push_back(Button(::app::strings::ui_publish_version).OnClick([change, ref = report.ref] { change(ref, kit::PublishContext{}); }));
+        actions.push_back(Button(::app::strings::ui_new_version).OnClick([revision, summary = report.summary] {
           revision = TextEditingValue::FromText(summary);
         }));
       }
-      actions.push_back(Button("Withdraw version").OnClick([withdrawing] { withdrawing = true; }));
+      actions.push_back(Button(::app::strings::ui_withdraw_version).OnClick([withdrawing] { withdrawing = true; }));
       body.push_back(Column(std::move(actions)).With(Spacing(6.0F), Enabled(!busy.Get())));
     }
   }
   if (!error->empty()) body.push_back(Text(error.Get(), TextRole::Label));
-  body.push_back(Row {Spacer(), Button(revision.Get() || withdrawing.Get() ? "Cancel" : "Close")
+  body.push_back(Row {Spacer(), Button(revision.Get() || withdrawing.Get() ? ::app::strings::ui_cancel : ::app::strings::ui_close)
       .OnClick([dialog, revision, withdrawing, error] {
         if (!revision.Get() && !withdrawing.Get()) { dialog.Dismiss(); return; }
         revision = std::nullopt;
@@ -1055,7 +1136,7 @@ View SharedReportsDialog(DialogContext dialog, std::shared_ptr<kit::AgentRuntime
         error = "";
       }).With(Enabled(!busy.Get()))}.With(Spacing(8.0F)));
   return Column(std::move(body)).With(Frame{.width = UseViewportClass() == ViewportClass::Compact ? 310.0F : 440.0F},
-      Padding(20.0F), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch), Background(UseTheme().colors.surface));
+      Padding(20.0F), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
 [[huxerui::composable]]
@@ -1066,7 +1147,7 @@ View ImportReportControl(std::shared_ptr<kit::AgentRuntime> runtime, kit::Projec
   const auto busy = UseState(false);
   const auto error = UseState(std::string{});
   if (!picker || !picker->CanOpenFiles()) return View{};
-  std::vector<View> body{Button("Import report into project").OnClick([picker, tasks, busy, error, runtime, project, imported] {
+  std::vector<View> body{Button(::app::strings::ui_import_report_into_project).OnClick([picker, tasks, busy, error, runtime, project, imported] {
     if (busy.Get()) return;
     busy = true;
     error = "";
@@ -1110,12 +1191,12 @@ static View BrowserReportDialog(DialogContext dialog, std::shared_ptr<kit::Agent
     });
   };
   const auto current = path.Get();
-  std::vector<View> body{Text("Choose a report", TextRole::Title),
+  std::vector<View> body{Text(::app::strings::ui_choose_a_report, TextRole::Title),
       Text(current.empty() ? folder : folder + "/" + current, TextRole::Label)};
   if (!current.empty()) {
     const auto slash = current.find_last_of('/');
     auto parent = slash == std::string::npos ? std::string{} : current.substr(0, slash);
-    body.push_back(Button("Parent folder").OnClick([navigate, parent] { navigate(parent); }).With(Enabled(!busy.Get())));
+    body.push_back(Button(::app::strings::ui_parent_folder).OnClick([navigate, parent] { navigate(parent); }).With(Enabled(!busy.Get())));
   }
   std::vector<View> rows;
   for (const auto& entry : entries.Get()) {
@@ -1147,14 +1228,13 @@ static View BrowserReportDialog(DialogContext dialog, std::shared_ptr<kit::Agent
       }).With(Enabled(!busy.Get())).Key(entry.name));
     }
   }
-  if (rows.empty()) body.push_back(Text("No JSON reports or folders here.", TextRole::Label));
+  if (rows.empty()) body.push_back(Text(::app::strings::ui_no_json_reports_or_folders_here, TextRole::Label));
   else body.push_back(ScrollView(Column(std::move(rows)).With(Spacing(4.0F)))
       .With(Frame{.max_height = 240.0F}, ScrollBar()));
   if (!error->empty()) body.push_back(Text(error.Get(), TextRole::Label));
-  body.push_back(Row{Spacer(), Button("Close").OnClick([dialog] { dialog.Dismiss(); })
+  body.push_back(Row{Spacer(), Button(::app::strings::ui_close).OnClick([dialog] { dialog.Dismiss(); })
       .With(Enabled(!busy.Get()))}.With(Spacing(8.0F)));
-  return Column(std::move(body)).With(Frame{.width = 390.0F}, Padding(20.0F), Spacing(10.0F),
-      Background(UseTheme().colors.surface));
+  return Column(std::move(body)).With(Frame{.width = 390.0F}, Padding(20.0F), Spacing(10.0F));
 }
 
 [[huxerui::composable]]
@@ -1164,7 +1244,7 @@ View BrowserWorkspaceReportControl(std::shared_ptr<kit::AgentRuntime> runtime, k
   const auto tasks = UseTaskScope();
   const auto busy = UseState(false);
   const auto error = UseState(std::string{});
-  std::vector<View> body{Button("Choose report from folder").OnClick(
+  std::vector<View> body{Button(::app::strings::ui_choose_report_from_folder).OnClick(
       [dialogs, tasks, runtime, project, store, workspace, folder, imported, busy, error] {
         if (busy.Get()) return;
         busy = true;
@@ -1182,7 +1262,7 @@ View BrowserWorkspaceReportControl(std::shared_ptr<kit::AgentRuntime> runtime, k
             error = listed.Error().message;
             co_return;
           }
-          dialogs.Show(DialogFactory{[runtime, project, store, workspace, folder, imported,
+          ShowPreviewDialog(dialogs, DialogFactory{[runtime, project, store, workspace, folder, imported,
                                       initial = std::move(listed).Value()](DialogContext dialog) {
             return BrowserReportDialog(dialog, runtime, project, store, workspace, folder, initial, imported);
           }});
@@ -1243,12 +1323,14 @@ View PresentationChat(std::shared_ptr<kit::Conversation> conversation, std::shar
   const auto review_pages = UseState(PresentationReviewPages{});
   const auto tasks = UseTaskScope();
   const auto colors = UseTheme().colors;
-  const auto navigation = PresentationNavigationStyle(UseEnvironment<ButtonStyle>(), colors.on_surface_variant);
-  const auto brief_fields = PreviewFormFieldStyle(UseEnvironment<TextFieldStyle>(), colors);
+  const auto buttons = UseEnvironment<ButtonStyle>();
+  const auto navigation = PresentationNavigationStyle(buttons, colors.on_surface_variant);
+  const auto form_fields = PreviewFormFieldStyle(UseEnvironment<TextFieldStyle>(), colors);
+  const auto untitled_slide = UseString(::app::strings::ui_untitled_slide);
   auto options = base_options;
-  options.render_form = [drafts, tasks, runtime, navigation, colors, brief_fields, fallback = base_options.render_form](
+  options.render_form = [drafts, tasks, runtime, navigation, colors, form_fields, buttons, untitled_slide, fallback = base_options.render_form](
       const kit::InteractionSnapshot& request, std::shared_ptr<kit::Conversation> session) -> std::optional<View> {
-    if (auto rendered = RenderForm(request, session, drafts, tasks, navigation, runtime, colors, brief_fields)) return rendered;
+    if (auto rendered = RenderForm(request, session, drafts, tasks, navigation, runtime, colors, form_fields, buttons, untitled_slide)) return rendered;
     return fallback ? fallback(request, std::move(session)) : std::nullopt;
   };
   if (!options.render_artifact) ConfigurePreviewArtifactReview(options, runtime, review_pages);

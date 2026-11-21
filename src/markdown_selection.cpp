@@ -419,7 +419,7 @@ private:
   }
 
   MarkdownExcerpt Excerpt() const {
-    MarkdownExcerpt excerpt{*range_};
+    MarkdownExcerpt excerpt{.range = *range_, .active_caret = Caret(range_->active), .pointer_selecting = pressed_};
     bool mapped = true;
     for (std::size_t i = First().paragraph; i <= Last().paragraph; ++i) {
       const auto& paragraph = *paragraphs_[i].content;

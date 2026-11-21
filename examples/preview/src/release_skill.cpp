@@ -1,3 +1,5 @@
+#include <app_resources.h>
+
 #include "release_skill.h"
 #include "release_skill_data.h"
 
@@ -55,20 +57,22 @@ View SkillPicker(std::shared_ptr<kit::AgentRuntime> runtime, kit::SkillCatalogQu
       error = "";
       std::vector<MenuEntry> items;
       for (auto& skill : available.Value()) {
-        auto label = skill.ref.id == ReleasePresentationSkill ? std::string(ReleaseSkillLabel) : std::move(skill.name);
+        auto label = skill.ref.id == ReleasePresentationSkill ? StringVariant{::app::strings::ui_release_presentation} :
+            StringVariant{std::move(skill.name)};
         items.emplace_back(MenuItem(std::move(label), [selection, ref = skill.ref] {
           selection = std::vector{ref};
         }).Checked(selection.Get() == std::vector{skill.ref}));
       }
-      if (!selection->empty()) items.emplace_back(MenuItem("Remove Skill", [selection] {
+      if (!selection->empty()) items.emplace_back(MenuItem(::app::strings::ui_remove_skill, [selection] {
         selection = std::vector<kit::SkillRef>{};
       }));
       if (items.empty()) { error = "No Skills are available in this conversation"; co_return; }
       menu.Show(anchor, std::move(items));
     });
   };
-  const auto label = selected.empty() ? std::string("Skills") :
-      selected.front().id == ReleasePresentationSkill ? "Skill: " + std::string(ReleaseSkillLabel) : "Skill: " + selected.front().id.value;
+  const auto label = selected.empty() ? StringVariant{::app::strings::ui_skills} :
+      selected.front().id == ReleasePresentationSkill ? StringVariant{::app::strings::ui_skill_release_presentation} :
+      StringVariant::Format(::app::strings::ui_skill_name, selected.front().id.value);
   auto button = Button(label).OnClick(choose).With(anchor).Key("composer-skills");
   if (error->empty()) return button;
   return Column{std::move(button), Text(error.Get(), TextRole::Label)}.With(Spacing(4.0F));

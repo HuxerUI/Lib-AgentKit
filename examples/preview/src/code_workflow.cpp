@@ -1,3 +1,5 @@
+#include <app_resources.h>
+
 #include "code_workflow.h"
 
 #include "code_tools.h"
@@ -92,12 +94,12 @@ View CodeEditorDialog(DialogContext dialog, CodeWorkspace workspace, std::string
   };
   const auto open = [load, path] { load(path->text); };
   std::vector<View> content{
-      Text("Workspace editor", TextRole::Title)
+      Text(::app::strings::ui_workspace_editor, TextRole::Title)
           .Style({Font::System(18.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}),
-      Row{ProvideEnvironment(field_style, TextField(path).Label("Workspace-relative file").Variant(TextFieldVariant::Outlined)
+      Row{ProvideEnvironment(field_style, TextField(path).Label(::app::strings::ui_workspace_relative_file).Variant(TextFieldVariant::Outlined)
               .OnChanged([path](const TextEditingValue& value) { path = value; })
               .OnSubmitted(open).With(Grow()).Key("workspace-editor-path")),
-          Button("Open file").OnClick(open).With(Enabled(!busy.Get() && !path->text.empty()))}
+          Button(::app::strings::ui_open_file).OnClick(open).With(Enabled(!busy.Get() && !path->text.empty()))}
           .With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center))};
   if (document.Get() && file.Get()) {
     ce::EditorOptions options{.document = *document.Get()};
@@ -113,7 +115,7 @@ View CodeEditorDialog(DialogContext dialog, CodeWorkspace workspace, std::string
   if (!error.Get().empty()) content.push_back(Text(error.Get(), TextRole::Label));
   std::vector<View> actions;
   if (dirty.Get() && file.Get()) {
-    actions.push_back(Button("Discard draft").OnClick([workspace, loaded = file.Get(), path, load, error, dirty] {
+    actions.push_back(Button(::app::strings::ui_discard_draft).OnClick([workspace, loaded = file.Get(), path, load, error, dirty] {
       auto result = EditCodeBuffer(*workspace.editor, *loaded, loaded->draft.disk_text);
       if (!result.Succeeded()) { error = result.Error().message; return; }
       dirty = false;
@@ -124,10 +126,10 @@ View CodeEditorDialog(DialogContext dialog, CodeWorkspace workspace, std::string
     }).With(Enabled(!busy.Get())));
   }
   actions.push_back(Spacer());
-  actions.push_back(Button("Done").OnClick([dialog] { dialog.Dismiss(); }));
+  actions.push_back(Button(::app::strings::ui_done).OnClick([dialog] { dialog.Dismiss(); }));
   content.push_back(ProvideEnvironment(secondary, Row(std::move(actions)).With(Spacing(8.0F))));
   return Column(std::move(content)).With(Frame{.width = 520.0F}, Padding(20.0F), Spacing(12.0F),
-      CrossAlign(CrossAxisAlignment::Stretch), CornerRadius(12.0F), Border{colors.outline}, Background(colors.surface));
+      CrossAlign(CrossAxisAlignment::Stretch));
 }
 
 std::optional<View> ScopeView(const kit::InteractionSnapshot& request, std::shared_ptr<kit::Conversation> session,
@@ -163,8 +165,8 @@ std::optional<View> ScopeView(const kit::InteractionSnapshot& request, std::shar
   };
   return Column{
       Text(form->title, TextRole::Title),
-      Text("These files will be sent to the model for this run. The run's permissions determine when a patch needs approval."),
-      TextField(current.text).Label("Workspace-relative paths, one per line")
+      Text(::app::strings::ui_these_files_will_be_sent_to_the),
+      TextField(current.text).Label(::app::strings::ui_workspace_relative_paths_one_per_line)
           .LineLimits(TextFieldLineLimits::MultiLine(2, 4))
           .OnChanged([state, current](const TextEditingValue& value) mutable {
             current.text = value;
@@ -172,7 +174,7 @@ std::optional<View> ScopeView(const kit::InteractionSnapshot& request, std::shar
             state = current;
           }).Key("code-scope"),
       Row{Text(current.error, TextRole::Label), Spacer(),
-          Button("Share files").OnClick(std::move(submit)).With(Enabled(!current.submitting))}.With(Spacing(8.0F)),
+          Button(::app::strings::ui_share_files).OnClick(std::move(submit)).With(Enabled(!current.submitting))}.With(Spacing(8.0F)),
   }.With(Spacing(8.0F), Padding(12.0F));
 }
 
@@ -413,9 +415,9 @@ View CodeRevertReview(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
     }
   }
   if (unresolved) {
-    content.push_back(Text("Revert result needs verification", TextRole::Label));
+    content.push_back(Text(::app::strings::ui_revert_result_needs_verification, TextRole::Label));
     if (workspace && evidence) {
-      content.push_back(Button("Check revert result").OnClick([runtime, tasks, session = current->summary.id,
+      content.push_back(Button(::app::strings::ui_check_revert_result).OnClick([runtime, tasks, session = current->summary.id,
           call = *unresolved, workspace = *workspace, evidence = *evidence, verification, preparing, status] {
         if (preparing.Get()) return;
         if (!verification.Get() || verification.Get()->first != call.id)
@@ -431,7 +433,7 @@ View CodeRevertReview(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
       }).With(Enabled(!preparing.Get() && !current->summary.active_run)));
     }
   } else if (latest_result) {
-    if (latest_result->reconciliation) content.push_back(Text("Revert result verified", TextRole::Label));
+    if (latest_result->reconciliation) content.push_back(Text(::app::strings::ui_revert_result_verified, TextRole::Label));
     for (const auto& effect : latest_result->effects) {
       const auto label = effect.state == kit::ResourceEffectState::Applied ? "Reverted: " : "Skipped: ";
       content.push_back(Text(label + File(effect.resource.value).Name(), TextRole::Label));
@@ -439,7 +441,7 @@ View CodeRevertReview(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
   }
   content.push_back(ScrollView(Column(std::move(files)).With(Spacing(6.0F))).With(Grow()));
   if (current && !unresolved) content.push_back(
-      Button("Prepare revert").OnClick([runtime, tasks, session = current->summary.id, call = original.id, selected = std::move(selected),
+      Button(::app::strings::ui_prepare_revert).OnClick([runtime, tasks, session = current->summary.id, call = original.id, selected = std::move(selected),
                                            preparing, submitted, status, waiting] {
         if (selected.empty() || preparing.Get() || waiting) return;
         preparing = true;
@@ -457,13 +459,13 @@ View CodeRevertReview(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
       }).With(Enabled(enabled)));
   if (!status.Get().empty()) content.push_back(Text(status.Get(), TextRole::Label));
   else if (submission && submission->state == kit::QueueItemState::Rejected) {
-    content.push_back(Text(submission->reason ? submission->reason->message : "The reverse patch could not start.", TextRole::Label)
+    content.push_back(Text(submission->reason ? StringVariant{submission->reason->message} : StringVariant{::app::strings::ui_the_reverse_patch_could_not_start}, TextRole::Label)
         .Style({Font::System(12.0F), UseTheme().colors.error}));
   } else if (awaiting_approval) {
-    content.push_back(Text("Return to the conversation to review the reverse patch.", TextRole::Label));
+    content.push_back(Text(::app::strings::ui_return_to_the_conversation_to_review_the, TextRole::Label));
   } else if (waiting || preparing.Get()) {
     const bool queued = submission && submission->state == kit::QueueItemState::Queued && current->summary.active_run;
-    content.push_back(Text(queued ? "The reverse patch is queued." : "Preparing the reverse patch...", TextRole::Label));
+    content.push_back(Text(queued ? ::app::strings::ui_the_reverse_patch_is_queued : ::app::strings::ui_preparing_the_reverse_patch, TextRole::Label));
   }
   return Column(std::move(content)).With(Grow(), Spacing(12.0F));
 }
@@ -481,13 +483,13 @@ static View CodeWorkspaceConversation(std::shared_ptr<kit::Conversation> convers
     return recover ? ObserveCodeSession(conversation, tasks, observed, status) : std::function<void()>{};
   }, conversation, evidence.has_value());
   const auto snapshot = observed.Get();
-  std::vector<View> actions{Button("Edit workspace file").OnClick(std::move(edit))};
+  std::vector<View> actions{Button(::app::strings::ui_edit_workspace_file).OnClick(std::move(edit))};
   std::optional<View> recovery_review;
   if (snapshot && evidence) {
     for (const auto& call : snapshot->tools) {
       if (call.tool.id != ApplyCodePatch) continue;
       if (call.state == kit::ToolCallState::ResultUnknown && call.issued_targets) {
-        actions.push_back(Button("Check patch result").OnClick([runtime, tasks, session = snapshot->summary.id, call,
+        actions.push_back(Button(::app::strings::ui_check_patch_result).OnClick([runtime, tasks, session = snapshot->summary.id, call,
             workspace, evidence = *evidence, checking, status, verification] {
           if (checking.Get()) return;
           if (!verification.Get() || verification.Get()->first != call.id)
@@ -504,12 +506,12 @@ static View CodeWorkspaceConversation(std::shared_ptr<kit::Conversation> convers
       } else if (call.artifacts.empty() && (call.reconciliation || call.state == kit::ToolCallState::PartiallyApplied)) {
         if (reviewed.Get() == call.id) {
           recovery_review = Column{
-              Row{Button("Back to conversation").OnClick([reviewed] { reviewed = std::nullopt; }), Spacer()},
-              Text("Applied workspace changes", TextRole::Title),
+              Row{Button(::app::strings::ui_back_to_conversation).OnClick([reviewed] { reviewed = std::nullopt; }), Spacer()},
+              Text(::app::strings::ui_applied_workspace_changes, TextRole::Title),
               CodeRevertReview(runtime, conversation, call, workspace, evidence).Key(call.id.value),
           }.With(Grow(), Spacing(12.0F), Padding(20.0F));
         }
-        const auto label = call.reconciliation ? "Review recovered patch" : "Review partial patch";
+        const auto label = call.reconciliation ? ::app::strings::ui_review_recovered_patch : ::app::strings::ui_review_partial_patch;
         actions.push_back(Button(label).OnClick([reviewed, id = call.id] { reviewed = id; }).Key(call.id.value));
       }
     }
@@ -674,7 +676,7 @@ static View SelectableCodeDiff(std::shared_ptr<kit::Conversation> conversation, 
           .With(Grow(), CrossAlign(CrossAxisAlignment::Stretch), Padding(EdgeInsets{.left = lane_width * 2.0F}))}
           .With(Grow(), Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch), ClipChildren(),
               CornerRadius(7.0F), Border{colors.outline}, Background(colors.surface_container_high),
-              Semantics{.label = "Code diff", .identifier = "code-diff"}),
+              Semantics{.label = ::app::strings::ui_code_diff, .identifier = "code-diff"}),
   };
   if (draft) body.push_back(kit::AgentChatSourceActions(std::move(conversation), std::move(selected), *draft));
   return Column(std::move(body)).With(Grow(), Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
@@ -704,7 +706,7 @@ static View CodeDiffReview(std::shared_ptr<kit::Conversation> conversation, kit:
   if (show_filename) details.push_back(Text(filename, TextRole::Title)
       .Style({Font::System(27.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}));
   details.push_back(Flow(std::move(metadata)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)));
-  if (editor) details.push_back(Row{Button("Open editor source").OnClick(std::move(editor)), Spacer()});
+  if (editor) details.push_back(Row{Button(::app::strings::ui_open_editor_source).OnClick(std::move(editor)), Spacer()});
   details.push_back(SelectableCodeDiff(std::move(conversation), artifact, kit::PartId{std::move(path)}, patch, draft));
   return Column(std::move(details)).With(Grow(), Spacing(9.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
@@ -720,7 +722,7 @@ View CodeChat(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<k
   const auto tasks = UseTaskScope();
   const auto dialogs = UseDialog();
   const auto open_editor = [dialogs, workspace](std::string path, std::string version) {
-    if (workspace && workspace->NativeFolder()) dialogs.Show(DialogFactory{[workspace, path, version](DialogContext context) {
+    if (workspace && workspace->NativeFolder()) ShowPreviewDialog(dialogs, DialogFactory{[workspace, path, version](DialogContext context) {
       return CodeEditorDialog(context, *workspace, path, version);
     }});
   };

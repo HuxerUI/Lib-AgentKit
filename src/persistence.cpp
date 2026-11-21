@@ -188,9 +188,58 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Budget, tokens, model_turns, tool_calls, cont
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(RunCompletion, summary, structured, artifacts)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(SkillActivation, skill, trigger)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(RunSteerSnapshot, message, state, reason)
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(RunSnapshot, id, session, agent, model, trigger, parent, retry_of,
-    work_request, task, goal, state, waits, steering, active_skills, usage, end_reason, result, failure,
-    execution_profile)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(RunTiming, started_at, ended_at, waiting_for_input, input_wait_started_at)
+
+void to_json(nlohmann::json& wire, const RunSnapshot& run) {
+  wire["id"] = run.id;
+  wire["session"] = run.session;
+  wire["agent"] = run.agent;
+  wire["model"] = run.model;
+  wire["trigger"] = run.trigger;
+  wire["parent"] = run.parent;
+  wire["retry_of"] = run.retry_of;
+  wire["work_request"] = run.work_request;
+  wire["task"] = run.task;
+  wire["goal"] = run.goal;
+  wire["state"] = run.state;
+  wire["waits"] = run.waits;
+  wire["steering"] = run.steering;
+  wire["active_skills"] = run.active_skills;
+  wire["usage"] = run.usage;
+  wire["end_reason"] = run.end_reason;
+  wire["result"] = run.result;
+  wire["failure"] = run.failure;
+  wire["execution_profile"] = run.execution_profile;
+  wire["timing"] = run.timing;
+  wire["reasoning_summary"] = run.reasoning_summary;
+  wire["model_active"] = run.model_active;
+}
+
+void from_json(const nlohmann::json& wire, RunSnapshot& run) {
+  wire.at("id").get_to(run.id);
+  wire.at("session").get_to(run.session);
+  wire.at("agent").get_to(run.agent);
+  wire.at("model").get_to(run.model);
+  wire.at("trigger").get_to(run.trigger);
+  wire.at("parent").get_to(run.parent);
+  wire.at("retry_of").get_to(run.retry_of);
+  wire.at("work_request").get_to(run.work_request);
+  wire.at("task").get_to(run.task);
+  wire.at("goal").get_to(run.goal);
+  wire.at("state").get_to(run.state);
+  wire.at("waits").get_to(run.waits);
+  wire.at("steering").get_to(run.steering);
+  wire.at("active_skills").get_to(run.active_skills);
+  wire.at("usage").get_to(run.usage);
+  wire.at("end_reason").get_to(run.end_reason);
+  wire.at("result").get_to(run.result);
+  wire.at("failure").get_to(run.failure);
+  wire.at("execution_profile").get_to(run.execution_profile);
+  run.timing = wire.value("timing", std::optional<RunTiming>{});
+  run.reasoning_summary = wire.value("reasoning_summary", std::string{});
+  run.model_active = wire.value("model_active", false);
+}
+
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(FormRequest, title, schema, presentation, expires_at)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(TargetBaseline, target, expected)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(GoalEditImpact, previous, retiring_run, in_flight_calls, continuing_runs,
@@ -857,7 +906,7 @@ Task<void> SettleInterrupted(StoredSession& stored, RuntimeState& runtime) {
       }
     }
     const bool revised = run.view.end_reason == RunEndReason::GoalRevised;
-    run.view.state = revised || parent_closed ? RunState::Cancelled : RunState::Failed;
+    SetObservedRunState(run.view, revised || parent_closed ? RunState::Cancelled : RunState::Failed, runtime.Now());
     runtime.FinishWork(session, run.view);
     if (parent_closed) run.view.end_reason = RunEndReason::ParentCancelled;
     else if (!revised) run.view.end_reason = uncertain ? RunEndReason::ToolOutcomeUnknown : RunEndReason::Interrupted;
@@ -1350,6 +1399,7 @@ Async<void> RuntimeState::LoadStored() {
     for (auto& entry : image.runs) {
       auto run_id = entry.view.id;
       const auto restoring = CanRestore(entry, sessions.at(id));
+      entry.view.model_active = false;
       std::map<ToolCallId, ToolAttempt> attempts;
       for (auto& [call, plan] : entry.tool_plans) attempts.emplace(call, ToolAttempt{std::move(plan)});
       if (!entry.host_model_step && entry.host_skill_input)

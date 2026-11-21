@@ -1,4 +1,4 @@
-#include "preview_store.h"
+#include "sqlite_session_store.h"
 
 #include <huxerui/agentkit.h>
 #include <huxerui/huxerui.h>
@@ -237,7 +237,7 @@ huxerui::Task<void> VerifyRuntimeReopen(huxerui::File file) {
   kit::Sequence cursor = 0;
   std::vector<kit::SessionEvent> live;
   {
-    auto store = std::make_shared<LostReceiptStore>(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)));
+    auto store = std::make_shared<LostReceiptStore>(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)));
     auto model = std::make_shared<CountingModel>();
     model->split_text = true;
     auto runtime = RegisterRuntime(store, model);
@@ -281,7 +281,7 @@ huxerui::Task<void> VerifyRuntimeReopen(huxerui::File file) {
     Take(co_await runtime->CloseAsync());
   }
   {
-    auto store = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+    auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
     auto model = std::make_shared<CountingModel>();
     bool may_read = true;
     auto runtime = RegisterRuntime(store, model, {}, false, {}, [&](kit::PolicyRequest request) -> kit::Async<kit::PolicyDecision> {
@@ -334,7 +334,7 @@ huxerui::Task<void> VerifyRuntimeReopen(huxerui::File file) {
     Take(co_await runtime->CloseAsync());
   }
   {
-    auto store = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+    auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
     const auto image = Take(co_await store->LoadAsync());
     const auto missing = std::ranges::find_if(image.records, [&](const auto& row) {
       return row.collection == "agentkit.session-events" && row.key == first.stamp.commit.value;
@@ -374,7 +374,7 @@ struct StreamingCheckpoint {
 };
 
 huxerui::Task<void> SaveStreamingCheckpoint(huxerui::File file, StreamingCheckpoint& saved) {
-  auto store = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto model = std::make_shared<CountingModel>();
   model->split_text = model->pause_text = true;
   auto runtime = RegisterRuntime(store, model);
@@ -389,7 +389,7 @@ huxerui::Task<void> SaveStreamingCheckpoint(huxerui::File file, StreamingCheckpo
 }
 
 huxerui::Task<void> RecoverStreamingCheckpoint(huxerui::File file, const StreamingCheckpoint& saved) {
-  auto store = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto model = std::make_shared<CountingModel>();
   auto runtime = RegisterRuntime(store, model);
   Take(co_await runtime->StartAsync());
@@ -412,7 +412,7 @@ huxerui::Task<void> RecoverStreamingCheckpoint(huxerui::File file, const Streami
 
 huxerui::Task<void> StartInterruptedEffect(huxerui::File file, std::shared_ptr<EffectProbe> probe,
                                           kit::SessionCreated& created) {
-  auto store = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto model = std::make_shared<CountingModel>();
   model->write = true;
   auto runtime = RegisterRuntime(store, model, probe);
@@ -432,7 +432,7 @@ huxerui::Task<void> StartInterruptedEffect(huxerui::File file, std::shared_ptr<E
 
 huxerui::Task<void> RecoverInterruptedEffect(huxerui::File file, std::shared_ptr<EffectProbe> probe,
                                             kit::SessionCreated created) {
-  auto store = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto model = std::make_shared<CountingModel>();
   auto runtime = RegisterRuntime(store, model, probe);
   Take(co_await runtime->StartAsync());
@@ -472,7 +472,7 @@ huxerui::Task<void> RecoverInterruptedEffect(huxerui::File file, std::shared_ptr
 }
 
 huxerui::Task<void> VerifyReconciledEffect(huxerui::File file, std::shared_ptr<EffectProbe> probe, kit::SessionCreated created) {
-  auto runtime = RegisterRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), std::make_shared<CountingModel>(), probe);
+  auto runtime = RegisterRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), std::make_shared<CountingModel>(), probe);
   Take(co_await runtime->StartAsync());
   const kit::ToolExecutionResult applied{.outcome = kit::ToolOutcome::Succeeded};
   auto replay = Take(co_await runtime->ReconcileToolAsync(probe->reconciliation, created.session, probe->started, applied));
@@ -535,7 +535,7 @@ private:
 
 huxerui::Task<void> SaveToolReview(huxerui::File file, std::shared_ptr<EffectProbe> probe, SavedReview& saved,
                                  ReviewRestart scenario) {
-  auto store = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto fault = std::make_shared<ReviewExecutionFaultStore>(store, saved);
   const bool pending = scenario == ReviewRestart::Pending;
   auto model = std::make_shared<CountingModel>();
@@ -568,7 +568,7 @@ huxerui::Task<void> SaveToolReview(huxerui::File file, std::shared_ptr<EffectPro
 
 huxerui::Task<void> ReopenToolReview(huxerui::File file, std::shared_ptr<EffectProbe> probe, SavedReview& saved,
                                    ReviewRestart scenario) {
-  auto store = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto model = std::make_shared<CountingModel>();
   model->write = true;
   auto runtime = RegisterRuntime(std::move(store), model, probe, false,
@@ -718,7 +718,7 @@ huxerui::Task<void> VerifySkillApproval(huxerui::File file, SavedSkill& saved, b
   source->old_available = old_available;
   auto model = std::make_shared<ReleaseSkillModel>();
   model->catalog_version = source->current;
-  auto store = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto runtime = Take(AgentRuntime::Create({.tasks = huxerui::UseApplicationTaskScope(),
       .principal = [] { return AgentResult<PrincipalId>::Success({"skill-user"}); },
       .access = [source, trigger, revoke_resource](PolicyRequest request) -> Async<PolicyDecision> {
@@ -796,7 +796,7 @@ struct SavedApproval {
 };
 
 huxerui::Task<void> UseLegacyToolPlanFields(huxerui::File file, kit::SessionId session) {
-  auto store = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto image = Take(co_await store->LoadAsync());
   const auto record = std::ranges::find(image.records, session.value, &kit::StoreValue::key);
   Check(record != image.records.end(), "approval checkpoint was not stored");
@@ -823,7 +823,7 @@ huxerui::Task<void> UseLegacyToolPlanFields(huxerui::File file, kit::SessionId s
 
 huxerui::Task<void> SaveApproval(huxerui::File file, std::shared_ptr<EffectProbe> probe, SavedApproval& saved,
                                 ApprovalRestart scenario) {
-  auto storage = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto storage = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto model = std::make_shared<CountingModel>();
   model->write = true;
   model->with_private_state = scenario == ApprovalRestart::StoredContinuation || scenario == ApprovalRestart::VolatileContinuation;
@@ -853,7 +853,7 @@ huxerui::Task<void> ResumeApproval(huxerui::File file, std::shared_ptr<EffectPro
   probe->hold_before_effect = false;
   probe->hold_effect = false;
   probe->deny = scenario == ApprovalRestart::Revoked;
-  auto storage = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto storage = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto model = std::make_shared<CountingModel>();
   model->write = true;
   auto runtime = RegisterRuntime(std::move(storage), model, probe, scenario == ApprovalRestart::StoredContinuation);
@@ -916,7 +916,7 @@ huxerui::Task<void> ResumeApproval(huxerui::File file, std::shared_ptr<EffectPro
 
 huxerui::Task<void> VerifyCatalogApproval(huxerui::File file, SavedApproval& saved,
                                          std::shared_ptr<EffectProbe> probe, bool reopen, kit::Revision version) {
-  auto storage = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto storage = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto model = std::make_shared<CountingModel>();
   model->write = true;
   std::optional<kit::ToolDefinition> definition;
@@ -1003,7 +1003,7 @@ public:
 };
 
 huxerui::Task<void> VerifyStoredToolTurn(huxerui::File file, SavedToolTurn& saved, bool reopen) {
-  auto store = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto model = std::make_shared<StoredToolTurnModel>();
   auto runtime = Take(kit::AgentRuntime::Create({.tasks = huxerui::UseApplicationTaskScope(),
       .principal = [] { return kit::AgentResult<kit::PrincipalId>::Success({"test.user"}); },
@@ -1211,7 +1211,7 @@ std::shared_ptr<kit::AgentRuntime> RegisterPublicationRuntime(std::shared_ptr<ki
 }
 
 huxerui::Task<void> VerifyModelPublications(huxerui::File file, ModelPublicationFixture& fixture, bool reopen) {
-  auto runtime = RegisterPublicationRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = RegisterPublicationRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   if (!reopen) {
     auto receipt = Take(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
@@ -1342,7 +1342,7 @@ std::shared_ptr<kit::AgentRuntime> ResultAccessRuntime(std::shared_ptr<kit::Sess
 }
 
 huxerui::Task<void> VerifyResultAccess(huxerui::File file, ResultAccessFixture& fixture, bool reopen) {
-  auto runtime = ResultAccessRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = ResultAccessRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   if (!reopen) {
     const auto created = Take(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {.options = {.agent = {"permission.agent"}}}));
@@ -1492,7 +1492,7 @@ huxerui::Task<void> VerifySourceApproval(huxerui::File file, SavedSourceApproval
   const kit::ToolId consumer_tool{"source-approval.consume"};
   const kit::SourceSlice input{rework_report, {results_part}};
   const kit::ArtifactRef replacement{rework_report.id, 2};
-  auto fault = std::make_shared<SourcePlanFaultStore>(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)));
+  auto fault = std::make_shared<SourcePlanFaultStore>(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)));
   auto runtime = Take(kit::AgentRuntime::Create({.tasks = huxerui::UseApplicationTaskScope(),
       .principal = [] { return kit::AgentResult<kit::PrincipalId>::Success({"test.user"}); },
       .access = [&](kit::PolicyRequest request) -> kit::Async<kit::PolicyDecision> {
@@ -1653,7 +1653,7 @@ struct SavedRework {
 };
 
 huxerui::Task<void> UseLegacyReworkPlanField(huxerui::File file, kit::SessionId session) {
-  auto store = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto image = Take(co_await store->LoadAsync());
   const auto row = std::ranges::find(image.records, session.value, &kit::StoreValue::key);
   Check(row != image.records.end(), "rework was not stored");
@@ -1681,7 +1681,7 @@ huxerui::Task<void> VerifyRework(huxerui::File file, SavedRework& saved, bool re
   const kit::ProjectId project{"rework.project"};
   const kit::ToolId check_source{"rework.check-source"};
   kit::PrincipalId viewer{"test.user"};
-  auto storage = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto storage = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto lost = std::make_shared<LostReceiptStore>(storage, true);
   auto runtime = Take(kit::AgentRuntime::Create({.tasks = huxerui::UseApplicationTaskScope(),
       .principal = [&viewer] { return kit::AgentResult<kit::PrincipalId>::Success(viewer); },
@@ -1994,7 +1994,7 @@ std::shared_ptr<kit::AgentRuntime> RegisterFormRuntime(std::shared_ptr<kit::Sess
 
 huxerui::Task<void> FormRun(huxerui::File file, std::shared_ptr<FormProbe> probe, kit::SessionCreated& created,
                            bool reopen, bool answer_before_restart) {
-  auto runtime = RegisterFormRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto runtime = RegisterFormRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(co_await runtime->StartAsync());
   if (!reopen) {
     kit::CreateSessionRequest request{.options = {.agent = {"test.form"}}, .initial = kit::SendInput{.text = "Ask"}};
@@ -2036,7 +2036,7 @@ const kit::SkillRef recovered_skill = ReleaseSkillSource::Ref(3);
 
 huxerui::Task<void> SaveSideChat(huxerui::File file, std::shared_ptr<FormProbe> probe, StoredSideChat& saved,
                                SideChatDelivery delivery = SideChatDelivery::Queue) {
-  auto runtime = RegisterFormRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto runtime = RegisterFormRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(runtime->RegisterAgent({{.ref = {{"test.selection"}, 1}, .display_name = "Selection", .model = {"test.model"}}}));
   Take(co_await runtime->StartAsync());
   kit::CreateSessionRequest root{.options = {.agent = {"test.form"}}, .initial = kit::SendInput{.text = "Stored source"}};
@@ -2076,7 +2076,7 @@ huxerui::Task<void> SaveSideChat(huxerui::File file, std::shared_ptr<FormProbe> 
 }
 
 huxerui::Task<void> ReopenSideChat(huxerui::File file, std::shared_ptr<FormProbe> probe, const StoredSideChat& saved) {
-  auto runtime = RegisterFormRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto runtime = RegisterFormRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(co_await runtime->StartAsync());
   auto child = co_await runtime->Sessions().OpenAsync(saved.child);
   Check(!child.Succeeded() && child.Error().code == kit::ErrorCode::NotFound, "the temporary side chat survived restart");
@@ -2099,7 +2099,7 @@ huxerui::Task<void> ReopenSideChat(huxerui::File file, std::shared_ptr<FormProbe
 
 huxerui::Task<void> RecoverRejectedReferences(huxerui::File file, std::shared_ptr<FormProbe> probe, const StoredSideChat& saved) {
   probe->reject_saved_profile = true;
-  auto runtime = RegisterFormRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto runtime = RegisterFormRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(co_await runtime->StartAsync());
   auto expired_child = co_await runtime->Sessions().OpenAsync(saved.child);
   Check(!expired_child.Succeeded(), "the original temporary conversation should be gone");
@@ -2162,7 +2162,7 @@ huxerui::Task<void> RecoverRejectedReferences(huxerui::File file, std::shared_pt
 }
 
 huxerui::Task<void> FinishUnappliedSteer(huxerui::File file, std::shared_ptr<FormProbe> probe, const StoredSideChat& saved) {
-  auto runtime = RegisterFormRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto runtime = RegisterFormRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(co_await runtime->StartAsync());
   const auto main = Take(co_await runtime->Sessions().OpenAsync(saved.parent));
   const auto before = main->Snapshot();
@@ -2180,7 +2180,7 @@ huxerui::Task<void> FinishUnappliedSteer(huxerui::File file, std::shared_ptr<For
 }
 
 huxerui::Task<void> RecoverUnappliedSteer(huxerui::File file, std::shared_ptr<FormProbe> probe, const StoredSideChat& saved) {
-  auto runtime = RegisterFormRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto runtime = RegisterFormRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(co_await runtime->StartAsync());
   Check(!(co_await runtime->Sessions().OpenAsync(saved.child)).Succeeded(), "the temporary reply unexpectedly survived restart");
   auto main = Take(co_await runtime->Sessions().OpenAsync(saved.parent));
@@ -2240,7 +2240,7 @@ huxerui::Task<void> RecoverUnappliedSteer(huxerui::File file, std::shared_ptr<Fo
 huxerui::Task<void> VerifyStore(huxerui::File file) {
   const huxerui::Bytes first{std::byte{0x00}, std::byte{0xff}};
   const huxerui::Bytes second{std::byte{0x42}};
-  auto existing = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto existing = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto empty = Take(co_await existing->LoadAsync());
   Check(empty.revision == 0 && empty.records.empty(), "new store must be empty");
   kit::StoreTransaction begin{{"create"}, 0, {
@@ -2251,7 +2251,7 @@ huxerui::Task<void> VerifyStore(huxerui::File file) {
   begin.writes.back().data = second;
   ExpectError(co_await existing->CommitAsync(begin), kit::ErrorCode::Conflict);
 
-  auto other = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto other = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   kit::StoreTransaction stale{{"stale"}, 0, {{"session", "new", {}, first}}};
   ExpectError(co_await other->CommitAsync(stale), kit::ErrorCode::Conflict);
   kit::StoreTransaction bad_key{{"bad-base"}, 1, {
@@ -2280,7 +2280,7 @@ huxerui::Task<void> VerifyStore(huxerui::File file) {
   existing.reset();
   other.reset();
 
-  auto reopened = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto reopened = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto image = Take(co_await reopened->LoadAsync());
   Check(image.revision == 2 && image.records.size() == 1 && image.records.front().collection == "command" &&
         image.records.front().revision == 1 && image.records.front().data == second, "reopened image contains only committed data");
@@ -2383,7 +2383,7 @@ std::shared_ptr<kit::AgentRuntime> CollaborationRuntime(
 }
 
 huxerui::Task<void> DispatchReviews(huxerui::File file, std::shared_ptr<CollaborationFixture> fixture) {
-  auto runtime = CollaborationRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = CollaborationRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   auto worker = Take(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {.options = {.agent = {"reviewer"}}}));
   fixture->worker = std::get<kit::SessionCreated>(worker.outcome).session;
@@ -2417,7 +2417,7 @@ huxerui::Task<void> DispatchReviews(huxerui::File file, std::shared_ptr<Collabor
 }
 
 huxerui::Task<void> ResumeReviews(huxerui::File file, std::shared_ptr<CollaborationFixture> fixture) {
-  auto runtime = CollaborationRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = CollaborationRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   auto parent = Take(co_await runtime->Sessions().OpenAsync(fixture->parent.session));
   auto queued = Take(co_await runtime->Collaboration().ReadMessageAsync(fixture->request));
@@ -2520,7 +2520,7 @@ kit::Async<kit::CommandProgress> AwaitOperation(std::shared_ptr<kit::AgentRuntim
 }
 
 huxerui::Task<void> StageCreation(huxerui::File file, std::shared_ptr<OperationFixture> fixture) {
-  auto runtime = OperationRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = OperationRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   auto source = Take(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
       .options = {.agent = {"approval.lead"}}, .initial = kit::SendInput{.text = "Delegate a review"}}));
@@ -2536,7 +2536,7 @@ huxerui::Task<void> StageCreation(huxerui::File file, std::shared_ptr<OperationF
 
 huxerui::Task<void> CommitCreationDecision(huxerui::File file, std::shared_ptr<OperationFixture> fixture) {
   fixture->pause_create = true;
-  auto runtime = OperationRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = OperationRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   auto source = Take(co_await runtime->Sessions().OpenAsync(fixture->source));
   auto again = Take(co_await runtime->Sessions().OpenAsync(fixture->source));
@@ -2555,7 +2555,7 @@ huxerui::Task<void> CommitCreationDecision(huxerui::File file, std::shared_ptr<O
 
 huxerui::Task<void> FinishApprovedOperations(huxerui::File file, std::shared_ptr<OperationFixture> fixture) {
   fixture->pause_create = false;
-  auto store = std::make_shared<LostReceiptStore>(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), true);
+  auto store = std::make_shared<LostReceiptStore>(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), true);
   auto runtime = OperationRuntime(store, fixture);
   Take(co_await runtime->StartAsync());
   auto status = Take(co_await AwaitOperation(runtime, fixture->command));
@@ -2781,7 +2781,7 @@ huxerui::Task<void> CheckProjectSourceRetired(std::shared_ptr<kit::Conversation>
 }
 
 huxerui::Task<void> SetUpProject(huxerui::File file, std::shared_ptr<ProjectFixture> fixture) {
-  auto runtime = ProjectRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = ProjectRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   auto api = runtime->Projects();
   const auto id = fixture->project;
@@ -2865,7 +2865,7 @@ huxerui::Task<void> SetUpProject(huxerui::File file, std::shared_ptr<ProjectFixt
 }
 
 huxerui::Task<void> ReopenProject(huxerui::File file, std::shared_ptr<ProjectFixture> fixture) {
-  auto runtime = ProjectRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = ProjectRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   auto api = runtime->Projects();
   const auto id = fixture->project;
@@ -2934,7 +2934,7 @@ huxerui::Task<void> ReopenProject(huxerui::File file, std::shared_ptr<ProjectFix
 }
 
 huxerui::Task<void> RecoverProjectWithdrawal(huxerui::File file, std::shared_ptr<ProjectFixture> fixture) {
-  auto runtime = ProjectRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = ProjectRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   auto api = runtime->Projects();
   const auto& id = fixture->project;
@@ -3119,7 +3119,7 @@ bool SameApproval(const kit::PendingApproval& left, const kit::PendingApproval& 
 }
 
 huxerui::Task<void> StageComparisonApprovals(huxerui::File file, std::shared_ptr<ForkReviewFixture> fixture) {
-  auto runtime = ForkReviewRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = ForkReviewRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   const auto source = std::get<kit::SessionCreated>(Take(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
       .options = {.agent = {"comparison.worker"}, .project = fixture->project, .workspace = kit::WorkspaceId{"main"}},
@@ -3169,7 +3169,7 @@ huxerui::Task<void> StageComparisonApprovals(huxerui::File file, std::shared_ptr
 }
 
 huxerui::Task<void> DecideComparisonApprovals(huxerui::File file, std::shared_ptr<ForkReviewFixture> fixture) {
-  auto store = std::make_shared<LostReceiptStore>(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), true, false);
+  auto store = std::make_shared<LostReceiptStore>(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), true, false);
   auto runtime = ForkReviewRuntime(store, fixture);
   Take(co_await runtime->StartAsync());
   const auto source = Take(co_await runtime->Sessions().OpenAsync(fixture->request.from.session));
@@ -3203,7 +3203,7 @@ huxerui::Task<void> DecideComparisonApprovals(huxerui::File file, std::shared_pt
 }
 
 huxerui::Task<void> RecoverComparisonApproval(huxerui::File file, std::shared_ptr<ForkReviewFixture> fixture) {
-  auto runtime = ForkReviewRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = ForkReviewRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   const auto progress = Take(co_await runtime->Commands().ReadAsync(fixture->create));
   Check(progress.state == kit::CommandState::Applied && progress.approval &&
@@ -3235,7 +3235,7 @@ huxerui::Task<void> RecoverComparisonApproval(huxerui::File file, std::shared_pt
 }
 
 huxerui::Task<void> StoreForkReview(huxerui::File file, std::shared_ptr<ForkReviewFixture> fixture) {
-  auto storage = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto storage = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto lost = std::make_shared<LostReceiptStore>(storage, true, false);
   auto runtime = ForkReviewRuntime(lost, fixture);
   Take(co_await runtime->StartAsync());
@@ -3284,7 +3284,7 @@ huxerui::Task<void> StoreForkReview(huxerui::File file, std::shared_ptr<ForkRevi
 }
 
 huxerui::Task<void> ResumeForkReview(huxerui::File file, std::shared_ptr<ForkReviewFixture> fixture, bool finish) {
-  auto runtime = ForkReviewRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = ForkReviewRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   const auto command = Take(co_await runtime->Commands().ReadAsync(fixture->create));
   Check(command.result && std::get<kit::ForkReviewCreated>(*command.result).review == fixture->review,
@@ -3344,7 +3344,7 @@ huxerui::Task<void> ResumeForkReview(huxerui::File file, std::shared_ptr<ForkRev
 }
 
 huxerui::Task<void> StoreCandidateAdoption(huxerui::File file, std::shared_ptr<ForkReviewFixture> fixture) {
-  auto runtime = ForkReviewRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = ForkReviewRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   auto comparisons = runtime->ForkReviews();
   kit::CreateSessionRequest source{.options = {.agent = {"comparison.worker"}, .project = fixture->project},
@@ -3401,7 +3401,7 @@ huxerui::Task<void> StoreCandidateAdoption(huxerui::File file, std::shared_ptr<F
 }
 
 huxerui::Task<void> RecoverCandidateAdoption(huxerui::File file, std::shared_ptr<ForkReviewFixture> fixture, bool approve) {
-  auto runtime = ForkReviewRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = ForkReviewRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   auto comparisons = runtime->ForkReviews();
   const auto& request = fixture->adoption;
@@ -3505,7 +3505,7 @@ huxerui::Task<kit::GoalSnapshot> WaitGoalState(kit::SessionGoals goals, kit::Goa
 }
 
 huxerui::Task<void> ReviseReleaseGoal(huxerui::File file, std::shared_ptr<GoalFixture> fixture) {
-  auto store = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto runtime = RegisterGoalRuntime(store, fixture);
   Take(co_await runtime->StartAsync());
   auto created = Take(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {.options = {.agent = {"test.goal"}}}));
@@ -3570,7 +3570,7 @@ huxerui::Task<void> ReviseReleaseGoal(huxerui::File file, std::shared_ptr<GoalFi
 }
 
 huxerui::Task<void> ReviewRecoveredGoal(huxerui::File file, std::shared_ptr<GoalFixture> fixture) {
-  auto runtime = RegisterGoalRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = RegisterGoalRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   auto session = Take(co_await runtime->Sessions().OpenAsync(fixture->session));
   auto goals = session->Goals();
@@ -3666,7 +3666,7 @@ std::shared_ptr<kit::AgentRuntime> PausedGoalRuntime(std::shared_ptr<kit::Sessio
 
 huxerui::Task<void> VerifyPausedGoalDispatch(huxerui::File file) {
   auto dispatch = std::make_shared<PausedGoalDispatch>();
-  auto store = Take(co_await agentkit_preview::OpenSessionStoreAsync(file));
+  auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
   auto runtime = PausedGoalRuntime(std::move(store), dispatch);
   Take(co_await runtime->StartAsync());
   auto sessions = runtime->Sessions();
@@ -3802,7 +3802,7 @@ std::shared_ptr<kit::AgentRuntime> GoalDispatchRuntime(std::shared_ptr<kit::Sess
 }
 
 huxerui::Task<void> ReviseDispatchedGoal(huxerui::File file, std::shared_ptr<GoalDispatchFixture> fixture) {
-  auto runtime = GoalDispatchRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = GoalDispatchRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   const kit::CreateSessionRequest create{.options = {.agent = {"goal.dispatch"}, .project = fixture->project}};
   auto main = Take(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), create));
@@ -3888,7 +3888,7 @@ huxerui::Task<void> ReviseDispatchedGoal(huxerui::File file, std::shared_ptr<Goa
 }
 
 huxerui::Task<void> RecoverDispatchedGoal(huxerui::File file, std::shared_ptr<GoalDispatchFixture> fixture) {
-  auto runtime = GoalDispatchRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), fixture);
+  auto runtime = GoalDispatchRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), fixture);
   Take(co_await runtime->StartAsync());
   auto owner = Take(co_await runtime->Sessions().OpenAsync(fixture->owner));
   auto running = Take(co_await runtime->Sessions().OpenAsync(fixture->workers[0]));
@@ -3967,7 +3967,7 @@ std::shared_ptr<kit::AgentRuntime> ForkRuntime(std::shared_ptr<kit::SessionStore
 }
 
 huxerui::Task<void> StageWorkspaceFork(huxerui::File file, WorkspaceForkProbe& probe) {
-  auto runtime = ForkRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto runtime = ForkRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(co_await runtime->StartAsync());
   const kit::WorkspaceId workspace{"source-workspace"};
   const kit::ProjectId project{"shared-fork-project"};
@@ -3992,7 +3992,7 @@ huxerui::Task<void> StageWorkspaceFork(huxerui::File file, WorkspaceForkProbe& p
 }
 
 huxerui::Task<void> ApproveWorkspaceFork(huxerui::File file, WorkspaceForkProbe& probe) {
-  auto store = std::make_shared<LostReceiptStore>(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), true);
+  auto store = std::make_shared<LostReceiptStore>(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), true);
   auto runtime = ForkRuntime(store, probe);
   Take(co_await runtime->StartAsync());
   auto source = Take(co_await runtime->Sessions().OpenAsync(probe.request.from.session));
@@ -4017,7 +4017,7 @@ huxerui::Task<void> ApproveWorkspaceFork(huxerui::File file, WorkspaceForkProbe&
 }
 
 huxerui::Task<void> ReopenWorkspaceFork(huxerui::File file, WorkspaceForkProbe& probe) {
-  auto runtime = ForkRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto runtime = ForkRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(co_await runtime->StartAsync());
   auto progress = Take(co_await runtime->Commands().ReadAsync(probe.command));
   Check(progress.state == kit::CommandState::Applied && progress.result &&
@@ -4045,9 +4045,9 @@ huxerui::Task<void> ReopenWorkspaceFork(huxerui::File file, WorkspaceForkProbe& 
   const auto abandoned = kit::NewCommandId();
   auto cleanup = probe.request;
   cleanup.workspace->copy_plan->version = 3;
-  auto stale = ForkRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto stale = ForkRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(co_await stale->StartAsync());
-  auto stale_cleanup = ForkRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto stale_cleanup = ForkRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(co_await stale_cleanup->StartAsync());
   Take(co_await runtime->Sessions().AbandonWorkspaceForkAsync(abandoned, cleanup, retired));
   for (int attempt = 0; attempt < 2; ++attempt) {
@@ -4066,7 +4066,7 @@ huxerui::Task<void> ReopenWorkspaceFork(huxerui::File file, WorkspaceForkProbe& 
   Check(!stale_close.Succeeded() && stale_close.Error().code == kit::ErrorCode::Conflict,
         "the stale runtime lost the store conflict");
   Take(co_await runtime->CloseAsync());
-  auto reopened = ForkRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto reopened = ForkRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(co_await reopened->StartAsync());
   Take(co_await reopened->Sessions().AbandonWorkspaceForkAsync(abandoned, cleanup, retired));
   auto retry = co_await reopened->Sessions().ForkAsync(abandoned, cleanup);

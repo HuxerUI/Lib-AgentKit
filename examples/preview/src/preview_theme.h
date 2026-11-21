@@ -1,6 +1,6 @@
 #pragma once
 
-#include <huxerui/theme.h>
+#include <huxerui/huxerui.h>
 
 namespace agentkit_preview {
 
@@ -41,6 +41,18 @@ inline huxerui::TextFieldStyle PreviewFormFieldStyle(huxerui::TextFieldStyle fie
   field.selection = colors.primary_container;
   field.composition = colors.on_primary_container;
   return field;
+}
+
+inline void ShowPreviewDialog(const huxerui::DialogHandle& dialogs, huxerui::DialogFactory content,
+                              huxerui::DialogOptions options = {}) {
+  using namespace huxerui;
+  dialogs.Show(DialogFactory{[content = std::move(content)](DialogContext dialog) {
+    const auto colors = UseTheme().colors;
+    return Column{content(dialog)}.With(CrossAlign(CrossAxisAlignment::Stretch),
+        Background(colors.surface_container_low), CornerRadius(14.0F), Border{colors.outline},
+        Shadow{.color = Color::Rgb(0, 0, 0, 0.32F), .offset = {0.0F, 8.0F}, .blur_radius = 28.0F})
+        .Key("preview-dialog-surface");
+  }}, std::move(options));
 }
 
 inline huxerui::ThemeSpec PreviewTheme(huxerui::ThemeBrightness brightness) {

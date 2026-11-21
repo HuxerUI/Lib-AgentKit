@@ -2,6 +2,8 @@
 #include <huxerui/huxerui.h>
 #include <huxerui/testing/ui_test.h>
 
+#include "test_resources.h"
+
 #include <algorithm>
 #include <iostream>
 #include <map>
@@ -297,7 +299,14 @@ void VerifyWorkshop() {
   std::optional<TaskScope> tasks;
   const Application app{[]() -> View {
     const auto visible = UseService<VisibleChat>();
-    if (visible && visible->Get()) return AgentChat(visible->Get(), {.draft_sources = *UseService<DraftSources>()});
+    if (visible && visible->Get()) {
+      return ProvideEnvironment(AgentChatLayoutStyle{.show_run_activity = true},
+          AgentChat(visible->Get(), {
+              .draft_sources = *UseService<DraftSources>(),
+              .tool_label = [](const ToolRef& tool) -> std::string {
+                return tool.id == reserve ? "Equipment reservation" : std::string{};
+              }}));
+    }
     return Text("Opening workshop");
   }, {.application_hooks = {[&](ApplicationContext& context) {
     auto visible = std::make_shared<VisibleChat>(std::shared_ptr<Conversation>{});
@@ -310,7 +319,8 @@ void VerifyWorkshop() {
     tasks = UseApplicationTaskScope();
     tasks->Launch([shop, visible, selection, scope = *tasks] { return OpenWorkshop(shop, scope, visible, selection); });
   }}}};
-  UiTest ui(app, {.viewport = {1100.0F, 900.0F}});
+  UiTest ui(app, {.viewport = {1100.0F, 900.0F},
+      .resource_provider = std::make_shared<agentkit_test::PackagedResources>()});
   const auto wait = [&](const auto& ready, const char* message) {
     const auto end = std::chrono::steady_clock::now() + 15s;
     while (!shop->failure && !ready() && std::chrono::steady_clock::now() < end) {
@@ -349,6 +359,20 @@ void VerifyWorkshop() {
   tap("Approve");
   settled(1);
   Check(shop->ledger->bookings == 1 && shop->chat->Snapshot()->artifacts.size() == 1, "Approved reservation did not issue exactly one receipt");
+  const auto reservation_snapshot = shop->chat->Snapshot();
+  const auto activity = ui.Find(UiSelector::Key("chat-turn/" + reservation_snapshot->runs.front().id.value));
+  const auto status = activity.Find(UiSelector::Key("chat-assistant-status"));
+  const auto work = activity.Find(UiSelector::Key("chat-run-activity"));
+  wait([&] { return activity.Exists() && status.Exists() && status.One().text == "Completed" &&
+      work.Exists() && work.One().in_viewport; }, "The completed reservation activity did not mount");
+  work.Tap();
+  Check(reservation_snapshot->tools.size() == 1, "The reservation did not retain exactly one tool call");
+  const auto tool = activity.Find(UiSelector::Key(reservation_snapshot->tools.front().id.value));
+  wait([&] { return activity.Exists() && tool.Exists(); }, "The reservation tool activity did not expand");
+  const auto label = tool.One().text.value_or("");
+  if (label != "Equipment reservation \xc2\xb7 Completed")
+    throw std::runtime_error("Unexpected reservation activity: " + label);
+  work.Tap();
   wait([&] { return ui.Find(UiSelector::Text("Reserved equipment: caliper")).Exists(); }, "The host content renderer did not mount");
   tap("Explain reservation");
   settled(2);

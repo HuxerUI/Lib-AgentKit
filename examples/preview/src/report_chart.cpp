@@ -1,3 +1,5 @@
+#include <app_resources.h>
+
 #include "report_chart.h"
 
 #include "preview_json.h"
@@ -279,13 +281,13 @@ View ChartCard(kit::RenderInput<kit::CustomBlock> input, Chart chart) {
         error = result.Succeeded() ? "" : result.Error().message;
       });
     };
-    card.push_back(TextField(name).Label("CSV file name").LineLimits(TextFieldLineLimits::SingleLine())
+    card.push_back(TextField(name).Label(::app::strings::ui_csv_file_name).LineLimits(TextFieldLineLimits::SingleLine())
         .OnChanged([name](const TextEditingValue& value) { name = value; }).With(Frame{.max_width = 300.0F}).Key("chart-file-name"));
     card.push_back(Row{
-        Button(retry.Get() ? "Retry chart action" : "Export CSV").OnClick([submit, name, indices] {
+        Button(retry.Get() ? ::app::strings::ui_retry_chart_action : ::app::strings::ui_export_csv).OnClick([submit, name, indices] {
           submit("export", {{"file_name", name->text}, {"indices", indices}});
         }).With(Enabled(!busy.Get() && (retry.Get().has_value() || total > 0))),
-        Button("Done").OnClick([submit] { submit("dismiss", nullptr); }).With(Enabled(!busy.Get() && !retry.Get())),
+        Button(::app::strings::ui_done).OnClick([submit] { submit("dismiss", nullptr); }).With(Enabled(!busy.Get() && !retry.Get())),
     }.With(Spacing(8.0F)));
     if (!error.Get().empty()) card.push_back(Text(error.Get(), TextRole::Label));
   }

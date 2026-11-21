@@ -1,9 +1,14 @@
 #include <huxerui/agentkit.h>
+#include <app_resources.h>
+#include <huxerui_agentkit_resources.h>
 #include <huxerui/archive.h>
 #include <huxerui/huxerui.h>
 #include <huxerui/sqlite.h>
 #include <huxerui/testing/ui_test.h>
 #include <nlohmann/json.hpp>
+
+#include "sqlite_session_store.h"
+#include "test_resources.h"
 
 #include "../examples/preview/src/code_workspace.h"
 #include "../examples/preview/src/code_tests.h"
@@ -89,6 +94,20 @@ using namespace huxerui::testing;
 using namespace std::chrono_literals;
 namespace kit = huxerui::agentkit;
 
+using PreviewTestResources = agentkit_test::PackagedResources;
+
+class UiTest final : public huxerui::testing::UiTest {
+ public:
+  explicit UiTest(const Application& application, UiTestOptions options = {})
+      : huxerui::testing::UiTest(application, WithResources(std::move(options))) {}
+
+ private:
+  static UiTestOptions WithResources(UiTestOptions options) {
+    if (!options.resource_provider) options.resource_provider = std::make_shared<PreviewTestResources>();
+    return options;
+  }
+};
+
 void Wait(UiTest& preview, const std::function<bool()>& established, const char* message, std::chrono::seconds timeout = 8s) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (!established() && std::chrono::steady_clock::now() < deadline) {
@@ -147,6 +166,10 @@ UiSelector ButtonText(const char* label) {
   if (label == std::string_view("Send") || label == std::string_view("Queue message") || label == std::string_view("Send as new task"))
     return UiSelector::Key(std::string("chat-send/") + label);
   if (label == std::string_view("New group")) return UiSelector::Key("new-group");
+  if (label == std::string_view("Goal")) return UiSelector::Key("conversation-goal");
+  if (label == std::string_view("Compare alternatives")) return UiSelector::Key("comparison-entry");
+  if (label == std::string_view("Back to comparison")) return UiSelector::Key("comparison-return");
+  if (label == std::string_view("Jump to latest")) return UiSelector::Key("jump-to-latest");
   return UiSelector::AllOf(UiSelector::Type<Button>(), UiSelector::Text(label));
 }
 
@@ -157,21 +180,6 @@ UiSelector ReviewCard(std::string_view label) {
 UiNodeQuery PendingConversation(UiTest& ui, std::string title) {
   return ui.Find(UiSelector::Key("pending-session-title/" + title));
 }
-
-class PreviewTestResources final : public PlatformResources {
- public:
-  ResourceConfiguration Configuration() const override { return {}; }
-
-  std::optional<InputStream> OpenRead(std::string_view path) override {
-    auto stream = package_.Resolve(path).OpenRead();
-    if (stream.Succeeded()) return std::move(stream).Value();
-    if (stream.Error().code == IoErrorCode::NotFound) return {};
-    throw std::runtime_error(stream.Error().message);
-  }
-
- private:
-  File package_{AGENTKIT_PREVIEW_RESOURCES};
-};
 
 constexpr auto ReportChartFilename = "\xe5\x9b\xa2\xe9\x98\x9f\xe6\x9e\x84\xe6\x88\x90.csv";
 
@@ -341,19 +349,19 @@ void AskAboutSelection(UiTest& preview, const std::string& excerpt) {
   const auto waiting = "The artifact side chat did not open for " + excerpt;
   Wait(preview, [&] { return question.Exists() || failure.Exists(); }, waiting.c_str());
   if (failure.Exists()) throw std::runtime_error(failure.One().text.value_or("The artifact selection was rejected"));
-  question.Tap();
+  FocusPreviewEditor(preview, question, "The artifact side chat question did not accept focus");
   question.ReplaceText("Explain this selected artifact fragment");
-  preview.Find(UiSelector::Key("side-chat-dialog")).Find(ButtonText("Ask")).Tap();
+  preview.Find(UiSelector::Key("side-chat-pane")).Find(UiSelector::Key("chat-send/Send")).Tap();
   const auto reply = "Selected text: " + excerpt;
   Wait(preview, [&] { return MessageEditor(preview, reply).has_value(); }, "The model received a different artifact fragment");
   auto editor = MessageEditor(preview, reply).value();
-  editor.Tap();
+  FocusPreviewEditor(preview, editor, "The artifact side chat reply did not accept selection");
   editor.SetSelection({15, TextEditingValue::FromText(reply).selection.active});
   auto bring_back = preview.Find(UiSelector::Key("side-chat-return-selection"));
   Wait(preview, [&] { return bring_back.Exists(); }, "The artifact reply could not be brought back");
   bring_back.Tap();
   const auto composer = preview.Find(UiSelector::Key("composer"));
-  Wait(preview, [&] { return !preview.Find(UiSelector::Key("side-chat-dialog")).Exists() &&
+  Wait(preview, [&] { return !preview.Find(UiSelector::Key("side-chat-pane")).Exists() &&
       composer.Exists() && composer.One().in_viewport && composer.One().focused &&
       preview.Find(ButtonText("Remove conclusion")).Exists(); }, "The side chat did not return to the focused conversation draft");
 }
@@ -386,9 +394,21 @@ void PreparePresentation(const Application& application, const File& output) {
   UiTest preview(application, {.viewport = {1080.0F, 880.0F}, .resource_provider = std::make_shared<PreviewTestResources>()});
   DraftPresentationOutline(preview);
   auto title = preview.Find(UiSelector::Key("slide-title-0"));
+  const auto outline_index = preview.Find(UiSelector::Key("outline-slide-index"));
+  const auto outline_editor = preview.Find(UiSelector::Key("outline-slide-editor"));
+  Wait(preview, [&] { return outline_index.Exists() && outline_editor.Exists() &&
+      outline_index.One().bounds.x + outline_index.One().bounds.width <= outline_editor.One().bounds.x; },
+      "The outline index did not sit next to the editor");
   title.Tap();
   title.ReplaceText("Approved rollout");
-  TapFormButton(preview, "Next slide");
+  preview.SetWindowMetrics({.viewport = {430.0F, 760.0F}});
+  Wait(preview, [&] { return outline_index.One().bounds.y + outline_index.One().bounds.height <= outline_editor.One().bounds.y &&
+      title.One().value == "Approved rollout"; }, "The outline did not stack its index and preserve its draft at narrow widths");
+  preview.SetWindowMetrics({.viewport = {1080.0F, 880.0F}});
+  auto next_outline = outline_index.Find(UiSelector::Key("outline-slide/2"));
+  Wait(preview, [&] { return outline_index.One().bounds.x + outline_index.One().bounds.width <= outline_editor.One().bounds.x &&
+      next_outline.Exists() && next_outline.One().in_viewport; }, "The second outline entry was not visible in the wide editor");
+  next_outline.Tap({.device_kind = PointerDeviceKind::Mouse});
   auto second = preview.Find(UiSelector::Key("slide-title-1"));
   Wait(preview, [&] { return second.Exists(); }, "Second outline slide did not mount");
   second.Tap();
@@ -403,8 +423,17 @@ void PreparePresentation(const Application& application, const File& output) {
   bullets.ReplaceText("Brief & revise <option>");
   TapFormButton(preview, "Confirm outline");
   auto first_preview = preview.Find(UiSelector::Text("Approved rollout"));
-  Wait(preview, [&] { return first_preview.Exists(); }, "Staged presentation did not preview the edited first slide");
-  TapFormButton(preview, "Next slide");
+  const auto stage = preview.Find(UiSelector::Key("presentation-slide"));
+  const auto export_footer = preview.Find(UiSelector::Key("presentation-form-actions"));
+  Wait(preview, [&] { return first_preview.Exists() && stage.Exists() && export_footer.Exists() &&
+      stage.One().bounds.y + stage.One().bounds.height <= export_footer.One().bounds.y &&
+      stage.One().visible_bounds.height >= stage.One().bounds.height - 1.0F; },
+      "The first slide was clipped or overlapped by the export controls");
+  const auto page_picker = preview.Find(UiSelector::Key("presentation-slide-picker"));
+  page_picker.Tap();
+  const auto second_preview = preview.Find(UiSelector::Text("2. Validated operations"));
+  Wait(preview, [&] { return second_preview.Exists() && second_preview.One().in_viewport; }, "The preview did not offer the slide by title");
+  second_preview.Tap();
   Wait(preview, [&] { return preview.Find(UiSelector::Text("Validated operations")).Exists(); },
        "Staged presentation did not preview the edited second slide");
   TapFormButton(preview, "Review export");
@@ -782,12 +811,14 @@ output { margin-left: 18px; color: #305b49; }
 
 class PatchStream final : public kit::ModelTurnStream {
 public:
-  explicit PatchStream(bool release, bool staged = false, std::string trailing_config = {})
-      : release_(release), staged_(staged), trailing_config_(std::move(trailing_config)) {}
+  explicit PatchStream(bool release, bool staged = false, std::string trailing_config = {}, bool reasoning_summary = false)
+      : release_(release), staged_(staged), trailing_config_(std::move(trailing_config)), reasoning_summary_(reasoning_summary) {}
 
   kit::Async<std::optional<kit::ModelEvent>> ReadAsync() override {
     using kit::JsonValue;
     using Result = kit::AgentResult<std::optional<kit::ModelEvent>>;
+    if (std::exchange(reasoning_summary_, false))
+      co_return Result::Success(kit::ModelReasoningSummary{"Check the two approved files before proposing the edit."});
     if (index_++ == 0) {
       JsonValue::Array files;
       JsonValue::Object config{{"path", JsonValue{std::string("config.txt")}},
@@ -813,12 +844,14 @@ private:
   bool release_;
   bool staged_;
   std::string trailing_config_;
+  bool reasoning_summary_;
   std::size_t index_ = 0;
 };
 
 class PatchModel final : public kit::ModelProvider {
 public:
-  explicit PatchModel(bool fail_first = false) : fail_first_(fail_first) {}
+  explicit PatchModel(bool fail_first = false, bool reasoning_summary = false)
+      : fail_first_(fail_first), reasoning_summary_(reasoning_summary) {}
 
   kit::ModelCapabilities Capabilities() const override { return {.text_stream = true, .structured_output = true}; }
 
@@ -842,11 +875,13 @@ public:
         })) {
       co_return Result::Failure({.code = kit::ErrorCode::InvalidArgument, .message = "Expected the approved design contents"});
     }
-    co_return Result::Success(std::make_unique<PatchStream>(release, prompt->find("Keep mode staged") != std::string::npos));
+    co_return Result::Success(std::make_unique<PatchStream>(release, prompt->find("Keep mode staged") != std::string::npos,
+        std::string{}, reasoning_summary_));
   }
 
 private:
   bool fail_first_;
+  bool reasoning_summary_;
 };
 
 class EditorPatchModel final : public kit::ModelProvider {
@@ -1449,12 +1484,14 @@ void OpenNavigationGroupMenu(UiTest& ui, const char* label) {
 }
 
 void SaveNavigationName(UiTest& ui, const char* value) {
-  auto name = ui.Find(UiSelector::Key("navigation-name"));
+  const auto surface = ui.Find(UiSelector::Key("preview-dialog-surface"));
+  Wait(ui, [&] { return surface.Exists(); }, "The navigation dialog did not open on the Preview surface");
+  auto name = surface.Find(UiSelector::Key("navigation-name"));
   const auto message = std::string("Navigation name editor did not receive focus for ") + value;
   FocusPreviewEditor(ui, name, message.c_str());
   name.ReplaceText(value);
   TapFormButton(ui, "Save");
-  Wait(ui, [&] { return !name.Exists(); }, "The navigation name dialog did not close");
+  Wait(ui, [&] { return !surface.Exists(); }, "The navigation name dialog did not close");
 }
 
 struct DraftCreationGate {
@@ -2194,24 +2231,31 @@ constexpr auto MarkdownSecondDelta = " another delta\n\n**\xe6\x96\xb9\xe6\xa1\x
 
 class ComposerStream final : public kit::ModelTurnStream {
 public:
-  ComposerStream(std::shared_ptr<std::atomic<int>> released, std::stop_token stop, std::string tail)
-      : released_(std::move(released)), stop_(stop), tail_(std::move(tail)) {}
+  ComposerStream(std::shared_ptr<std::atomic<int>> released, std::stop_token stop, std::string tail, bool routing)
+      : released_(std::move(released)), stop_(stop), tail_(std::move(tail)), routing_(routing) {}
 
   kit::Async<std::optional<kit::ModelEvent>> ReadAsync() override {
     using Result = kit::AgentResult<std::optional<kit::ModelEvent>>;
-    switch (next_++) {
-      case 0: co_return Result::Success(kit::ModelTextDelta{R"({"internal":"route"})", false});
-      case 1: co_return Result::Success(kit::ModelTextDelta{MarkdownFirstDelta});
-      case 2:
+    const auto next = next_++;
+    if (routing_) {
+      switch (next) {
+        case 0: co_return Result::Success(kit::ModelTextDelta{R"({"internal":"route"})", false});
+        case 1: co_return Result::Success(kit::ModelStructuredOutput{kit::JsonValue{kit::JsonValue::Object{
+            {"route", kit::JsonValue{std::string("answer")}}}}});
+        case 2: co_return Result::Success(kit::ModelFinished{kit::ModelFinishReason::Completed, {}});
+        default: co_return Result::Success(std::nullopt);
+      }
+    }
+    switch (next) {
+      case 0: co_return Result::Success(kit::ModelTextDelta{MarkdownFirstDelta});
+      case 1:
         while (released_->load() == 0 && !stop_.stop_requested()) co_await Delay(10ms);
         if (stop_.stop_requested()) co_return Result::Success(std::nullopt);
         co_return Result::Success(kit::ModelTextDelta{MarkdownSecondDelta + tail_});
-      case 3:
+      case 2:
         while (released_->load() < 2 && !stop_.stop_requested()) co_await Delay(10ms);
         if (stop_.stop_requested()) co_return Result::Success(std::nullopt);
-        co_return Result::Success(kit::ModelStructuredOutput{kit::JsonValue{kit::JsonValue::Object{
-            {"route", kit::JsonValue{std::string("answer")}}, {"answer", kit::JsonValue{std::string("Response complete")}}}}});
-      case 4: co_return Result::Success(kit::ModelFinished{kit::ModelFinishReason::Completed, {}});
+        co_return Result::Success(kit::ModelFinished{kit::ModelFinishReason::Completed, {}});
       default: co_return Result::Success(std::nullopt);
     }
   }
@@ -2224,6 +2268,7 @@ private:
   std::shared_ptr<std::atomic<int>> released_;
   std::stop_token stop_;
   std::string tail_;
+  bool routing_;
   int next_ = 0;
 };
 
@@ -2244,7 +2289,7 @@ public:
       }
     }
     co_return kit::AgentResult<std::unique_ptr<kit::ModelTurnStream>>::Success(
-        std::make_unique<ComposerStream>(released_, request.stop, tail_));
+        std::make_unique<ComposerStream>(released_, request.stop, tail_, request.output_schema.has_value()));
   }
 
 private:
@@ -2361,7 +2406,7 @@ void VerifyComposerIme(const File& root) {
 
   edit({.kind = TextInputCommandKind::UpdateComposition, .text = "nihao"});
   released->store(2);
-  Wait(ui, [&] { return !stop.Exists() && !send_mode.Exists() && ShowsText(ui, "Response complete"); },
+  Wait(ui, [&] { return !stop.Exists() && !send_mode.Exists() && ShowsText(ui, "The model is streaming another delta"); },
        "The Run did not finish while composing");
   if (!same_box(original_send, send.One().bounds) || !same_box(original_options, options.One().bounds))
     throw std::runtime_error("Finishing the Run moved the compact toolbar");
@@ -2494,7 +2539,7 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
   const std::string original = std::string(MarkdownFirstDelta) + MarkdownSecondDelta + image_tail;
   const std::string excerpt = std::string(MarkdownSelectionWord) + " &";
   const auto rendered = std::string(MarkdownSelectionWord) + " " + excerpt;
-  auto paragraph = ui.Find(UiSelector::Text(rendered));
+  auto paragraph = ui.Find(UiSelector::Key("agent-chat-history")).Find(UiSelector::Text(rendered));
   Wait(ui, [&] { return paragraph.Count() == 1 && paragraph.One().in_viewport && report.Exists(); },
       "The completed formatted reply did not render");
   auto remove = ui.Find(ButtonText("Remove quote"));
@@ -2548,6 +2593,14 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
   const auto midline = whole.y + whole.height / 2;
   ui.Drag({whole.x + whole.width - 1.0F, midline}, {whole.x + 1.0F, midline},
       {.segments = 1, .pointer = {.device_kind = PointerDeviceKind::Mouse}});
+  const auto toolbar = ui.Find(UiSelector::Key("message-selection-actions"));
+  Wait(ui, [&] {
+    if (toolbar.Count() != 1 || !toolbar.One().in_viewport) return false;
+    const auto popup = toolbar.One().bounds;
+    return popup.x <= whole.x + 8.0F && popup.x + popup.width > whole.x &&
+        (std::abs(popup.y + popup.height - midline) < 32.0F || std::abs(popup.y - midline) < 32.0F) &&
+        paragraph.One().bounds == whole;
+  }, "The Markdown action popup did not follow the active selection endpoint");
   TapFormButton(ui, "Quote");
   Wait(ui, [&] { return remove.Exists() && ui.Find(UiSelector::Text(rendered)).Count() == 2; },
       "Reverse drag did not quote the formatted paragraph");
@@ -2570,13 +2623,12 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
 
   select_excerpt();
   TapFormButton(ui, "Side chat");
-  auto dialog = ui.Find(UiSelector::Key("side-chat-dialog"));
-  auto question = dialog.Find(UiSelector::Key("side-chat-question"));
-  Wait(ui, [&] { return question.Exists() && dialog.Find(UiSelector::Text(excerpt)).Exists(); },
-      "Side chat did not show the rendered selection");
-  question.Tap();
+  auto pane = ui.Find(UiSelector::Key("side-chat-pane"));
+  auto question = pane.Find(UiSelector::Key("side-chat-question"));
+  Wait(ui, [&] { return question.Exists() && question.One().focused && ui.ActiveTextInput() &&
+      pane.Find(UiSelector::Text(excerpt)).Exists(); }, "Side chat did not show the rendered selection and focus the question");
   question.ReplaceText("Explain this selection");
-  dialog.Find(ButtonText("Ask")).Tap();
+  pane.Find(UiSelector::Key("chat-send/Send")).Tap();
   Wait(ui, [&] { return passages->size() >= 2; }, "The side-chat model did not receive the original source fragments");
   if (*passages != std::vector{std::string("Selected passage:\n") + MarkdownSelectionWord, std::string("Selected passage:\n &amp;")})
     throw std::runtime_error("The side chat sent unselected markup or expanded a rendered fragment");
@@ -2600,9 +2652,9 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
   Wait(ui, [&] { return source_refs.has_value(); }, "Side chat source refs were not available");
   if (*source_refs != expected) throw std::runtime_error("Side chat lost the exact Markdown source version or UTF-8 ranges");
 
-  dialog.Find(ButtonText("Close")).Tap();
+  pane.Find(ButtonText("Close")).Tap();
   auto composer = ui.Find(UiSelector::Key("composer"));
-  Wait(ui, [&] { return !dialog.Exists() && composer.Exists() && remove.Exists(); }, "Closing side chat lost the quoted draft");
+  Wait(ui, [&] { return !pane.Exists() && composer.Exists() && remove.Exists(); }, "Closing side chat lost the quoted draft");
   const auto submit_quote = [&](std::string message, const std::vector<kit::SourceSlice>& slices) {
     composer.Tap();
     composer.ReplaceText(message);
@@ -2611,7 +2663,7 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
     Wait(ui, [&] { return ShowsText(ui, message) && !stop.Exists() && !remove.Exists(); }, "The cited message did not finish");
     std::optional<nlohmann::json> persisted;
     tasks->Launch([&]() -> Task<void> {
-      const auto store = LiveTake(co_await agentkit_preview::OpenSessionStoreAsync(database));
+      const auto store = LiveTake(co_await agentkit_host::OpenSqliteSessionStoreAsync(database));
       const auto image = LiveTake(co_await store->LoadAsync());
       const auto row = std::ranges::find_if(image.records, [&](const auto& record) {
         return record.collection == "agentkit.session" && record.key == link.message.session.value;
@@ -2646,12 +2698,10 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
   });
   Wait(ui, [&] { return static_cast<bool>(transcript); }, "The Markdown transcript could not be read");
   const auto first_message = std::ranges::find(transcript->messages, link.message, &kit::Message::ref);
-  if (first_message == transcript->messages.end() || transcript->messages.end() - first_message != 5)
+  if (first_message == transcript->messages.end() || transcript->messages.end() - first_message != 3)
     throw std::runtime_error("The Markdown range fixture did not contain both replies and the intervening messages");
-  const auto& completion = *std::next(first_message);
-  const auto& middle = *std::next(first_message, 2);
-  const auto& last = *std::next(first_message, 3);
-  const std::string completion_text = "Response complete";
+  const auto& middle = *std::next(first_message);
+  const auto& last = *std::next(first_message, 2);
   const auto& last_block = last.blocks.front();
   const auto later_line = std::string("The model is streaming another delta");
   const std::string later_prefix = "The model";
@@ -2682,8 +2732,6 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
                              "Inline icon", " after.", "Following text"})
       add_source(link.message, link.block, part);
   }
-  extended.push_back({completion.ref, {}, kit::SourceTextRange{completion.blocks.front().id, 0, completion_text.size()}});
-  model_passages.push_back(completion_text);
   extended.push_back({middle.ref, {}, kit::SourceTextRange{middle.blocks.front().id, 0, bridge.size()}});
   model_passages.push_back(bridge);
   add_source(last.ref, last_block.id, "Streamed heading");
@@ -2693,7 +2741,7 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
   if (verify_images) earlier_excerpt +=
       "\nDelayed diagram\nMissing diagram\nDamaged diagram\nLocal diagram\nBefore Inline icon after.\nFollowing text";
   const auto later_excerpt = "Streamed heading\n" + later_prefix;
-  const auto range_quote = earlier_excerpt + '\n' + completion_text + '\n' + bridge + '\n' + later_excerpt;
+  const auto range_quote = earlier_excerpt + '\n' + bridge + '\n' + later_excerpt;
   for (const bool reverse : {false, true}) {
     if (reverse) select_endpoint(later_text, 0, static_cast<int>(later_prefix.size()));
     else select_endpoint(earlier_text, 4, 5);
@@ -2703,15 +2751,17 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
     if (reverse) select_endpoint(earlier_text, 4, 5);
     else select_endpoint(later_text, 0, static_cast<int>(later_prefix.size()));
     TapFormButton(ui, "Side chat");
-    const auto sources = dialog.Find(UiSelector::Key("side-chat-source"));
-    Wait(ui, [&] { return sources.Exists() && sources.Find(UiSelector::Text("4 selected passages")).Exists() &&
-        sources.Find(UiSelector::Text(earlier_excerpt)).Exists() && sources.Find(UiSelector::Text(completion_text)).Exists() &&
+    const auto sources = pane.Find(UiSelector::Key("side-chat-source"));
+    Wait(ui, [&] { return sources.Exists() && sources.Find(UiSelector::Text("3 selected passages")).Exists() &&
+        sources.Find(UiSelector::Text(earlier_excerpt)).Exists() &&
         sources.Find(UiSelector::Text(bridge)).Exists() &&
         sources.Find(UiSelector::Text(later_excerpt)).Exists(); }, "Side chat did not show only the rendered passages in the extended range");
     if (!reverse) {
       passages->clear();
+      Wait(ui, [&] { return question.Exists() && question.One().focused && ui.ActiveTextInput(); },
+          "The extended selection did not focus its side chat question");
       question.ReplaceText("Explain the Markdown range");
-      dialog.Find(ButtonText("Ask")).Tap();
+      pane.Find(UiSelector::Key("chat-send/Send")).Tap();
       Wait(ui, [&] { return passages->size() >= model_passages.size(); }, "The side chat did not receive all Markdown fragments");
       if (*passages != model_passages) throw std::runtime_error("The extended side chat sent incorrect source fragments");
       source_refs.reset();
@@ -2724,13 +2774,13 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
               snapshot->origin->side_chat_selection != expected) source_refs = snapshot->origin->side_chat_selection;
         }
       });
-      Wait(ui, [&] { return source_refs.has_value() && dialog.Find(UiSelector::Key("side-chat-composer")).Exists(); },
+      Wait(ui, [&] { return source_refs.has_value() && pane.Find(UiSelector::Key("side-chat-composer")).Exists(); },
           "The extended side chat did not settle with source refs");
       if (*source_refs != extended) throw std::runtime_error("The extended side chat lost exact source versions or UTF-8 ranges");
-    } else if (!dialog.Find(UiSelector::Key("side-chat-composer")).Exists() || question.Exists()) {
+    } else if (!pane.Find(UiSelector::Key("side-chat-composer")).Exists() || question.Exists()) {
       throw std::runtime_error("Reversing the range did not reopen the side chat for the same source slices");
     }
-    dialog.Find(ButtonText("Close")).Tap();
+    pane.Find(ButtonText("Close")).Tap();
     TapFormButton(ui, "Quote");
     Wait(ui, [&] { return remove.Exists() && ShowsText(ui, range_quote); }, "The quote did not preserve the extended rendered range");
     submit_quote(reverse ? "Use the backward Markdown range" : "Use the forward Markdown range", extended);
@@ -2860,7 +2910,19 @@ void VerifyLongConversation(const File& root) {
     ui.Pump(120ms);
     if (!fixture->error.empty()) throw std::runtime_error(fixture->error);
     if (!at_origin()) throw std::runtime_error("Streaming moved the reader away from the older message");
-    TapFormButton(ui, "Jump to latest");
+    const auto header = ui.Find(UiSelector::Key("agent-chat-heading"));
+    const auto composer_panel = ui.Find(UiSelector::Key("agent-chat-composer"));
+    const auto jump = ui.Find(ButtonText("Jump to latest"));
+    Wait(ui, [&] {
+      if (!jump.Exists() || !jump.One().in_viewport) return false;
+      const auto control = jump.One().bounds;
+      const auto input = composer_panel.One().bounds;
+      const auto heading = header.One().bounds;
+      return heading.height <= 40.0F && control.y > heading.y + heading.height &&
+          input.y - (control.y + control.height) >= 0.0F && input.y - (control.y + control.height) < 30.0F &&
+          std::abs(control.x + control.width / 2.0F - input.x - input.width / 2.0F) < 2.0F;
+    }, "The conversation header or floating jump position did not fit");
+    jump.Tap();
     Wait(ui, [&] { return MessageEditor(ui, "Added while reading earlier history").has_value(); }, "The jump control did not reveal the latest turn");
     const auto following = append("A following turn\n" + std::string(1100, 'x'));
     Wait(ui, [&] { return *following; }, "The following turn did not finish");
@@ -2943,7 +3005,7 @@ void VerifyDomainReviewWindows(const File& root) {
       return first.Find(selector).Exists() && second.Find(selector).Exists();
     };
     Wait(ui, [&] { return both_show("2 / 3"); }, "The two PPT reviews did not open at the chosen slide");
-    first.Find(UiSelector::Key("presentation-page-tabs")).Find(UiSelector::Text("Slide 3")).Tap();
+    first.Find(ButtonText("Next slide")).Tap();
     second.Find(ButtonText("Previous slide")).Tap();
     Wait(ui, [&] { return first.Find(UiSelector::Text("3 / 3")).Exists() && second.Find(UiSelector::Text("1 / 3")).Exists(); },
         "Changing the slide affected another review");
@@ -5271,7 +5333,7 @@ void VerifyDesignRevert(const File& directory) {
     Application edit_store{[]() -> View { return Spacer(); }, {.application_hooks = {[&](ApplicationContext&) {
       UseApplicationTaskScope().Launch([&]() -> Task<void> {
         try {
-          const auto store = LiveTake(co_await agentkit_preview::OpenSessionStoreAsync(database));
+          const auto store = LiveTake(co_await agentkit_host::OpenSqliteSessionStoreAsync(database));
           const auto image = LiveTake(co_await store->LoadAsync());
           const auto row = std::ranges::find(image.records, session_id.value, &kit::StoreValue::key);
           if (row == image.records.end()) throw std::runtime_error("The original design session was not stored");
@@ -5326,7 +5388,14 @@ void VerifyDesignRevert(const File& directory) {
     auto entry = ConversationRow(ui, title);
     Wait(ui, [&] { return entry.Exists(); }, "The design conversation did not reopen");
     entry.Tap();
-    TapControl(ui, ReviewCard("Review artifact v3"), "Review artifact v3", "agent-chat-history", -95.0F);
+    const auto target = ReviewCard("Review artifact v3");
+    auto card = ui.Find(target);
+    Wait(ui, [&] { return card.Exists() && card.One().enabled; }, "The stored design card was unavailable");
+    if (!card.One().in_viewport)
+      card = ui.Find(UiSelector::Key("agent-chat-history")).ScrollUntil(target, {.step = {0.0F, -95.0F}});
+    const auto visible = card.One().visible_bounds;
+    ui.TapAt({visible.x + std::min(visible.width / 4.0F, 24.0F), visible.y + visible.height / 2.0F},
+        {.device_kind = PointerDeviceKind::Mouse});
     Wait(ui, [&] { return ShowsText(ui, "Expanded preferences") && ShowsText(ui, "Version 3"); },
         "The stored design revision did not open");
   };
@@ -5727,12 +5796,15 @@ void VerifyCodeEditorBaseline(const File& directory, EditorBaselineCase scenario
   UiTest preview(application, {.viewport = {1080.0F, 920.0F}, .resource_provider = std::make_shared<PreviewTestResources>()});
   const auto check_editor_entry = [&] {
     auto title_view = preview.Find(UiSelector::Key("agent-chat-title"));
+    auto header_view = preview.Find(UiSelector::Key("agent-chat-heading"));
     auto edit = preview.Find(UiSelector::Key("agent-chat-header-actions")).Find(ButtonText("Edit workspace file"));
-    Wait(preview, [&] { return title_view.Exists() && edit.Exists() && edit.One().in_viewport; },
+    Wait(preview, [&] { return title_view.Exists() && header_view.Exists() && edit.Exists() && edit.One().in_viewport; },
         "Workspace action is missing from the conversation heading");
-    const auto heading = title_view.One().bounds;
+    const auto title = title_view.One().bounds;
+    const auto heading = header_view.One().bounds;
     const auto action = edit.One().bounds;
-    if (action.y < heading.y + heading.height || action.x < heading.x - 1.0F ||
+    if (heading.height > 56.0F || title.width <= 0.0F || action.x < title.x + title.width - 1.0F ||
+        action.y >= title.y + title.height || action.y + action.height <= title.y ||
         action.x + action.width > heading.x + heading.width + 1.0F || action.width >= heading.width) {
       throw std::runtime_error("Workspace action escaped the conversation column");
     }
@@ -6407,6 +6479,140 @@ void VerifyReleaseCompletionRevision(const File& root, bool complete_automatical
   }
 }
 
+constexpr auto code_activity_prompt =
+    "Set mode=enabled in config.txt and replace Disabled with Enabled in settings.html only.";
+constexpr auto code_activity_conclusion = "Workspace changes applied and tested";
+
+void VerifyLiveCodeTurnActivity(const File& root) {
+  const auto workspace = root.Child("code");
+  SeedLiveReleaseWorkspace(workspace);
+  bool passed = false;
+  auto drive = [workspace, &passed](auto started, auto workspace_id, auto project) -> Task<void> {
+    const auto app = UseApplication();
+    try {
+      auto runtime = LiveTake(std::move(started));
+      if (!workspace_id) throw std::runtime_error("The test workspace did not start");
+      auto session = co_await LiveConversation(runtime, project, *workspace_id, agentkit_preview::CodeAgent,
+          code_activity_prompt, code_activity_prompt);
+      auto watching = co_await LiveObserve(session);
+      bool saw_model_activity = false;
+      bool saw_completion = false;
+      auto events = LiveTake(co_await session->ObserveEventsAsync(0, [&](auto result) {
+        if (!result.Succeeded()) return;
+        for (const auto& event : result.Value()->events) {
+          if (const auto* run = std::get_if<kit::RunSnapshot>(&event.body)) {
+            saw_model_activity |= run->model_active;
+            saw_completion |= run->state == kit::RunState::Succeeded && run->timing && run->timing->ended_at &&
+                run->result && run->result->summary == code_activity_conclusion;
+          }
+        }
+      }));
+      const auto patch = co_await LiveWorkspacePatch(session);
+      CheckText(workspace.Child("config.txt"), "mode=disabled\n");
+      CheckText(workspace.Child("settings.html"), live_settings_before);
+      co_await Delay(1100ms);
+      co_await LiveApprove(session, patch);
+      const auto test = co_await LiveInteraction(session, "Run workspace tests");
+      CheckText(workspace.Child("config.txt"), "mode=enabled\n");
+      CheckText(workspace.Child("settings.html"), live_settings_after);
+      if (workspace.Child("tested.txt").Exists()) throw std::runtime_error("CTest ran before its separate approval");
+      co_await LiveApprove(session, test);
+      co_await LiveRunCompleted(session);
+      CheckText(workspace.Child("tested.txt"), "verified");
+      const auto deadline = std::chrono::steady_clock::now() + 5s;
+      while (!saw_completion && std::chrono::steady_clock::now() < deadline) co_await Delay(25ms);
+      const auto snapshot = session->Snapshot();
+      const auto& run = snapshot->runs.back();
+      if (!saw_model_activity || !saw_completion || !run.timing || !run.timing->ended_at ||
+          *run.timing->ended_at <= run.timing->started_at || run.timing->waiting_for_input < 1s)
+        throw std::runtime_error("The native turn did not publish model activity, measured wait time and completion");
+      std::cout << "Elapsed " << (*run.timing->ended_at - run.timing->started_at).count()
+                << " ms. " << code_activity_conclusion << ".\n";
+      LiveTake(co_await runtime->CloseAsync());
+      passed = true;
+    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; }
+    app.Quit();
+  };
+  const Application application{App, {
+      .window = {.title = "AgentKit Preview Live Acceptance"},
+      .application_hooks = {MakeConfiguredPreviewTestInstaller(root.Child("sessions.sqlite3"), workspace,
+          File(AGENTKIT_PREVIEW_CTEST), std::move(drive))}}};
+  static_cast<void>(RunApplication());
+  if (!passed) throw std::runtime_error("The native code turn acceptance failed");
+}
+
+void VerifyCodeTurnActivity(const File& root) {
+  const auto workspace = root.Child("code");
+  SeedReleaseTestWorkspace(workspace, WorkspaceTestScript("checked> Enabled", true));
+  const auto database = root.Child("sessions.sqlite3");
+  kit::ModelRegistration fixture{{{"preview.activity-code"}, 1}, {"preview", "code-fixture", "script", {}},
+      std::make_shared<PatchModel>(false, true)};
+  const Application application{App, {.application_hooks = {
+      MakeCodeTestInstaller(database, workspace, std::move(fixture), File(AGENTKIT_PREVIEW_CTEST))}}};
+  constexpr auto reasoning = "Check the two approved files before proposing the edit.";
+  const auto status = UiSelector::Key("chat-assistant-status");
+  const auto elapsed = UiSelector::Key("chat-run-time");
+  const auto work = UiSelector::Key("chat-run-activity");
+  const auto summary = UiSelector::Key("chat-reasoning-toggle");
+  const UiTestOptions options{.viewport = {1180.0F, 1000.0F}, .resource_provider = std::make_shared<PreviewTestResources>()};
+  const auto wait = [&](UiTest& preview, const std::function<bool()>& ready, const char* message,
+                        std::chrono::seconds timeout = 8s) {
+    try { Wait(preview, ready, message, timeout); }
+    catch (const std::exception&) {
+      static_cast<void>(root.Child("activity.snapshot").WriteString(preview.CaptureSnapshot().ToString()));
+      throw;
+    }
+  };
+  std::string recorded_elapsed;
+  {
+    UiTest preview(application, options);
+    ChooseDraftAssistant(preview, "Code");
+    SendNewConversation(preview, code_activity_prompt);
+    wait(preview, [&] { return preview.Find(status).Exists() && preview.Find(elapsed).Exists(); },
+        "The assistant did not show a state and timer before model output");
+    ShareWorkspaceScope(preview);
+    wait(preview, [&] { return preview.Find(status).Exists() && preview.Find(status).One().text == "Waiting for approval" &&
+        preview.Find(UiSelector::Text("Review workspace changes")).Exists(); },
+        "The assistant did not show the pending workspace write", 90s);
+    CheckText(workspace.Child("config.txt"), "mode=disabled\n");
+    std::this_thread::sleep_for(1100ms);
+    preview.Find(ButtonText("Approve")).Tap();
+    wait(preview, [&] { return preview.Find(UiSelector::Text("Run workspace tests")).Exists() &&
+        preview.Find(ButtonText("Approve")).Exists(); }, "The approved patch did not reach test approval", 25s);
+    CheckText(workspace.Child("config.txt"), "mode=enabled\n");
+    CheckText(workspace.Child("settings.html"), SettingsPage(true));
+    if (workspace.Child("tested.txt").Exists()) throw std::runtime_error("The test ran without its separate approval");
+    preview.Find(ButtonText("Approve")).Tap();
+    wait(preview, [&] { return preview.Find(status).Exists() &&
+        preview.Find(status).One().text == "Completed" && ShowsText(preview, code_activity_conclusion); },
+        "The code turn did not settle with its conclusion", 25s);
+    recorded_elapsed = preview.Find(elapsed).One().text.value_or("");
+    if (!recorded_elapsed.starts_with("Elapsed ") || recorded_elapsed == "Elapsed 0m 0s")
+      throw std::runtime_error("The code turn did not retain a measured elapsed time");
+    if (preview.Find(UiSelector::Text("Read workspace files · Completed")).Exists())
+      throw std::runtime_error("A completed turn did not collapse its work by default");
+    CheckText(workspace.Child("tested.txt"), "verified");
+  }
+  {
+    UiTest preview(application, options);
+    auto entry = ConversationRow(preview, code_activity_prompt);
+    wait(preview, [&] { return entry.Exists() && entry.One().in_viewport; }, "The completed code conversation was not restored");
+    entry.Tap();
+    wait(preview, [&] { return preview.Find(elapsed).Exists() && preview.Find(elapsed).One().text == recorded_elapsed &&
+        ShowsText(preview, code_activity_conclusion); }, "The elapsed time or conclusion changed after restart");
+    preview.Find(work).Tap();
+    wait(preview, [&] { return preview.Find(UiSelector::Text("Read workspace files · Completed")).Exists() &&
+        preview.Find(UiSelector::Text("Run workspace tests · Completed")).Exists(); },
+        "Expanding the work did not restore the read and verification activity");
+    if (preview.Find(UiSelector::Text(reasoning)).Exists()) throw std::runtime_error("The reasoning summary opened by default");
+    preview.Find(summary).Tap();
+    wait(preview, [&] { return preview.Find(UiSelector::Text(reasoning)).Exists(); }, "The public reasoning summary did not reopen");
+    preview.Find(summary).Tap();
+    wait(preview, [&] { return !preview.Find(UiSelector::Text(reasoning)).Exists(); }, "The reasoning summary did not collapse");
+    std::cout << recorded_elapsed << ". " << code_activity_conclusion << ".\n";
+  }
+}
+
 void CodeRoundTrip(const File& database, const File& workspace, const File& logs, const File& release) {
   SeedReleaseTestWorkspace(workspace, WorkspaceTestScript("checked> Enabled", true));
   const auto config = workspace.Child("config.txt");
@@ -6633,7 +6839,7 @@ Task<std::shared_ptr<kit::AgentRuntime>> OpenPresentationReworkRuntime(
   using namespace agentkit_preview;
   using Value = kit::JsonValue;
   const auto reports = root.Child("workspace-evidence");
-  auto store = LiveTake(co_await OpenSessionStoreAsync(root.Child("sessions.sqlite3")));
+  auto store = LiveTake(co_await agentkit_host::OpenSqliteSessionStoreAsync(root.Child("sessions.sqlite3")));
   auto weak = std::make_shared<std::weak_ptr<kit::AgentRuntime>>();
   auto runtime = LiveTake(kit::AgentRuntime::Create({.tasks = UseApplicationTaskScope(),
       .principal = [] { return kit::AgentResult<kit::PrincipalId>::Success({"preview.rework"}); },
@@ -7088,7 +7294,9 @@ void VerifyPresentationRework(const File& root, bool adoption_race) {
 }
 
 void VerifyMessageSideChat(const Application& application) {
-  UiTest preview(application, {.viewport = {1080.0F, 900.0F}});
+  constexpr Size wide_viewport{1080.0F, 900.0F};
+  constexpr Size narrow_viewport{420.0F, 620.0F};
+  UiTest preview(application, {.viewport = wide_viewport});
   const std::string excerpt = "\xe6\x96\xb9\xe6\xa1\x88";
   const auto original = "Before " + excerpt + " after D:/profiles/" + std::string(180, 'x') + "/project/summary.json";
   SendNewConversation(preview, original);
@@ -7100,59 +7308,111 @@ void VerifyMessageSideChat(const Application& application) {
   auto source = MessageEditor(preview, original).value();
   if (source.One().bounds.height <= 24.0F)
     throw std::runtime_error("A transcript line containing a long path did not wrap");
-  source.Tap();
+  FocusPreviewEditor(preview, source, "The source message did not accept selection");
   source.SetSelection({7, 9});
   const auto history = preview.Find(UiSelector::Key("agent-chat-history"));
-  const auto actions = history.Find(UiSelector::Key("message-selection-actions"));
+  const auto actions = preview.Find(UiSelector::Key("message-selection-actions"));
   auto side_chat = preview.Find(ButtonText("Side chat"));
   Wait(preview, [&] {
     if (!actions.Exists() || !actions.Find(ButtonText("Side chat")).Exists() || !side_chat.One().in_viewport) return false;
     const auto message = source.One().bounds;
     const auto command = side_chat.One().bounds;
-    return command.y >= message.y + message.height && command.y <= message.y + message.height + 10.0F;
-  }, "The selection actions did not appear below the source");
+    return !history.Find(UiSelector::Key("message-selection-actions")).Exists() &&
+        (std::abs(command.y + command.height - message.y) < 22.0F ||
+            std::abs(command.y - (message.y + message.height)) < 22.0F);
+  }, "The selection actions did not float next to the source");
   source.SetSelection({7, 7});
   Wait(preview, [&] { return !actions.Exists(); }, "A collapsed selection retained its actions");
   source.SetSelection({7, 9});
   Wait(preview, [&] { return side_chat.Exists() && side_chat.One().in_viewport; }, "Reselecting did not restore side chat");
   side_chat.Tap();
   auto question = preview.Find(UiSelector::Key("side-chat-question"));
-  auto dialog = preview.Find(UiSelector::Key("side-chat-dialog"));
-  const auto close_side = dialog.Find(ButtonText("Close"));
-  Wait(preview, [&] { return dialog.Exists() && question.Exists() && question.One().focused &&
-      question.One().bounds.width >= dialog.One().bounds.width - 40.0F; }, "Side chat did not focus the full-width question field");
-  question.Tap();
+  auto pane = preview.Find(UiSelector::Key("side-chat-pane"));
+  const auto close_side = pane.Find(ButtonText("Close"));
+  Wait(preview, [&] { return pane.Exists() && question.Exists() && question.One().focused &&
+      question.One().bounds.width >= pane.One().bounds.width - 64.0F &&
+      source.One().in_viewport && composer.One().in_viewport &&
+      composer.One().bounds.x + composer.One().bounds.width <= pane.One().bounds.x; },
+      "Side chat did not open next to the visible conversation and focus its question");
+  const auto splitters = [&] {
+    auto handles = preview.FindSemantics(UiSemanticSelector::Role(SemanticRole::Separator)).All();
+    std::erase_if(handles, [](const auto& handle) { return handle.offscreen || handle.bounds.height < 400.0F; });
+    std::ranges::sort(handles, [](const auto& first, const auto& second) { return first.bounds.x < second.bounds.x; });
+    return handles;
+  };
+  const auto drag = [&](std::size_t index, float distance) {
+    const auto handles = splitters();
+    if (handles.size() != 2) throw std::runtime_error("The wide workbench did not expose two resize handles");
+    const auto bounds = handles[index].bounds;
+    const Point start{bounds.x + bounds.width / 2.0F, bounds.y + bounds.height / 2.0F};
+    preview.Drag(start, {start.x + distance, start.y}, {.pointer = {.device_kind = PointerDeviceKind::Mouse}});
+  };
+  const auto initial_handles = splitters();
+  if (initial_handles.size() != 2) throw std::runtime_error("The wide workbench did not expose two resize handles");
+  const auto initial_left_divider = initial_handles.front().bounds.x;
+  drag(0, 36.0F);
+  const auto moved_handles = splitters();
+  if (moved_handles.size() != 2 || moved_handles.front().bounds.x < initial_left_divider + 30.0F)
+    throw std::runtime_error("Dragging the left divider did not resize navigation");
+  const auto resized_left_divider = moved_handles.front().bounds.x;
+  const auto initial_side_width = pane.One().bounds.width;
+  drag(1, 30.0F);
+  const auto resized_side_width = pane.One().bounds.width;
+  const auto resized_handles = splitters();
+  if (resized_side_width > initial_side_width - 24.0F || resized_handles.size() != 2 ||
+      std::abs(resized_handles.front().bounds.x - resized_left_divider) > 1.0F)
+    throw std::runtime_error("Dragging the right divider did not resize side chat independently");
+  composer.Tap();
+  if (!composer.One().focused || composer.One().value != "Keep the main draft" || !pane.Exists())
+    throw std::runtime_error("The main composer was not interactive while side chat was open");
+  FocusPreviewEditor(preview, question, "The question editor did not accept focus");
+  question.ReplaceText("Explain the excerpt");
+  preview.PressKey(Key::Enter);
+  if (question.One().value != "Explain the excerpt\n" || pane.Find(UiSelector::Key("side-chat-composer")).Exists())
+    throw std::runtime_error("The side chat question did not keep the main composer's multiline editing behavior");
   question.ReplaceText("Explain the excerpt");
   close_side.Tap();
-  Wait(preview, [&] { return !dialog.Exists() && side_chat.Exists() && side_chat.One().focused; },
+  Wait(preview, [&] { return !pane.Exists() && side_chat.Exists() && side_chat.One().focused; },
       "Closing the draft did not restore its original selection and action focus");
-  source.Tap();
+  FocusPreviewEditor(preview, source, "The source message did not accept selection");
   source.SetSelection({0, 6});
-  side_chat.Tap();
+  TapFormButton(preview, "Side chat");
   Wait(preview, [&] { return question.Exists() && question.One().focused && question.One().value == ""; },
       "A different selection inherited the previous side-chat draft");
   close_side.Tap();
-  Wait(preview, [&] { return !dialog.Exists(); }, "The second draft did not close");
-  source.Tap();
+  Wait(preview, [&] { return !pane.Exists(); }, "The second draft did not close");
+  FocusPreviewEditor(preview, source, "The source message did not accept selection");
   source.SetSelection({7, 9});
-  side_chat.Tap();
+  TapFormButton(preview, "Side chat");
   Wait(preview, [&] { return question.Exists() && question.One().focused && question.One().value == "Explain the excerpt"; },
       "Reopening the original selection did not restore its question draft");
-  dialog.Find(ButtonText("Ask")).Tap();
+  pane.Find(UiSelector::Key("chat-send/Send")).Tap();
   const auto answer = "Selected text: " + excerpt;
   Wait(preview, [&] { return MessageEditor(preview, answer).has_value(); }, "The assistant did not receive the exact selected text");
   auto whole = preview.Find(UiSelector::Key("side-chat-return-reply"));
   auto attachment = preview.Find(ButtonText("Remove conclusion"));
-  auto follow_up = dialog.Find(UiSelector::Key("agent-chat-composer"));
-  const auto follow_up_field = dialog.Find(UiSelector::Key("side-chat-composer"));
-  Wait(preview, [&] { return whole.Exists() && whole.One().in_viewport && follow_up.Exists() && dialog.One().bounds.height <= 490.0F &&
-      follow_up.One().bounds.y + follow_up.One().bounds.height <= dialog.One().bounds.y + dialog.One().bounds.height; },
-      "The completed reply and follow-up input did not fit the side chat dialog");
+  auto follow_up = pane.Find(UiSelector::Key("agent-chat-composer"));
+  const auto follow_up_field = pane.Find(UiSelector::Key("side-chat-composer"));
+  Wait(preview, [&] { return whole.Exists() && whole.One().in_viewport && follow_up.Exists() &&
+      follow_up.One().bounds.y + follow_up.One().bounds.height <= pane.One().bounds.y + pane.One().bounds.height; },
+      "The completed reply and follow-up input did not fit the side chat pane");
   Wait(preview, [&] { return follow_up_field.Exists() && follow_up_field.One().focused; },
       "The completed initial question did not focus the follow-up editor");
   follow_up_field.ReplaceText("Keep this follow-up draft");
+  preview.SetWindowMetrics({.viewport = narrow_viewport});
+  Wait(preview, [&] { return follow_up_field.Exists() && follow_up_field.One().in_viewport &&
+      follow_up_field.One().value == "Keep this follow-up draft" && (!composer.Exists() || !composer.One().in_viewport); },
+      "Narrowing the window did not keep the active side chat and its draft");
+  preview.SetWindowMetrics({.viewport = wide_viewport});
+  Wait(preview, [&] {
+    const auto handles = splitters();
+    return handles.size() == 2 && composer.Exists() && composer.One().in_viewport && whole.One().in_viewport &&
+        follow_up_field.One().value == "Keep this follow-up draft" &&
+        std::abs(pane.One().bounds.width - resized_side_width) < 1.0F &&
+        std::abs(handles.front().bounds.x - resized_left_divider) < 1.0F;
+  }, "Widening the window did not restore the split conversation and its pane widths");
   whole.Tap();
-  Wait(preview, [&] { return !dialog.Exists() && attachment.Exists() && preview.Find(UiSelector::Text(answer)).Exists() &&
+  Wait(preview, [&] { return !pane.Exists() && attachment.Exists() && preview.Find(UiSelector::Text(answer)).Exists() &&
       composer.Exists() && composer.One().focused && composer.One().value == "Keep the main draft"; },
       "The complete reply was not returned to the existing focused draft");
   attachment.Tap();
@@ -7162,23 +7422,23 @@ void VerifyMessageSideChat(const Application& application) {
       "The main conversation did not switch away");
   preview.Find(UiSelector::Key("session-directory")).Find(UiSelector::Key("session-title")).Tap();
   Wait(preview, [&] { return MessageEditor(preview, original).has_value(); }, "The main conversation did not reopen");
-  constexpr float compact_width = 420.0F;
-  preview.SetWindowMetrics({.viewport = {compact_width, 620.0F}});
+  preview.SetWindowMetrics({.viewport = narrow_viewport});
   Wait(preview, [&] {
     const auto editor = MessageEditor(preview, original);
     if (!editor) return false;
     const auto bounds = editor->One().bounds;
-    return bounds.x >= 0.0F && bounds.x + bounds.width <= compact_width;
+    return bounds.x >= 0.0F && bounds.x + bounds.width <= narrow_viewport.width;
   }, "The source message did not enter the compact layout");
   source = MessageEditor(preview, original).value();
-  source.Tap();
+  FocusPreviewEditor(preview, source, "The source message did not accept selection");
   source.SetSelection({7, 9});
   Wait(preview, [&] { return side_chat.Exists() && side_chat.One().in_viewport; },
       "The original message could not reopen its side chat");
   side_chat.Tap();
   Wait(preview, [&] {
-    return MessageEditor(preview, answer).has_value() && dialog.Exists() && follow_up.Exists() && follow_up.One().in_viewport &&
-        dialog.One().bounds.width <= compact_width && follow_up.One().visible_bounds.width >= follow_up.One().bounds.width - 1.0F &&
+    return MessageEditor(preview, answer).has_value() && pane.Exists() && follow_up.Exists() && follow_up.One().in_viewport &&
+        pane.One().bounds.width >= narrow_viewport.width - 1.0F && (!composer.Exists() || !composer.One().in_viewport) &&
+        follow_up.One().visible_bounds.width >= follow_up.One().bounds.width - 1.0F &&
         follow_up_field.One().focused && follow_up_field.One().value == "Keep this follow-up draft";
   }, "The compact side chat did not restore its reply and full-width input");
   auto reply = MessageEditor(preview, answer).value();
@@ -7223,9 +7483,9 @@ void VerifyCrossMessageSelection(const Application& application) {
   };
   select_range();
   TapFormButton(preview, "Side chat");
-  auto dialog = preview.Find(UiSelector::Key("side-chat-dialog"));
-  auto sources = dialog.Find(UiSelector::Key("side-chat-source"));
-  auto question = dialog.Find(UiSelector::Key("side-chat-question"));
+  auto pane = preview.Find(UiSelector::Key("side-chat-pane"));
+  auto sources = pane.Find(UiSelector::Key("side-chat-source"));
+  auto question = pane.Find(UiSelector::Key("side-chat-question"));
   Wait(preview, [&] { return question.Exists() && question.One().focused && sources.Find(UiSelector::Text("2 selected passages")).Exists(); },
       "The two-fragment side chat did not open");
   const auto earlier = sources.Find(UiSelector::Text(tail));
@@ -7233,16 +7493,16 @@ void VerifyCrossMessageSelection(const Application& application) {
   if (!earlier.Exists() || !later.Exists() || earlier.One().bounds.y >= later.One().bounds.y)
     throw std::runtime_error("The reverse selection did not preview exact fragments in reading order");
   question.ReplaceText("What is in the range?");
-  dialog.Find(ButtonText("Ask")).Tap();
+  pane.Find(UiSelector::Key("chat-send/Send")).Tap();
   const auto answer = "Selected text: " + tail + "\nSelected text: Received";
   Wait(preview, [&] { return ShowsText(preview, answer) ||
       (ShowsText(preview, "Selected text: " + tail) && ShowsText(preview, "Selected text: Received")); },
       "The model did not receive both exact fragments in reading order");
-  auto bring_back = dialog.Find(UiSelector::Key("side-chat-return-reply"));
+  auto bring_back = pane.Find(UiSelector::Key("side-chat-return-reply"));
   Wait(preview, [&] { return bring_back.Exists() && bring_back.One().in_viewport; }, "The multi-source reply could not be returned");
   bring_back.Tap();
   auto composer = preview.Find(UiSelector::Key("composer"));
-  Wait(preview, [&] { return !dialog.Exists() && composer.Exists() && composer.One().focused &&
+  Wait(preview, [&] { return !pane.Exists() && composer.Exists() && composer.One().focused &&
       preview.Find(ButtonText("Remove conclusion")).Exists() && !preview.Find(ButtonText("Cancel range")).Exists(); },
       "Returning the conclusion did not focus the draft after closing the range");
   select_range();
@@ -7508,10 +7768,23 @@ void VerifyLiveSettings(const File& root, const std::string& url, const std::str
     try {
       auto runtime = LiveTake(std::move(started));
       auto created = LiveTake(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
-          .options = {.agent = agentkit_preview::GeneralAgent, .project = std::move(project), .title = session_title},
-          .initial = kit::SendInput{.text = "This is a casual greeting. Use the answer route and reply with Hello."}}));
+          .options = {.agent = agentkit_preview::GeneralAgent, .project = std::move(project), .title = session_title}}));
       auto session = LiveTake(co_await runtime->Sessions().OpenAsync(std::get<kit::SessionCreated>(created.outcome).session));
-      auto watching = co_await LiveObserve(session);
+      std::size_t streamed_bytes = 0;
+      bool streamed_growth = false;
+      auto watching = LiveTake(co_await session->ObserveAsync([&](auto snapshot) {
+        if (!snapshot.Succeeded()) return;
+        for (const auto& message : snapshot.Value()->messages) {
+          if (message.author != kit::MessageAuthor::Agent || message.state != kit::MessageState::Streaming) continue;
+          for (const auto& block : message.blocks) {
+            if (const auto* text = std::get_if<kit::TextBlock>(&block.body); text && text->text.size() > streamed_bytes) {
+              streamed_growth |= streamed_bytes != 0;
+              streamed_bytes = text->text.size();
+            }
+          }
+        }
+      }));
+      LiveTake(co_await session->SendAsync(kit::NewCommandId(), {.text = "Explain how bubble sort works in five short sentences."}));
       const auto deadline = std::chrono::steady_clock::now() + 45s;
       while (std::chrono::steady_clock::now() < deadline) {
         const auto snapshot = session->Snapshot();
@@ -7519,8 +7792,9 @@ void VerifyLiveSettings(const File& root, const std::string& url, const std::str
           const auto& run = snapshot->runs.back();
           if (run.failure) throw std::runtime_error(run.failure->message);
           if (run.model.id.value != expected_model || run.state != kit::RunState::Succeeded ||
-              !run.usage.model_turns || !run.result || run.result->summary.empty()) {
-            throw std::runtime_error("The restored daily model did not complete a real model turn");
+              run.usage.model_turns != 2 || !streamed_growth || snapshot->messages.size() != 2 ||
+              snapshot->messages.back().state != kit::MessageState::Complete) {
+            throw std::runtime_error("The restored daily model did not stream one completed answer after routing");
           }
           completed = true;
           break;
@@ -7563,9 +7837,78 @@ void VerifyLiveSettings(const File& root, const std::string& url, const std::str
   }
 }
 
+void VerifyLocalization(const File& root) {
+  if (!root.CreateDirectories()) throw std::runtime_error("Could not create the localization fixture");
+  const auto package = Resources::OpenPackage(File(AGENTKIT_TEST_RESOURCE_PACKAGE));
+  if (!package.GetVectorImage(::app::images::goal).HasValue() ||
+      !package.GetVectorImage(huxerui_agentkit::images::arrow_down).HasValue()) {
+    throw std::runtime_error("A Preview or library icon was not in the resource package");
+  }
+  const auto verify = [&](const char* language, const char* new_conversation, const char* send, const char* settings,
+                          const char* models, const char* api_key, const char* placeholder) {
+    const ResourceConfiguration configuration{.locale = Locale::FromLanguageTag(language)};
+    const Application app{App, {.application_hooks = {MakePreviewInstaller(root.Child(std::string(language) + ".sqlite3"), true)}}};
+    UiTest ui(app, {.viewport = {1080.0F, 900.0F}, .resources = configuration});
+    const auto heading = ui.Find(UiSelector::Key("new-conversation-heading"));
+    const auto send_button = ui.Find(UiSelector::Key("chat-send/Send"));
+    const auto open_settings = ui.Find(UiSelector::Key("open-settings"));
+    try {
+      Wait(ui, [&] { return heading.Exists() && heading.One().text == new_conversation && send_button.Exists() &&
+          open_settings.Exists() && open_settings.Find(UiSelector::Text(settings)).Exists(); },
+          "The conversation workbench did not use the requested locale");
+      if (package.GetString(huxerui_agentkit::strings::ui_send, configuration) != send)
+        throw std::runtime_error("The shared send label did not use the requested locale");
+    } catch (const std::exception&) {
+      static_cast<void>(root.Child(std::string(language) + ".snapshot").WriteString(ui.CaptureSnapshot().ToString()));
+      throw std::runtime_error(std::string(language) + " workbench did not use the requested locale. Fixture: " + root.Path());
+    }
+    open_settings.Tap();
+    const auto categories = ui.Find(UiSelector::Key("settings-section-models"));
+    const auto add = ui.Find(UiSelector::Key("settings-add-model"));
+    Wait(ui, [&] { return categories.Exists() && categories.Find(UiSelector::Text(models)).Exists() && add.Exists(); },
+        "The settings page did not use the requested locale");
+    add.Tap();
+    const auto field = ui.FindSemantics(UiSemanticSelector::Label(api_key));
+    Wait(ui, [&] { return field.Count() == 1 && field.One().placeholder == placeholder && field.One().secure; },
+        "The API key field did not preserve its localized placeholder");
+  };
+  verify("en-US", "New conversation", "Send", "Settings", "Models", "API Key", "Optional. Paste a key or enter ${ENV_NAME}");
+  verify("zh-Hans-CN",
+       "\xe6\x96\xb0\xe5\xbb\xba\xe5\xaf\xb9\xe8\xaf\x9d", "\xe5\x8f\x91\xe9\x80\x81", "\xe8\xae\xbe\xe7\xbd\xae",
+      "\xe6\xa8\xa1\xe5\x9e\x8b", "API \xe5\xaf\x86\xe9\x92\xa5", "\xe9\x80\x89\xe5\xa1\xab\xe3\x80\x82\xe7\xb2\x98\xe8\xb4\xb4\xe5\xaf\x86\xe9\x92\xa5\xe6\x88\x96\xe8\xbe\x93\xe5\x85\xa5 ${ENV_NAME}");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--localization") {
+    const auto root = File((std::filesystem::temp_directory_path() /
+        ("agentkit-localization-" + kit::NewCommandId().value)).u8string());
+    try {
+      VerifyLocalization(root);
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << error.what() << '\n';
+      return 1;
+    }
+  }
+  if ((argc == 2 || argc == 3) && std::string_view(argv[1]) == "--code-turn-activity") {
+    const bool live = argc == 3;
+    const auto path = live ? std::filesystem::absolute(std::filesystem::u8path(argv[2])) :
+        std::filesystem::temp_directory_path() / ("agentkit-turn-activity-" + kit::NewCommandId().value);
+    try {
+      const File root(path.u8string());
+      if (root.Child("sessions.sqlite3").Exists() || root.Child("code").Exists() || (live && !root.Child("models").Exists()))
+        throw std::runtime_error("Use a fresh acceptance directory with saved models for the live run");
+      if (live) VerifyLiveCodeTurnActivity(root);
+      else VerifyCodeTurnActivity(root);
+      if (!live) {
+        std::error_code error;
+        std::filesystem::remove_all(path, error);
+      }
+      return 0;
+    } catch (const std::exception& error) { std::cerr << error.what() << "\nFixture: " << path.string() << '\n'; return 1; }
+  }
   if (argc == 7 && std::string_view(argv[1]) == "--live-settings") {
     try {
       VerifyLiveSettings(File(std::filesystem::absolute(std::filesystem::u8path(argv[2])).u8string()),

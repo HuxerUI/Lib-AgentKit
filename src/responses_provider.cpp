@@ -165,6 +165,7 @@ Json RequestBody(const ResponsesOptions& options, const ModelTurnRequest& reques
   if (!previous.empty()) body["previous_response_id"] = previous;
   auto instructions = ModelInstructions(request);
   if (options.encrypted_reasoning) body["include"] = Json::array({"reasoning.encrypted_content"});
+  if (options.reasoning_summary) body["reasoning"] = {{"summary", "auto"}};
   if (!request.tools.empty()) {
     auto tools = Json::array();
     for (const auto& tool : request.tools) {
@@ -218,7 +219,8 @@ public:
                     ReasoningItems reasoning, bool store)
       : model_(options.ref), run_(request.run), input_count_(request.items.size()), dialect_(options.dialect),
         structured_(request.output_schema.has_value()), multiple_(options.multi_tool_calls),
-        keep_reasoning_(options.encrypted_reasoning || options.dialect != ResponsesDialect::OpenAI), store_(store),
+        keep_reasoning_(options.encrypted_reasoning || options.dialect != ResponsesDialect::OpenAI),
+        show_summary_(options.reasoning_summary), store_(store),
         names_(std::move(names)), reasoning_(std::move(reasoning)) {}
 
   AgentResult<bool> Accept(SseFrame frame, std::deque<ModelEvent>& events) override {
@@ -343,6 +345,7 @@ private:
     if (!output.is_array() || output.size() != items_.size()) throw std::invalid_argument("Response output is incomplete");
     bool refused = false;
     std::string text;
+    std::string summary;
     for (std::size_t index = 0; index < items_.size(); ++index) {
       const auto& item = items_[index];
       const auto& wire = output[index];
@@ -353,7 +356,21 @@ private:
            (!item_status.empty() && item_status != "completed"))) {
         throw std::invalid_argument("Function call did not complete");
       }
-      if (item.kind != OutputKind::Message) continue;
+      if (item.kind != OutputKind::Message) {
+        if (show_summary_ && item.kind == OutputKind::Reasoning) {
+          if (const auto* parts = Member(wire, "summary"); parts && parts->is_array()) {
+            for (const auto& part : *parts) {
+              if (String(part, "type") != "summary_text") continue;
+              const auto chunk = String(part, "text");
+              const std::size_t separator_size = summary.empty() ? 0U : 2U;
+              if (chunk.empty() || summary.size() + separator_size + chunk.size() > 16 * 1024) continue;
+              if (separator_size) summary += "\n\n";
+              summary += chunk;
+            }
+          }
+        }
+        continue;
+      }
       std::string final_text;
       const auto& content = wire.at("content");
       const auto append = [&](const Json& part) {
@@ -388,6 +405,7 @@ private:
       events.emplace_back(ModelStructuredOutput{std::move(value).Value()});
     }
     auto resume = SaveResume(output, !text.empty());
+    if (!summary.empty()) events.emplace_back(ModelReasoningSummary{std::move(summary)});
     events.emplace_back(ModelFinished{calls_.empty() ? ModelFinishReason::Completed : ModelFinishReason::ToolCalls, std::move(resume)});
     return AgentResult<bool>::Success(true);
   }
@@ -431,6 +449,7 @@ private:
   bool structured_;
   bool multiple_;
   bool keep_reasoning_;
+  bool show_summary_;
   bool store_;
   ToolNames names_;
   ReasoningItems reasoning_;
@@ -509,7 +528,8 @@ AgentResult<ModelRegistration> MakeResponsesModel(ResponsesOptions options, Task
   if (options.output_format == ResponsesOutputFormat::Automatic) {
     options.output_format = glm ? ResponsesOutputFormat::JsonObject : ResponsesOutputFormat::JsonSchema;
   }
-  if ((glm && options.output_format == ResponsesOutputFormat::JsonSchema) || (!glm && options.allow_server_state)) {
+  if ((glm && options.output_format == ResponsesOutputFormat::JsonSchema) || (!glm && options.allow_server_state) ||
+      (options.reasoning_summary && options.dialect != ResponsesDialect::OpenAI)) {
     return Fail<ModelRegistration>(ErrorCode::Unsupported, "Unsupported Responses dialect capability");
   }
   options.encrypted_reasoning &= options.dialect == ResponsesDialect::OpenAI;

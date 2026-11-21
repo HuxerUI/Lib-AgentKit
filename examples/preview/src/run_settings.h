@@ -39,6 +39,7 @@ struct ModelProfileInput {
   std::string api_key;
   bool image_input = false;
   bool file_input = false;
+  bool reasoning_summary = false;
 };
 
 using AddModelProfile = std::function<huxerui::agentkit::Async<huxerui::agentkit::ModelProviderRef>(ModelProfileInput)>;
@@ -54,10 +55,10 @@ public:
   void SetDefaults(huxerui::agentkit::ModelProviderRef general, std::optional<huxerui::agentkit::ModelProviderRef> code);
   std::optional<huxerui::agentkit::ModelProviderRef> DefaultModel(const huxerui::agentkit::AgentId& agent) const;
   std::vector<ModelChoice> Models(const huxerui::agentkit::AgentId& agent) const;
-  std::string ModelLabel(const std::optional<huxerui::agentkit::ModelProviderRef>& ref) const;
+  huxerui::StringVariant ModelLabel(const std::optional<huxerui::agentkit::ModelProviderRef>& ref) const;
   huxerui::agentkit::ModelCapabilities Capabilities(const std::optional<huxerui::agentkit::ModelProviderRef>& ref,
       const huxerui::agentkit::AgentId& agent) const;
-  std::string Describe(const huxerui::agentkit::RunStartBinding& binding) const;
+  std::string Describe(const huxerui::agentkit::RunStartBinding& binding, const huxerui::Resources& resources) const;
   bool NeedsRenewal(const huxerui::agentkit::ExecutionProfileRef& profile,
                     const std::optional<huxerui::agentkit::WorkspaceId>& workspace) const;
 

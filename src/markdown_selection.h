@@ -34,6 +34,8 @@ struct MarkdownSourceExcerpt {
 struct MarkdownExcerpt {
   MarkdownRange range;
   MarkdownSourceExcerpt source;
+  std::optional<Rect> active_caret;
+  bool pointer_selecting = false;
 };
 
 std::optional<MarkdownSourceExcerpt> ReadMarkdownSourceRange(std::string_view source, std::size_t begin, std::size_t end);

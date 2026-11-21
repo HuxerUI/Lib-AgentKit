@@ -16,6 +16,7 @@ struct PendingCall {
 
 struct Round {
   std::string text;
+  std::string reasoning_summary;
   std::optional<JsonValue> structured;
   Usage usage{};
   std::vector<PendingCall> calls;
@@ -62,6 +63,13 @@ AgentResult<void> ApplyModelEvent(SessionData& session, RunExecution& run,
     }
     round.text += text->utf8;
     if (text->show_in_transcript) PublishText(session, run, text->utf8);
+  } else if (auto* summary = std::get_if<ModelReasoningSummary>(&event)) {
+    constexpr std::size_t summary_limit = 16 * 1024;
+    if (summary->text.empty() || !ValidUtf8(summary->text) ||
+        summary->text.size() > summary_limit - round.reasoning_summary.size()) {
+      return protocol("Invalid public reasoning summary");
+    }
+    round.reasoning_summary += summary->text;
   } else if (auto* start = std::get_if<ModelToolStarted>(&event)) {
     if (start->provider_call_id.empty() || start->name.empty() || round.calls.size() >= 128 ||
         std::ranges::find(round.calls, start->provider_call_id, &PendingCall::id) != round.calls.end()) {
@@ -142,6 +150,7 @@ Async<void> PrepareModelRequest(RuntimeState& state, const SessionData& session,
 
 Async<Round> ReadRound(RuntimeState& state, SessionData& session, RunExecution& run,
                        ModelRegistration& model, ModelTurnRequest request, Revision authorized_at) {
+  const auto reset_model = std::unique_ptr<bool, void(*)(bool*)>(&run.view.model_active, [](bool* value) { *value = false; });
   if (authorized_at != state.access_revision) co_return Fail<Round>(ErrorCode::Conflict, "Model input access changed before submission");
   if (run.stop.stop_requested()) co_return Fail<Round>(ErrorCode::AlreadyClosed, "Run closed");
   auto opened = co_await model.provider->StartTurnAsync(std::move(request));
@@ -183,6 +192,15 @@ Async<Round> ReadRound(RuntimeState& state, SessionData& session, RunExecution& 
   if ((reason == ModelFinishReason::ToolCalls) != !round.calls.empty() ||
       std::ranges::any_of(round.calls, [](const auto& call) { return !call.complete; })) {
     co_return Fail<Round>(ErrorCode::ProtocolError, "Model tool stream is incomplete");
+  }
+  if (!round.reasoning_summary.empty()) {
+    constexpr std::size_t run_summary_limit = 32 * 1024;
+    auto& summary = run.view.reasoning_summary;
+    const std::size_t separator_size = summary.empty() ? 0U : 2U;
+    if (summary.size() + separator_size + round.reasoning_summary.size() <= run_summary_limit) {
+      if (separator_size) summary += "\n\n";
+      summary += round.reasoning_summary;
+    }
   }
   co_return AgentResult<Round>::Success(std::move(round));
 }
@@ -642,6 +660,7 @@ Async<ModelReply> RuntimeState::RunHostModel(RunId id, ModelInput input) {
     if (AtTokenBudget(run, budget) || run.view.usage.model_turns >= budget.model_turns.value_or(32))
       co_return Fail<ModelReply>(ErrorCode::BudgetExceeded, "Run reached its model budget");
     ++run.view.usage.model_turns;
+    run.view.model_active = true;
     ++session.sequence;
     auto committed = co_await WhenSaved(Persist(session));
     if (!committed.Succeeded()) co_return Result::Failure(committed.Error());
@@ -852,6 +871,7 @@ Task<void> RuntimeState::Drive(RunId id) {
         co_return;
       }
       ++run.view.usage.model_turns;
+      run.view.model_active = true;
       run.model_boundary = false;
       ++session.sequence;
       auto committed = co_await WhenSaved(Persist(session));

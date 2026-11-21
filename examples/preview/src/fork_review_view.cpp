@@ -1,3 +1,5 @@
+#include <app_resources.h>
+
 #include "fork_review_view.h"
 
 #include "code_tools.h"
@@ -43,22 +45,22 @@ std::string ReviewTitle(const kit::JsonValue& criteria) {
   return text && !text->empty() ? *text : "Candidate comparison";
 }
 
-const char* ReviewStatus(kit::ForkReviewState state) {
+StringVariant ReviewStatus(kit::ForkReviewState state) {
   switch (state) {
-  case kit::ForkReviewState::Running: return "In progress";
-  case kit::ForkReviewState::Ready: return "Ready to review";
-  case kit::ForkReviewState::Closed: return "Closed";
+  case kit::ForkReviewState::Running: return ::app::strings::ui_in_progress;
+  case kit::ForkReviewState::Ready: return ::app::strings::ui_ready_to_review;
+  case kit::ForkReviewState::Closed: return ::app::strings::ui_closed;
   }
   return "";
 }
 
-const char* CandidateStatus(kit::CandidateState state) {
+StringVariant CandidateStatus(kit::CandidateState state) {
   switch (state) {
-  case kit::CandidateState::Queued: return "Queued";
-  case kit::CandidateState::Running: return "In progress";
-  case kit::CandidateState::Ready: return "Ready";
-  case kit::CandidateState::Failed: return "Failed";
-  case kit::CandidateState::Cancelled: return "Cancelled";
+  case kit::CandidateState::Queued: return ::app::strings::ui_queued;
+  case kit::CandidateState::Running: return ::app::strings::ui_in_progress;
+  case kit::CandidateState::Ready: return ::app::strings::ui_ready;
+  case kit::CandidateState::Failed: return ::app::strings::ui_failed;
+  case kit::CandidateState::Cancelled: return ::app::strings::ui_cancelled;
   }
   return "";
 }
@@ -242,24 +244,24 @@ View NewComparison(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_ptr<k
   const auto colors = UseTheme().colors;
   const auto field_style = PreviewFormFieldStyle(UseEnvironment<TextFieldStyle>(), colors);
   std::vector<View> content{
-      Text("New comparison", TextRole::Title),
+      Text(::app::strings::ui_new_comparison, TextRole::Title),
       SegmentedButton(std::move(domains), domain.Get()).OnChanged([domain, keep_form](std::size_t value) {
           domain = value;
           keep_form();
         })
           .With(Enabled(edit)),
-      Text(reading_input ? "Reading the source version..." : input.Get() ?
-          input.Get()->name + " v" + std::to_string(input.Get()->ref.version) : "Source conversation history", TextRole::Label),
-      TextField(criteria).Label("Shared requirements").Variant(TextFieldVariant::Outlined).Key("comparison-criteria")
+      Text(reading_input ? StringVariant{::app::strings::ui_reading_the_source_version} : input.Get() ?
+          StringVariant::Format(::app::strings::ui_0_v_1, input.Get()->name, input.Get()->ref.version) : StringVariant{::app::strings::ui_source_conversation_history}, TextRole::Label),
+      TextField(criteria).Label(::app::strings::ui_shared_requirements).Variant(TextFieldVariant::Outlined).Key("comparison-criteria")
           .OnChanged([criteria, keep_form](const TextEditingValue& value) { criteria = value; keep_form(); }).With(Enabled(edit)),
-      TextField(first).Label("First approach").Variant(TextFieldVariant::Outlined).Key("comparison-first")
+      TextField(first).Label(::app::strings::ui_first_approach).Variant(TextFieldVariant::Outlined).Key("comparison-first")
           .OnChanged([first, keep_form](const TextEditingValue& value) { first = value; keep_form(); }).With(Enabled(edit)),
-      TextField(second).Label("Second approach").Variant(TextFieldVariant::Outlined).Key("comparison-second")
+      TextField(second).Label(::app::strings::ui_second_approach).Variant(TextFieldVariant::Outlined).Key("comparison-second")
           .OnChanged([second, keep_form](const TextEditingValue& value) { second = value; keep_form(); }).With(Enabled(edit)),
   };
   if (pending.Get() && !pending.Get()->worktrees.empty()) {
     const auto& planned = pending.Get()->worktrees;
-    content.push_back(Text("Base commit " + planned.front().commit, TextRole::Label));
+    content.push_back(Text(StringVariant::Format(::app::strings::ui_base_commit_0, planned.front().commit), TextRole::Label));
     for (const auto& plan : planned) {
       content.push_back(Column{Text(plan.request.options.title, TextRole::Label), Text(plan.branch), Text(plan.directory)}
           .With(Spacing(3.0F)).Key(plan.plan.id.value));
@@ -269,11 +271,11 @@ View NewComparison(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_ptr<k
   std::vector<View> actions{Spacer()};
   if (pending.Get() && !retriable.Get()) {
     actions.push_back(ProvideEnvironment(ComparisonLinkStyle(UseEnvironment<ButtonStyle>(), colors),
-        Button("Edit details").OnClick([pending] { pending = std::shared_ptr<const ComparisonSubmission>{}; })
+        Button(::app::strings::ui_edit_details).OnClick([pending] { pending = std::shared_ptr<const ComparisonSubmission>{}; })
             .With(Enabled(!busy.Get()))));
   }
-  actions.push_back(Button(retriable.Get() ? "Check submission" : !pending.Get() && domain.Get() == 2
-          ? "Review worktrees" : "Start comparison").OnClick(submit)
+  actions.push_back(Button(retriable.Get() ? ::app::strings::ui_check_submission : !pending.Get() && domain.Get() == 2
+          ? ::app::strings::ui_review_worktrees : ::app::strings::ui_start_comparison).OnClick(submit)
       .With(Enabled(!busy.Get() && (pending.Get() || (!reading_input && !criteria->text.empty() && !first->text.empty() &&
           !second->text.empty() && first->text != second->text)))));
   content.push_back(Row(std::move(actions)).With(Spacing(8.0F)));
@@ -317,7 +319,7 @@ kit::Async<CandidatePreview> LoadPreview(std::shared_ptr<kit::AgentRuntime> runt
 View CandidateArtifact(const CandidatePreview& preview, const CandidatePreview* other, std::size_t slide, std::string_view title) {
   std::vector<View> content;
   if (preview.metadata.name != title) content.push_back(Text(preview.metadata.name, TextRole::Title));
-  content.push_back(Text("Version " + std::to_string(preview.metadata.ref.version), TextRole::Label));
+  content.push_back(Text(StringVariant::Format(::app::strings::ui_version_0, preview.metadata.ref.version), TextRole::Label));
   if (preview.board) {
     content.push_back(DesignArtboard(preview.board, {}, 204.0F));
     if (other && other->board) {
@@ -330,7 +332,7 @@ View CandidateArtifact(const CandidatePreview& preview, const CandidatePreview* 
       if (preview.board->width != other->board->width || preview.board->height != other->board->height)
         differences.push_back("Different artboard size");
       if (!differences.empty()) {
-        content.push_back(Text("Differences", TextRole::Label));
+        content.push_back(Text(::app::strings::ui_differences, TextRole::Label));
         for (auto& line : differences) content.push_back(Text(std::move(line)));
       }
     }
@@ -340,9 +342,9 @@ View CandidateArtifact(const CandidatePreview& preview, const CandidatePreview* 
       content.push_back(Text(shown.title, TextRole::Title));
       for (const auto& bullet : shown.bullets) content.push_back(Text(bullet));
       if (other && other->deck && (slide >= other->deck->slides.size() || shown != other->deck->slides[slide]))
-        content.push_back(Text("Slide content differs", TextRole::Label));
+        content.push_back(Text(::app::strings::ui_slide_content_differs, TextRole::Label));
     } else {
-      content.push_back(Text("No slide at this position."));
+      content.push_back(Text(::app::strings::ui_no_slide_at_this_position));
     }
   } else if (!preview.code_diffs.empty()) {
     for (const auto& diff : preview.code_diffs) content.push_back(Text(diff));
@@ -455,7 +457,7 @@ View ComparisonDetail(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
   const auto theme = UseTheme().colors;
   const auto link_style = ComparisonLinkStyle(UseEnvironment<ButtonStyle>(), theme);
   const bool wide = UseViewportClass() == ViewportClass::Expanded;
-  if (!snapshot.Get()) return Text(error->empty() ? "Opening comparison..." : error.Get());
+  if (!snapshot.Get()) return Text(error->empty() ? StringVariant{::app::strings::ui_opening_comparison} : StringVariant{error.Get()});
   const auto& review = *snapshot.Get();
   const auto source_view = source->Snapshot();
   const kit::ToolCallSnapshot* recovered = nullptr;
@@ -470,7 +472,7 @@ View ComparisonDetail(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
     auto workspace = source_view->summary.workspace && services.workspaces
         ? services.workspaces->Find(*source_view->summary.workspace) : std::nullopt;
     return Column{
-        ProvideEnvironment(link_style, Button("Back to comparison").OnClick([reviewing_recovered] {
+        ProvideEnvironment(link_style, Button(::app::strings::ui_back_to_comparison).OnClick([reviewing_recovered] {
           reviewing_recovered = std::nullopt;
         })),
         CodeRevertReview(runtime, source, *recovered, std::move(workspace), services.evidence).Key(recovered->id.value),
@@ -585,19 +587,19 @@ View ComparisonDetail(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
   for (std::size_t i = 0; i < candidates.size(); ++i) {
     const auto& candidate = candidates[i];
     const auto& label = review.request.candidates[i].session.title;
-    const auto title = label.empty() ? std::string("Candidate") : label;
+    const auto title = label.empty() ? UseString(::app::strings::ui_candidate) : label;
     const auto* preview = artifact_for(candidate);
     const auto other = candidates.size() == 2 ? artifact_for(candidates[1 - i]) : nullptr;
     const auto& agent = review.request.candidates[i].session.agent;
     std::vector<View> links{
-        Button("Open conversation").OnClick([open_branch, session = candidate.session] { open_branch(session); })
+        Button(::app::strings::ui_open_conversation).OnClick([open_branch, session = candidate.session] { open_branch(session); })
             .Key("comparison-open/" + candidate.session.value),
     };
     if (CanPrepareAdoption(review) && (agent == PptAgent || agent == DesignAgent || agent == CodeAgent) && source_view &&
         (source_view->summary.agent.id == agent || source_view->summary.agent.id == GeneralAgent)) {
       const auto ref = preview && (preview->deck || preview->board || !preview->code_diffs.empty())
           ? std::optional{preview->metadata.ref} : std::nullopt;
-      links.push_back(Button("Review adoption: " + title).OnClick([adopt, candidate = candidate.id, ref, agent] {
+      links.push_back(Button(StringVariant::Format(::app::strings::ui_review_adoption_0, title)).OnClick([adopt, candidate = candidate.id, ref, agent] {
         if (ref) adopt(candidate, *ref, agent);
       }).With(Enabled(ref && candidate.state == kit::CandidateState::Ready && !busy.Get() && !pending.Get()))
           .Key("comparison-adopt/" + candidate.id.value));
@@ -611,7 +613,7 @@ View ComparisonDetail(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
         Divider(),
     };
     if (preview) panel.push_back(CandidateArtifact(*preview, other, slide, title));
-    else if (!candidate.artifacts.empty()) panel.push_back(Text("Reading the candidate version..."));
+    else if (!candidate.artifacts.empty()) panel.push_back(Text(::app::strings::ui_reading_the_candidate_version));
     if (candidate.reason) panel.push_back(Text(candidate.reason->message));
     if (candidate.validation && candidate.validation->model)
       panel.push_back(Text(candidate.validation->model->value, TextRole::Label));
@@ -631,32 +633,32 @@ View ComparisonDetail(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
         CornerRadius(9.0F), CrossAlign(CrossAxisAlignment::Stretch)).Key(candidate.id.value));
   }
   std::vector<View> controls{
-      Button("All comparisons").OnClick([select] { select(std::nullopt); }),
+      Button(::app::strings::ui_all_comparisons).OnClick([select] { select(std::nullopt); }),
   };
   if (!review.adoption_reconciled &&
       (review.adoption_state == kit::ToolCallState::PartiallyApplied || review.adoption_state == kit::ToolCallState::ResultUnknown))
-    controls.push_back(Button("Check adoption result").OnClick(check_adoption).With(Enabled(!busy.Get())));
-  if (recovered) controls.push_back(Button("Review recovered changes").OnClick([reviewing_recovered, call = recovered->id] {
+    controls.push_back(Button(::app::strings::ui_check_adoption_result).OnClick(check_adoption).With(Enabled(!busy.Get())));
+  if (recovered) controls.push_back(Button(::app::strings::ui_review_recovered_changes).OnClick([reviewing_recovered, call = recovered->id] {
     reviewing_recovered = std::optional{call};
   }));
   if (review.state != kit::ForkReviewState::Closed)
-    controls.push_back(Button("Close comparison").OnClick(close).With(Enabled(!busy.Get()), Tooltip("End the current comparison")));
+    controls.push_back(Button(::app::strings::ui_close_comparison).OnClick(close).With(Enabled(!busy.Get()), Tooltip(::app::strings::ui_end_the_current_comparison)));
   std::vector<View> results{
       ProvideEnvironment(link_style, Flow(std::move(controls)).With(Spacing(6.0F))),
       Text(ReviewTitle(review.request.comparison_criteria), TextRole::Title)
           .Style({Font::System(26.0F).WithWeight(FontWeight::SemiBold), theme.on_surface}),
   };
-  if (pending.Get() && !busy.Get()) results.push_back(Button("Check adoption").OnClick([adopt] { adopt({}, {}, {}); }));
+  if (pending.Get() && !busy.Get()) results.push_back(Button(::app::strings::ui_check_adoption).OnClick([adopt] { adopt({}, {}, {}); }));
   if (!operation_error->empty()) results.push_back(Text(operation_error.Get(), TextRole::Label));
   if (pages > 1) {
     results.push_back(ProvideEnvironment(link_style, Row{
-        Button("Previous slide").OnClick([current_slide, slide] { current_slide = slide - 1; }).With(Enabled(slide > 0)),
+        Button(::app::strings::ui_previous_slide).OnClick([current_slide, slide] { current_slide = slide - 1; }).With(Enabled(slide > 0)),
         Text(std::to_string(slide + 1) + " / " + std::to_string(pages), TextRole::Label),
-        Button("Next slide").OnClick([current_slide, slide] { current_slide = slide + 1; }).With(Enabled(slide + 1 < pages)),
+        Button(::app::strings::ui_next_slide).OnClick([current_slide, slide] { current_slide = slide + 1; }).With(Enabled(slide + 1 < pages)),
     }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center))));
   }
   {
-    View body = panels.empty() ? View(Text("No candidates are visible in this comparison.")) :
+    View body = panels.empty() ? View(Text(::app::strings::ui_no_candidates_are_visible_in_this_comparison)) :
         wide && panels.size() == 2 ? View(Row(std::move(panels)).With(Spacing(16.0F), CrossAlign(CrossAxisAlignment::Start))) :
         View(Column(std::move(panels)).With(Spacing(16.0F), CrossAlign(CrossAxisAlignment::Stretch)));
     results.push_back(ScrollView(std::move(body)).With(Grow(), ScrollBar()));
@@ -689,18 +691,18 @@ View ComparisonLibrary(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_p
   }, source_id);
   const auto colors = UseTheme().colors;
   const auto link_style = ComparisonLinkStyle(UseEnvironment<ButtonStyle>(), colors);
-  if (!entries.Get()) return Text(error->empty() ? "Loading comparisons..." : error.Get());
+  if (!entries.Get()) return Text(error->empty() ? StringVariant{::app::strings::ui_loading_comparisons} : StringVariant{error.Get()});
   if (fresh.Get() || entries.Get()->empty()) {
     std::vector<View> content;
     if (!entries.Get()->empty()) content.push_back(ProvideEnvironment(link_style,
-        Row{Button("All comparisons").OnClick([fresh] { fresh = false; }), Spacer()}));
+        Row{Button(::app::strings::ui_all_comparisons).OnClick([fresh] { fresh = false; }), Spacer()}));
     content.push_back(NewComparison(runtime, source, std::move(services), select, open_approval, [fresh] {
       if (!fresh.Get()) fresh = true;
     }).Key("new-comparison"));
     return Column(std::move(content)).With(Spacing(14.0F));
   }
   std::vector<View> rows{
-      Row{Text("Comparisons", TextRole::Title), Spacer(), Button("New comparison").OnClick([fresh] { fresh = true; })}
+      Row{Text(::app::strings::ui_comparisons, TextRole::Title), Spacer(), Button(::app::strings::ui_new_comparison).OnClick([fresh] { fresh = true; })}
           .With(CrossAlign(CrossAxisAlignment::Center)),
   };
   for (const auto& entry : *entries.Get()) {
@@ -727,7 +729,7 @@ View ComparisonWorkspace(std::shared_ptr<kit::AgentRuntime> runtime, std::shared
   auto content = review ? ComparisonDetail(runtime, source, *review, services, select, open_branch, open_approval).Key(review->value) :
       View(ScrollView(ComparisonLibrary(runtime, source, std::move(services), select, open_approval)).With(ScrollBar()));
   return Row{Spacer(), Column{
-      Row{ProvideEnvironment(link_style, Button("Back to conversation").OnClick(std::move(back))), Spacer(),
+      Row{ProvideEnvironment(link_style, Button(::app::strings::ui_back_to_conversation).OnClick(std::move(back))), Spacer(),
           Text(snapshot ? snapshot->summary.title : "", TextRole::Label).LineLimit(1).Overflow(TextOverflow::Ellipsis)}
           .With(Spacing(8.0F), Frame{.min_height = 44.0F}, CrossAlign(CrossAxisAlignment::Center)),
       Divider(),

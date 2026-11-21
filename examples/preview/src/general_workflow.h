@@ -9,6 +9,7 @@ inline const huxerui::agentkit::AgentId PptAgent{"preview.ppt"};
 inline const huxerui::agentkit::ToolId ConfirmPreview{"preview.confirm"};
 inline const huxerui::agentkit::ToolId ReadReport{"preview.report.read"};
 inline const huxerui::agentkit::ToolId PrepareReleaseOutline{"preview.report.outline"};
+inline constexpr std::string_view GeneralAnswerInstruction = "Answer the latest user message directly in plain text or Markdown.";
 
 huxerui::agentkit::AgentResult<void> RegisterGeneralTools(const std::shared_ptr<huxerui::agentkit::AgentRuntime>& runtime);
 huxerui::agentkit::Async<huxerui::agentkit::RunCompletion> RunGeneral(

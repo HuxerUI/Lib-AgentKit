@@ -104,8 +104,22 @@ void RuntimeState::ConstrainDelegationBudget(const RunExecution& run, Budget& bu
   }
 }
 
+void SetObservedRunState(RunSnapshot& run, RunState state, TimePoint now) {
+  if (auto& timing = run.timing) {
+    if (state != RunState::WaitingForInput && timing->input_wait_started_at) {
+      timing->waiting_for_input += std::max(Duration::zero(), now - *timing->input_wait_started_at);
+      timing->input_wait_started_at.reset();
+    } else if (state == RunState::WaitingForInput && !timing->input_wait_started_at) {
+      timing->input_wait_started_at = now;
+    }
+    if (Terminal(state)) timing->ended_at = std::max(now, timing->started_at);
+  }
+  if (Terminal(state)) run.model_active = false;
+  run.state = state;
+}
+
 void RuntimeState::UpdateRunState(SessionData& session, RunExecution& run, RunState state) {
-  run.view.state = state;
+  SetObservedRunState(run.view, state, Now());
   if (session.summary.active_run == run.view.id) session.summary.run_state = state;
 }
 
@@ -143,7 +157,8 @@ void RuntimeState::ScheduleDelegates(SessionData& session) {
     child.delegate_dispatched = true;
     if (!child.delegate->started) {
       child.delegate->started = true;
-      child.view.state = RunState::Running;
+      child.view.timing = RunTiming{.started_at = Now()};
+      UpdateRunState(session, child, RunState::Running);
     }
     ready.push_back(id);
     ++occupied;

@@ -1,3 +1,5 @@
+#include <app_resources.h>
+
 #include "goal_view.h"
 #include "release_workflow.h"
 
@@ -32,34 +34,34 @@ struct ReviewedGoalEdit {
   kit::GoalEditPreview preview;
 };
 
-std::string Status(kit::GoalState state) {
+StringVariant Status(kit::GoalState state) {
   switch (state) {
-    case kit::GoalState::Proposed: return "Ready to enable";
-    case kit::GoalState::Active: return "Active";
-    case kit::GoalState::Blocked: return "Blocked";
-    case kit::GoalState::Paused: return "Paused";
-    case kit::GoalState::BudgetLimited: return "Budget reached";
-    case kit::GoalState::Verifying: return "Verifying evidence";
-    case kit::GoalState::AwaitingCompletionApproval: return "Awaiting completion approval";
-    case kit::GoalState::Completed: return "Completed";
-    case kit::GoalState::Cancelled: return "Cancelled";
+    case kit::GoalState::Proposed: return ::app::strings::ui_ready_to_enable;
+    case kit::GoalState::Active: return ::app::strings::ui_active;
+    case kit::GoalState::Blocked: return ::app::strings::ui_blocked;
+    case kit::GoalState::Paused: return ::app::strings::ui_paused;
+    case kit::GoalState::BudgetLimited: return ::app::strings::ui_budget_reached;
+    case kit::GoalState::Verifying: return ::app::strings::ui_verifying_evidence;
+    case kit::GoalState::AwaitingCompletionApproval: return ::app::strings::ui_awaiting_completion_approval;
+    case kit::GoalState::Completed: return ::app::strings::ui_completed;
+    case kit::GoalState::Cancelled: return ::app::strings::ui_cancelled;
   }
   return {};
 }
 
-const char* RunStatus(std::optional<kit::RunState> state) {
-  if (!state) return "Run: idle";
+StringVariant RunStatus(std::optional<kit::RunState> state) {
+  if (!state) return ::app::strings::ui_run_idle;
   switch (*state) {
-    case kit::RunState::Running: return "Run: running";
-    case kit::RunState::WaitingForInput: return "Run: waiting for input";
-    case kit::RunState::WaitingForReply: return "Run: waiting for reply";
-    case kit::RunState::WaitingForDependency: return "Run: waiting for dependency";
-    case kit::RunState::Cancelling: return "Run: stopping";
-    case kit::RunState::Succeeded: return "Run: succeeded";
-    case kit::RunState::Failed: return "Run: failed";
-    case kit::RunState::Cancelled: return "Run: cancelled";
+    case kit::RunState::Running: return ::app::strings::ui_run_running;
+    case kit::RunState::WaitingForInput: return ::app::strings::ui_run_waiting_for_input;
+    case kit::RunState::WaitingForReply: return ::app::strings::ui_run_waiting_for_reply;
+    case kit::RunState::WaitingForDependency: return ::app::strings::ui_run_waiting_for_dependency;
+    case kit::RunState::Cancelling: return ::app::strings::ui_run_stopping;
+    case kit::RunState::Succeeded: return ::app::strings::ui_run_succeeded;
+    case kit::RunState::Failed: return ::app::strings::ui_run_failed;
+    case kit::RunState::Cancelled: return ::app::strings::ui_run_cancelled;
   }
-  return "Run: idle";
+  return ::app::strings::ui_run_idle;
 }
 
 [[huxerui::composable]]
@@ -74,7 +76,7 @@ View GoalArtifactLabel(std::shared_ptr<kit::AgentRuntime> runtime, kit::Artifact
     });
     return [worker] { worker.Cancel(); };
   }, runtime, artifact);
-  return Text((name.Get().empty() ? "Artifact" : name.Get()) + " v" + std::to_string(artifact.version),
+  return Text(StringVariant::Format(::app::strings::ui_0_v_1, name.Get().empty() ? UseString(::app::strings::ui_artifact) : name.Get(), artifact.version),
       TextRole::Label);
 }
 
@@ -202,9 +204,9 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
   std::vector<View> content;
   if (!error->empty()) content.push_back(Text(error.Get()));
   if (!now) {
-    if (error->empty()) content.push_back(Text("Loading goal..."));
+    if (error->empty()) content.push_back(Text(::app::strings::ui_loading_goal));
   } else if (const auto draft = editor.Get()) {
-    auto field = [&](const char* label, TextEditingValue GoalDraft::* member, bool multiline = false) {
+    auto field = [&](StringVariant label, TextEditingValue GoalDraft::* member, bool multiline = false) {
       return TextField((*draft).*member).Label(label)
           .LineLimits(multiline ? TextFieldLineLimits::MultiLine(2, 4) : TextFieldLineLimits::SingleLine())
           .OnChanged([editor, impact, member](const TextEditingValue& value) {
@@ -216,17 +218,17 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
           }).With(Enabled(!busy.Get()));
     };
     if (!draft->budget_only) {
-      content.push_back(field("Objective", &GoalDraft::objective).Key("goal-objective"));
+      content.push_back(field(::app::strings::ui_objective, &GoalDraft::objective).Key("goal-objective"));
       const auto* definition = !draft->new_goal && *now ? &(*now)->spec.definition : nullptr;
       if (definition && IsWorkspaceRelease(*definition)) {
-        content.push_back(field("Slide count", &GoalDraft::slides).Key("goal-slide-count"));
+        content.push_back(field(::app::strings::ui_slide_count, &GoalDraft::slides).Key("goal-slide-count"));
       } else if (!definition || std::holds_alternative<std::nullptr_t>(definition->completion_conditions.value) ||
                  std::holds_alternative<std::string>(definition->completion_conditions.value)) {
-        content.push_back(field("Completion conditions", &GoalDraft::conditions, true).Key("goal-conditions"));
+        content.push_back(field(::app::strings::ui_completion_conditions, &GoalDraft::conditions, true).Key("goal-conditions"));
       } else {
-        content.push_back(Text("Completion conditions are supplied by the workflow.", TextRole::Label));
+        content.push_back(Text(::app::strings::ui_completion_conditions_are_supplied_by_the_workflow, TextRole::Label));
       }
-      content.push_back(Checkbox("Require approval after verification", draft->require_approval)
+      content.push_back(Checkbox(::app::strings::ui_require_approval_after_verification, draft->require_approval)
           .OnChanged([editor, impact](bool require) {
             auto changed = editor.Get();
             if (!changed) return;
@@ -236,27 +238,27 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
           }).With(Enabled(!busy.Get())).Key("goal-confirm-completion"));
     }
     if (draft->new_goal || draft->budget_only) {
-      content.push_back(Text("Budget", TextRole::Title));
-      content.push_back(Text("Leave optional limits empty.", TextRole::Label));
+      content.push_back(Text(::app::strings::ui_budget, TextRole::Title));
+      content.push_back(Text(::app::strings::ui_leave_optional_limits_empty, TextRole::Label));
       content.push_back(Row {
-        field("Tokens", &GoalDraft::tokens).With(Grow()),
-        field("Model turns", &GoalDraft::turns).With(Grow()),
+        field(::app::strings::ui_tokens, &GoalDraft::tokens).With(Grow()),
+        field(::app::strings::ui_model_turns, &GoalDraft::turns).With(Grow()),
       }.With(Spacing(10.0F)));
       content.push_back(Row {
-        field("Tool calls", &GoalDraft::tools).With(Grow()),
-        field("Minutes", &GoalDraft::minutes).With(Grow()),
+        field(::app::strings::ui_tool_calls, &GoalDraft::tools).With(Grow()),
+        field(::app::strings::ui_minutes, &GoalDraft::minutes).With(Grow()),
       }.With(Spacing(10.0F)));
     }
     if (const auto preview = impact.Get()) {
       const auto& changes = preview->preview.impact;
-      content.push_back(Text("Review changes", TextRole::Title));
-      if (changes.retiring_run) content.push_back(Text("The current goal run will finish stopping before the new version starts."));
+      content.push_back(Text(::app::strings::ui_review_changes, TextRole::Title));
+      if (changes.retiring_run) content.push_back(Text(::app::strings::ui_the_current_goal_run_will_finish_stopping));
       if (const auto n = changes.in_flight_calls.size()) content.push_back(Text(std::to_string(n) + " in-flight tool calls will be reconciled."));
       if (const auto n = changes.invalidated_interactions.size()) content.push_back(Text(std::to_string(n) + " pending interactions will close."));
       if (const auto n = changes.continuing_runs.size()) content.push_back(Text(std::to_string(n) + " independent runs will continue as started."));
       if (const auto n = changes.retiring_linked_runs.size()) content.push_back(Text(std::to_string(n) + " linked runs will stop for this revision."));
       if (const auto n = changes.withdrawn_requests.size()) content.push_back(Text(std::to_string(n) + " queued requests will be withdrawn."));
-      if (changes.resets_completion_review) content.push_back(Text("Evidence must be verified against the new version."));
+      if (changes.resets_completion_review) content.push_back(Text(::app::strings::ui_evidence_must_be_verified_against_the_new));
     }
     const auto commit = [scope, conversation, snapshot, editor, busy, error, impact, update] {
       const auto edit = editor.Get();
@@ -295,7 +297,7 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
     const auto action = draft->new_goal ? "Save goal" : draft->budget_only ? "Save budget" :
         impact.Get() ? "Apply goal change" : "Review goal change";
     content.push_back(Row {
-      ProvideEnvironment(secondary, Button("Discard").OnClick([editor, impact, error] {
+      ProvideEnvironment(secondary, Button(::app::strings::ui_discard).OnClick([editor, impact, error] {
         editor = std::optional<GoalDraft>{};
         impact = std::shared_ptr<const ReviewedGoalEdit>{};
         error = "";
@@ -307,13 +309,13 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
     if (goal) {
       content.push_back(Text(goal->spec.definition.objective, TextRole::Title));
       content.push_back(Text(Status(goal->state)));
-      content.push_back(Text("Version " + std::to_string(goal->ref.version), TextRole::Label));
+      content.push_back(Text(StringVariant::Format(::app::strings::ui_version_0, goal->ref.version), TextRole::Label));
       content.push_back(Text(UsageText(*goal), TextRole::Label));
     }
-    content.push_back(Row{Button("Set goal").OnClick([editor] { editor = GoalDraft{.new_goal = true}; }), Spacer()});
+    content.push_back(Row{Button(::app::strings::ui_set_goal).OnClick([editor] { editor = GoalDraft{.new_goal = true}; }), Spacer()});
   } else {
     content.push_back(Text(goal->spec.definition.objective, TextRole::Title));
-    content.push_back(Text(Status(goal->state) + "   \xc2\xb7   Version " + std::to_string(goal->ref.version), TextRole::Label));
+    content.push_back(Text(StringVariant::Format(::app::strings::ui_status_version, UseString(Status(goal->state)), goal->ref.version), TextRole::Label));
     content.push_back(Text(UsageText(*goal), TextRole::Label));
     if (const auto slides = ReleaseSlideCount(goal->spec.definition.completion_conditions)) {
       content.push_back(Text(std::to_string(*slides) + " slides", TextRole::Label));
@@ -324,30 +326,30 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
     };
     std::vector<View> actions;
     if (goal->state == kit::GoalState::Proposed) {
-      actions.push_back(Button("Enable").OnClick([start] { start(kit::EnableGoal{}); }).With(Enabled(!busy.Get())));
+      actions.push_back(Button(::app::strings::ui_enable).OnClick([start] { start(kit::EnableGoal{}); }).With(Enabled(!busy.Get())));
     } else if (goal->state == kit::GoalState::Paused || goal->state == kit::GoalState::Blocked ||
         goal->state == kit::GoalState::BudgetLimited) {
-      actions.push_back(Button("Resume").OnClick([start] { start(kit::ResumeGoal{}); }).With(Enabled(!busy.Get())));
+      actions.push_back(Button(::app::strings::ui_resume).OnClick([start] { start(kit::ResumeGoal{}); }).With(Enabled(!busy.Get())));
     } else {
       actions.push_back(ProvideEnvironment(secondary,
-          Button("Pause").OnClick([start] { start(kit::PauseGoal{}); }).With(Enabled(!busy.Get()))));
+          Button(::app::strings::ui_pause).OnClick([start] { start(kit::PauseGoal{}); }).With(Enabled(!busy.Get()))));
     }
-    actions.push_back(ProvideEnvironment(secondary, Button("Edit goal")
+    actions.push_back(ProvideEnvironment(secondary, Button(::app::strings::ui_edit_goal)
         .OnClick([editor, draft = EditDraft(*goal, false)] { editor = draft; }).With(Enabled(!busy.Get()))));
-    actions.push_back(ProvideEnvironment(secondary, Button("Budget")
+    actions.push_back(ProvideEnvironment(secondary, Button(::app::strings::ui_budget)
         .OnClick([editor, draft = EditDraft(*goal, true)] { editor = draft; }).With(Enabled(!busy.Get()))));
     actions.push_back(ProvideEnvironment(destructive,
-        Button("Cancel goal").OnClick([start] { start(kit::CancelGoal{}); }).With(Enabled(!busy.Get()))));
+        Button(::app::strings::ui_cancel_goal).OnClick([start] { start(kit::CancelGoal{}); }).With(Enabled(!busy.Get()))));
     content.push_back(Flow(std::move(actions)).With(Spacing(8.0F)));
     if (goal->completion_review) {
-      content.push_back(Row{Button("Open completion approval").OnClick(
+      content.push_back(Row{Button(::app::strings::ui_open_completion_approval).OnClick(
           [open_completion, approval = goal->completion_review->approval] { open_completion(approval); }), Spacer()});
     }
   }
   if (visible && goal && !editor.Get()) {
     const auto& definition = goal->spec.definition;
     if (const auto* conditions = std::get_if<std::string>(&definition.completion_conditions.value); conditions && !conditions->empty()) {
-      content.push_back(Column{Text("Completion conditions", TextRole::Label), Text(*conditions)}.With(Spacing(4.0F)));
+      content.push_back(Column{Text(::app::strings::ui_completion_conditions, TextRole::Label), Text(*conditions)}.With(Spacing(4.0F)));
     }
     content.push_back(Text(definition.completion == kit::GoalCompletionPolicy::RequireConfirmation ?
         "Approval required after verification" : "Complete automatically after verification", TextRole::Label));
@@ -356,7 +358,7 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
     const auto* sources = goal->verification && !goal->verification->verified.empty() ? &goal->verification->verified :
         goal->evidence ? &goal->evidence->sources : nullptr;
     if (sources && !sources->empty()) {
-      std::vector<View> evidence{Text("Evidence", TextRole::Label)
+      std::vector<View> evidence{Text(::app::strings::ui_evidence, TextRole::Label)
           .Style({Font::System(14.0F).WithWeight(FontWeight::SemiBold), colors.on_surface})};
       std::vector<kit::SourceRef> shown;
       for (const auto& source : *sources) {
@@ -366,18 +368,18 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
           evidence.push_back(GoalArtifactLabel(runtime, *artifact)
               .Key("evidence/" + artifact->id.value + "/" + std::to_string(artifact->version)));
         else if (const auto* message = std::get_if<kit::MessageRef>(&source.source))
-          evidence.push_back(Text("Message v" + std::to_string(message->version), TextRole::Label));
+          evidence.push_back(Text(StringVariant::Format(::app::strings::ui_message_v_0, message->version), TextRole::Label));
         else if (const auto* item = std::get_if<kit::SharedContextRef>(&source.source))
-          evidence.push_back(Text("Shared context v" + std::to_string(item->version), TextRole::Label));
+          evidence.push_back(Text(StringVariant::Format(::app::strings::ui_shared_context_v_0, item->version), TextRole::Label));
         else if (const auto* resource = std::get_if<kit::ResourceRef>(&source.source))
-          evidence.push_back(Text("Resource " + resource->version, TextRole::Label));
+          evidence.push_back(Text(StringVariant::Format(::app::strings::ui_resource_0, resource->version), TextRole::Label));
       }
       content.push_back(Column(std::move(evidence)).With(Spacing(6.0F)).Key("goal-evidence"));
     }
   }
   auto panel = Column {
     Row {
-      ProvideEnvironment(secondary, Button("Close goal").OnClick(close)),
+      ProvideEnvironment(secondary, Button(::app::strings::ui_close_goal).OnClick(close)),
       Spacer(),
       Text(RunStatus(run), TextRole::Label).Style({Font::System(12.0F), colors.on_surface_variant}).Key("goal-run-status"),
     }.With(CrossAlign(CrossAxisAlignment::Center)),

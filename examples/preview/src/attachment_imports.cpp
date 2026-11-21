@@ -1,3 +1,5 @@
+#include <app_resources.h>
+
 #include "attachment_imports.h"
 
 #include <algorithm>
@@ -177,7 +179,7 @@ View AttachmentPicker(std::shared_ptr<AttachmentImports> imports, State<kit::Age
       busy = false;
     });
   };
-  auto control = Button(on_staged ? "Attach images" : "Attach files").OnClick(std::move(pick))
+  auto control = Button(on_staged ? ::app::strings::ui_attach_images : ::app::strings::ui_attach_files).OnClick(std::move(pick))
       .With(Enabled(!busy.Get())).Key(on_staged ? "attach-images" : "attach-files");
   if (error->empty()) return control;
   return Column{std::move(control), Text(error.Get(), TextRole::Label)}.With(Spacing(4.0F));

@@ -143,6 +143,39 @@ struct AgentChatInteractionRequest {
   bool operator==(const AgentChatInteractionRequest&) const = default;
 };
 
+/// @brief Optional layout and activity presentation for AgentChat().
+/// Provide it with ProvideEnvironment() around a conversation or a group of conversations.
+struct AgentChatLayoutStyle {
+  /// Maximum content width in logical pixels.
+  float content_width = 672.0F;
+  /// Title font size in logical pixels. Empty uses the default size.
+  std::optional<float> heading_size;
+  /// Uses chat bubbles and the compact composer layout.
+  bool chat_bubbles = false;
+  /// Shows per-Run status, elapsed time, and collapsible activity from session events.
+  bool show_run_activity = false;
+
+  /// Returns the default AgentChat layout.
+  static constexpr AgentChatLayoutStyle Default() noexcept { return {}; }
+
+  /// Compares all presentation settings.
+  bool operator==(const AgentChatLayoutStyle&) const = default;
+};
+
+/// @brief Optional mount point for popups opened by host composer controls.
+/// Read it with UseEnvironment() from AgentChatRunControls::render descendants. A standalone
+/// host composer can provide its own anchor with ProvideEnvironment().
+struct AgentChatComposerAnchor {
+  /// Mounted composer area. If unavailable, controls may fall back to their own handle.
+  std::optional<ViewHandle> view;
+
+  /// Returns an empty anchor.
+  static AgentChatComposerAnchor Default() { return {}; }
+
+  /// Compares the anchor handles.
+  bool operator==(const AgentChatComposerAnchor&) const = default;
+};
+
 /// @brief Optional UI integration points for AgentChat().
 /// The default UI can render messages and standard interactions. Supply host views only for the artifacts,
 /// forms or shell controls that require application-specific presentation.
@@ -187,6 +220,9 @@ struct AgentChatOptions {
   std::optional<ViewHandle> composer_focus;
   /// Returns a custom view for a transcript text block, or empty for the default renderer.
   std::function<std::optional<View>(const Message&, const ContentBlock&)> render_text_block;
+  /// Resolves an exact tool version to a display label for Run activity.
+  /// An empty callback or label falls back to the tool ID.
+  std::function<std::string(const ToolRef&)> tool_label;
 };
 
 /// @brief Builds the default conversation view with history, interactions, selection and a composer.
@@ -195,6 +231,12 @@ struct AgentChatOptions {
 /// @return A composable view that owns its observation for the lifetime of the mounted conversation.
 /// @see Conversation::ObserveAsync(), AgentChatSelection, AgentChatOptions
 View AgentChat(std::shared_ptr<Conversation> conversation, AgentChatOptions options = {});
+
+/// @brief Hosts side chats opened by the wrapped AgentChat or source actions in a resizable pane.
+/// @param content Primary view containing AgentChat or AgentChatSourceActions.
+/// @return A layout that shows both views on wide surfaces and switches between them on narrow surfaces.
+/// @see AgentChatSelection, AgentChatSourceActions
+View AgentChatWithSidePane(View content);
 
 /// @brief Builds quotation and side-chat actions for a selected artifact source.
 /// @param conversation Open conversation whose permissions apply to the source read.

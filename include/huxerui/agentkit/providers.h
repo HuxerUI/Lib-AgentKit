@@ -119,6 +119,9 @@ struct ResponsesOptions {
   ResponsesDialect dialect = ResponsesDialect::OpenAI;
   /// Opt-in for GLM server-side continuation, subject to current Run authorization.
   bool allow_server_state = false;
+  /// Requests displayable reasoning summaries on a supporting OpenAI Responses model.
+  /// The summary is published in RunSnapshot and follows the Run's retention.
+  bool reasoning_summary = false;
 };
 
 /// @brief Creates the Responses adapter on the application thread.

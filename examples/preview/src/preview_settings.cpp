@@ -1,3 +1,5 @@
+#include <app_resources.h>
+
 #include "preview_settings.h"
 
 #include "general_workflow.h"
@@ -17,22 +19,22 @@ namespace kit = huxerui::agentkit;
 using Json = nlohmann::json;
 
 constexpr std::size_t instruction_limit = 4096;
-constexpr std::array<const char*, 3> appearance_labels{"Dark", "Light", "Follow system"};
-constexpr std::array<const char*, 4> tone_labels{"Default", "Concise", "Friendly", "Formal"};
+const std::array appearance_labels{::app::strings::ui_dark, ::app::strings::ui_light, ::app::strings::ui_follow_system};
+const std::array tone_labels{::app::strings::ui_default, ::app::strings::ui_concise, ::app::strings::ui_friendly, ::app::strings::ui_formal};
 
 enum class SettingsSection { Models, Personalization, Appearance, Storage };
 
 struct SettingsCategory {
   SettingsSection section;
-  const char* title;
+  StringResource title;
   const char* key;
 };
 
-constexpr std::array categories{
-    SettingsCategory{SettingsSection::Models, "Models", "settings-section-models"},
-    SettingsCategory{SettingsSection::Personalization, "Personalization", "settings-section-personalization"},
-    SettingsCategory{SettingsSection::Appearance, "Appearance", "settings-section-appearance"},
-    SettingsCategory{SettingsSection::Storage, "Storage", "settings-section-storage"},
+const std::array categories{
+    SettingsCategory{SettingsSection::Models, ::app::strings::ui_models, "settings-section-models"},
+    SettingsCategory{SettingsSection::Personalization, ::app::strings::ui_personalization, "settings-section-personalization"},
+    SettingsCategory{SettingsSection::Appearance, ::app::strings::ui_appearance, "settings-section-appearance"},
+    SettingsCategory{SettingsSection::Storage, ::app::strings::ui_storage, "settings-section-storage"},
 };
 
 Json ModelRecord(const std::optional<kit::ModelProviderRef>& model) {
@@ -50,14 +52,14 @@ std::optional<kit::ModelProviderRef> ReadModel(const Json& document, const char*
 
 using ModelRole = std::optional<kit::ModelProviderRef> PreviewSettings::*;
 
-View ModelRoleField(const char* label, std::vector<ModelChoice> choices, const char* fallback,
+View ModelRoleField(StringVariant label, std::vector<ModelChoice> choices, StringVariant fallback,
     State<PreviewSettings> draft, ModelRole role) {
   const auto selected = draft.Get().*role;
-  std::vector<std::pair<std::optional<kit::ModelProviderRef>, std::string>> options{{std::nullopt, fallback}};
+  std::vector<std::pair<std::optional<kit::ModelProviderRef>, StringVariant>> options{{std::nullopt, std::move(fallback)}};
   for (auto& item : choices) options.emplace_back(std::move(item.ref), std::move(item.label));
   auto found = std::ranges::find(options, selected, &decltype(options)::value_type::first);
   if (found == options.end()) {
-    options.emplace_back(selected, "Saved model unavailable");
+    options.emplace_back(selected, ::app::strings::ui_saved_model_unavailable);
     found = std::prev(options.end());
   }
   const auto index = static_cast<std::size_t>(found - options.begin());
@@ -69,7 +71,7 @@ View ModelRoleField(const char* label, std::vector<ModelChoice> choices, const c
       });
 }
 
-View SettingsRow(const char* label, const char* help, View control, bool stacked, const ColorScheme& colors) {
+View SettingsRow(StringVariant label, StringVariant help, View control, bool stacked, const ColorScheme& colors) {
   auto copy = Column{
       Text(label).Style({Font::System(14.0F).WithWeight(FontWeight::Medium), colors.on_surface}),
       Text(help).Style({Font::System(12.0F), colors.on_surface_variant}),
@@ -224,50 +226,50 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
     auto vision = choices;
     std::erase_if(vision, [](const auto& item) { return !item.capabilities.image_input; });
     std::vector<View> catalog_heading{
-        Text("Configured models").Style({Font::System(15.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}).With(Grow()),
+        Text(::app::strings::ui_configured_models).Style({Font::System(15.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}).With(Grow()),
     };
     if (add_model) catalog_heading.push_back(ProvideEnvironment(secondary,
-        Button("Add model...").OnClick([dialog, add_model, refresh_models] {
+        Button(::app::strings::ui_add_model_dots).OnClick([dialog, add_model, refresh_models] {
           ShowAddModel(dialog, add_model, [refresh_models](kit::ModelProviderRef) { refresh_models = refresh_models.Get() + 1; });
         })).Key("settings-add-model"));
     std::vector<View> catalog{
         Row(std::move(catalog_heading)).With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Center)),
     };
-    if (choices.empty()) catalog.push_back(Text("No models configured").Style({Font::System(13.0F), colors.on_surface_variant}));
+    if (choices.empty()) catalog.push_back(Text(::app::strings::ui_no_models_configured).Style({Font::System(13.0F), colors.on_surface_variant}));
     for (const auto& model : choices) {
       catalog.push_back(Text(model.name).Style({Font::System(13.0F), colors.on_surface_variant})
           .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Tooltip(model.label)));
     }
     content.push_back(SettingsPanel({Column(std::move(catalog)).With(Padding(16.0F), Spacing(9.0F),
         CrossAlign(CrossAxisAlignment::Stretch))}, colors));
-    content.push_back(Text("Model roles").Style({Font::System(15.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}));
+    content.push_back(Text(::app::strings::ui_model_roles).Style({Font::System(15.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}));
     content.push_back(SettingsPanel({
-        SettingsRow("Daily model", "Default for new conversations.",
-            ModelRoleField("Daily model", choices, "Automatic", draft, &PreviewSettings::daily_model).Key("settings-daily-model"),
+        SettingsRow(::app::strings::ui_daily_model, ::app::strings::ui_default_for_new_conversations,
+            ModelRoleField(::app::strings::ui_daily_model, choices, ::app::strings::ui_automatic, draft, &PreviewSettings::daily_model).Key("settings-daily-model"),
             stack_fields, colors),
-        SettingsRow("Image understanding", "Choose a model that accepts images.",
-            ModelRoleField("Image understanding", vision, "Use the selected chat model", draft, &PreviewSettings::image_model)
+        SettingsRow(::app::strings::ui_image_understanding, ::app::strings::ui_choose_a_model_that_accepts_images,
+            ModelRoleField(::app::strings::ui_image_understanding, vision, ::app::strings::ui_use_the_selected_chat_model, draft, &PreviewSettings::image_model)
                 .Key("settings-image-model"), stack_fields, colors),
-        SettingsRow("Auto Review model", "Use for automatic approval review.",
-            ModelRoleField("Auto Review model", choices, "Use the host review policy", draft, &PreviewSettings::review_model)
+        SettingsRow(::app::strings::ui_auto_review_model, ::app::strings::ui_use_for_automatic_approval_review,
+            ModelRoleField(::app::strings::ui_auto_review_model, choices, ::app::strings::ui_use_the_host_review_policy, draft, &PreviewSettings::review_model)
                 .Key("settings-review-model"), stack_fields, colors),
     }, colors));
     break;
   }
   case SettingsSection::Personalization:
     content.push_back(SettingsPanel({
-        SettingsRow("Reply tone", "Choose how the assistant writes its replies.",
-            Select(tone_labels, static_cast<std::size_t>(draft->tone), [](const char* label) { return Text(label); })
-              .Label("Reply tone").OnChanged([draft](std::size_t index) {
+        SettingsRow(::app::strings::ui_reply_tone, ::app::strings::ui_choose_how_the_assistant_writes_its_replies,
+            Select(tone_labels, static_cast<std::size_t>(draft->tone), [](const StringResource& label) { return Text(label); })
+              .Label(::app::strings::ui_reply_tone).OnChanged([draft](std::size_t index) {
                 auto value = draft.Get();
                 value.tone = static_cast<ReplyTone>(index);
                 draft = std::move(value);
               }).Key("settings-reply-tone"), stack_fields, colors),
         Column{
-            Text("Personal instructions").Style({Font::System(14.0F).WithWeight(FontWeight::Medium), colors.on_surface}),
-            ProvideEnvironment(fields, TextField(instructions).Label("Personal instructions")
+            Text(::app::strings::ui_personal_instructions).Style({Font::System(14.0F).WithWeight(FontWeight::Medium), colors.on_surface}),
+            ProvideEnvironment(fields, TextField(instructions).Label(::app::strings::ui_personal_instructions)
                 .Variant(TextFieldVariant::Outlined)
-                .Placeholder("Add preferences the assistant should follow when replying")
+                .Placeholder(::app::strings::ui_add_preferences_the_assistant_should_follow_when)
                 .LineLimits(TextFieldLineLimits::MultiLine(3, 8)).OnChanged([draft, instructions](const TextEditingValue& text) {
                   instructions = text;
                   auto value = draft.Get();
@@ -279,9 +281,9 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
     break;
   case SettingsSection::Appearance:
     content.push_back(SettingsPanel({
-        SettingsRow("Theme", "Applies as soon as you save.",
-            Select(appearance_labels, static_cast<std::size_t>(draft->appearance), [](const char* label) { return Text(label); })
-              .Label("Theme").OnChanged([draft](std::size_t index) {
+        SettingsRow(::app::strings::ui_theme, ::app::strings::ui_applies_as_soon_as_you_save,
+            Select(appearance_labels, static_cast<std::size_t>(draft->appearance), [](const StringResource& label) { return Text(label); })
+              .Label(::app::strings::ui_theme).OnChanged([draft](std::size_t index) {
                 auto value = draft.Get();
                 value.appearance = static_cast<PreviewAppearance>(index);
                 draft = std::move(value);
@@ -291,7 +293,7 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
   case SettingsSection::Storage:
     content.push_back(SettingsPanel({
         Column{
-            Text("Preview data folder").Style({Font::System(14.0F).WithWeight(FontWeight::Medium), colors.on_surface}),
+            Text(::app::strings::ui_preview_data_folder).Style({Font::System(14.0F).WithWeight(FontWeight::Medium), colors.on_surface}),
             Text(file.ParentPath().value_or(std::string{})).With(Foreground(colors.on_surface_variant)),
         }.With(Padding(16.0F), Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch)),
     }, colors));
@@ -308,20 +310,20 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
       .With(Grow(), ScrollBar()).Key("settings-scroll");
   const auto primary = PreviewPrimaryButton(UseEnvironment<ButtonStyle>(), colors);
   auto status = !error->empty() ? Text(error.Get()).With(Foreground(colors.error)).With(Grow())
-      : pending_restart ? Text("Restart Preview to apply model roles and reply preferences.", TextRole::Label)
+      : pending_restart ? Text(::app::strings::ui_restart_preview_to_apply_model_roles_and, TextRole::Label)
           .With(Foreground(colors.on_surface_variant)).With(Grow()) : View(Spacer().With(Grow()));
   return Column{
       settings_lane(Column{
-          Row{Text("Settings", TextRole::Title)
+          Row{Text(::app::strings::ui_settings, TextRole::Title)
                   .Style({Font::System(20.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}).With(Grow()),
-              ProvideEnvironment(secondary, Button("Back to conversations").OnClick(std::move(close))).Key("close-settings"),
+              ProvideEnvironment(secondary, Button(::app::strings::ui_back_to_conversations).OnClick(std::move(close))).Key("close-settings"),
           }.With(Padding(EdgeInsets::Symmetric(0.0F, 10.0F)), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center)),
           Flow(std::move(links)).With(Spacing(5.0F), Padding(EdgeInsets{.bottom = 8.0F})),
       }.With(CrossAlign(CrossAxisAlignment::Stretch))),
       ProvideEnvironment(DividerStyle{colors.outline}, Divider()),
       std::move(content_area),
       ProvideEnvironment(DividerStyle{colors.outline}, Divider()),
-      settings_lane(Row{std::move(status), ProvideEnvironment(primary, Button(busy.Get() ? "Saving..." : "Save settings")
+      settings_lane(Row{std::move(status), ProvideEnvironment(primary, Button(busy.Get() ? ::app::strings::ui_saving : ::app::strings::ui_save_settings)
               .OnClick(save).With(Enabled(!busy.Get() && draft.Get() != current.Get()))).Key("settings-save"),
       }.With(Padding(EdgeInsets::Symmetric(0.0F, 10.0F)), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center)))
           .With(Background(colors.surface_container_low)),

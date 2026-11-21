@@ -872,7 +872,19 @@ struct RunSteerInput {
   std::vector<SideChatConclusion> conclusions;
 };
 
-/// @brief Immutable view of one Run, including origin, waits, usage and terminal result.
+/// @brief Durable wall-clock timing for a Run and its user-input waits.
+struct RunTiming {
+  /// When execution began. A queued delegate has no start time until dispatched.
+  TimePoint started_at;
+  /// When the Run reached its terminal state, if it has ended.
+  std::optional<TimePoint> ended_at;
+  /// Sum of closed intervals spent waiting for a form or approval.
+  Duration waiting_for_input{};
+  /// Start of the current form or approval wait, if one is open.
+  std::optional<TimePoint> input_wait_started_at;
+};
+
+/// @brief Authorized, durable state of one Run.
 struct RunSnapshot {
   /// Execution attempt ID.
   RunId id;
@@ -912,6 +924,13 @@ struct RunSnapshot {
   std::optional<AgentError> failure;
   /// Exact host execution profile resolved at acceptance, when present.
   std::optional<ExecutionProfileRef> execution_profile;
+  /// Timing recorded by the runtime. Older stored Runs may have no timing.
+  std::optional<RunTiming> timing;
+  /// Provider-supplied public reasoning summary for this Run, when offered.
+  /// Adapter continuation state is private and excluded.
+  std::string reasoning_summary;
+  /// Whether the runtime is requesting or consuming a model turn.
+  bool model_active = false;
 };
 
 /// @brief Versioned interaction payload requesting user data.

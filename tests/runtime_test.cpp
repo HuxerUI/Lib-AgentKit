@@ -3,6 +3,8 @@
 #include <huxerui/huxerui.h>
 #include <huxerui/testing/ui_test.h>
 
+#include "test_resources.h"
+
 #include <algorithm>
 #include <iostream>
 #include <set>
@@ -606,7 +608,8 @@ void VerifyContentApplication() {
           complete = true;
         });
       }}}};
-  testing::UiTest ui(application, {.viewport = {900.0F, 820.0F}});
+  testing::UiTest ui(application, {.viewport = {900.0F, 820.0F},
+      .resource_provider = std::make_shared<agentkit_test::PackagedResources>()});
   ui.PumpUntil([&] { return complete; }, {.timeout = 5s, .step = 5ms});
   if (error) std::rethrow_exception(error);
   const auto has_operations = [&] { return ui.Find(testing::UiSelector::Text("Operations: 3")).Exists(); };

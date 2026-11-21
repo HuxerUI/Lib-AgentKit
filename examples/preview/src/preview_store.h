@@ -46,6 +46,5 @@ struct PreviewStores {
 };
 
 huxerui::agentkit::Async<PreviewStores> OpenPreviewStoresAsync(huxerui::File file);
-huxerui::agentkit::Async<std::shared_ptr<huxerui::agentkit::SessionStore>> OpenSessionStoreAsync(huxerui::File file);
 
 } // namespace agentkit_preview

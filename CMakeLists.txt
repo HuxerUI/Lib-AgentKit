@@ -128,14 +128,20 @@ if (NOT TARGET nlohmann_json::nlohmann_json)
 endif ()
 target_link_libraries(huxerui_agentkit PRIVATE nlohmann_json::nlohmann_json)
 
-option(HUXERUI_AGENTKIT_BUILD_TESTS "Build AgentKit runtime tests" OFF)
+option(HUXERUI_AGENTKIT_BUILD_TESTS "Build AgentKit tests" OFF)
+option(HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS "Include the Preview integration tests" ON)
 if (HUXERUI_AGENTKIT_BUILD_TESTS)
     if (NOT TARGET HuxerUI::testing)
         find_package(HuxerUI CONFIG REQUIRED COMPONENTS testing PATHS "${HUXERUI_HOME}")
     endif ()
     enable_testing()
     add_executable(huxerui_agentkit_runtime_tests tests/runtime_test.cpp)
-    target_link_libraries(huxerui_agentkit_runtime_tests PRIVATE HuxerUI::AgentKit HuxerUI::testing)
+    huxerui_use_library(huxerui_agentkit_runtime_tests TARGET HuxerUI::AgentKit)
+    target_link_libraries(huxerui_agentkit_runtime_tests PRIVATE HuxerUI::testing)
+    set_property(TARGET huxerui_agentkit_runtime_tests APPEND PROPERTY HUXERUI_RESOURCE_PACKAGE_INPUTS
+            "${HUXERUI_BUILTIN_RESOURCE_PACKAGE}")
+    target_compile_definitions(huxerui_agentkit_runtime_tests PRIVATE
+            AGENTKIT_TEST_RESOURCE_PACKAGE="$<TARGET_PROPERTY:huxerui_agentkit_runtime_tests,HUXERUI_RESOURCE_PACKAGE>")
     add_test(NAME huxerui_agentkit_runtime_tests COMMAND huxerui_agentkit_runtime_tests)
     add_test(NAME huxerui_agentkit_tool_schedule_tests COMMAND huxerui_agentkit_runtime_tests --tool-schedule)
     if (NOT CMAKE_CROSSCOMPILING AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
@@ -155,9 +161,37 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS)
         endif ()
     endif ()
 
-    include(examples/preview/cmake/SQLite.cmake)
+    include(cmake/HostSQLite.cmake)
+    add_executable(huxerui_agentkit_sqlite_tests
+            tests/sqlite_store_test.cpp
+            tests/fork_history_test.cpp
+    )
+    if (MSVC)
+        target_compile_options(huxerui_agentkit_sqlite_tests PRIVATE /bigobj)
+    endif ()
+    target_link_libraries(huxerui_agentkit_sqlite_tests PRIVATE HuxerUI::AgentKit HuxerUI::testing nlohmann_json::nlohmann_json)
+    agentkit_host_use_sqlite_session_store(huxerui_agentkit_sqlite_tests)
+    add_test(NAME huxerui_agentkit_sqlite_tests COMMAND huxerui_agentkit_sqlite_tests)
+
+    add_executable(huxerui_agentkit_delegation_tests tests/delegation_test.cpp)
+    target_link_libraries(huxerui_agentkit_delegation_tests PRIVATE HuxerUI::AgentKit HuxerUI::testing)
+    agentkit_host_use_sqlite_session_store(huxerui_agentkit_delegation_tests)
+    add_test(NAME huxerui_agentkit_delegation_tests COMMAND huxerui_agentkit_delegation_tests)
+    set_tests_properties(huxerui_agentkit_delegation_tests PROPERTIES TIMEOUT 45)
+
+    add_executable(huxerui_agentkit_model_tests
+            tests/model_protocol_test.cpp
+    )
+    target_include_directories(huxerui_agentkit_model_tests PRIVATE src)
+    target_link_libraries(huxerui_agentkit_model_tests PRIVATE
+            HuxerUI::AgentKit HuxerUI::testing nlohmann_json::nlohmann_json)
+    agentkit_host_use_sqlite_session_store(huxerui_agentkit_model_tests)
+    add_test(NAME huxerui_agentkit_model_tests COMMAND huxerui_agentkit_model_tests)
+endif ()
+
+if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS)
     include(examples/preview/cmake/Archive.cmake)
-    include(examples/preview/cmake/Terminal.cmake)
+    include(cmake/HostTerminal.cmake)
     include(examples/preview/cmake/Skills.cmake)
     add_executable(huxerui_agentkit_preview_tests
             tests/preview_test.cpp
@@ -193,9 +227,12 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS)
         target_compile_options(huxerui_agentkit_preview_tests PRIVATE /bigobj)
     endif ()
     agentkit_preview_embed_skills(huxerui_agentkit_preview_tests)
+    huxerui_use_library(huxerui_agentkit_preview_tests TARGET HuxerUI::AgentKit)
+    huxerui_add_resources(huxerui_agentkit_preview_tests ROOT "${CMAKE_CURRENT_SOURCE_DIR}/examples/preview/resources" NAMESPACE app)
+    get_property(agentkit_preview_test_resources TARGET huxerui_agentkit_preview_tests PROPERTY HUXERUI_RESOURCE_PACKAGE)
     target_compile_definitions(huxerui_agentkit_preview_tests PRIVATE AGENTKIT_PREVIEW_TEST
             AGENTKIT_PREVIEW_CTEST="${CMAKE_CTEST_COMMAND}" AGENTKIT_PREVIEW_CMAKE="${CMAKE_COMMAND}"
-            AGENTKIT_PREVIEW_RESOURCES="${HUXERUI_BUILTIN_RESOURCE_PACKAGE}")
+            AGENTKIT_TEST_RESOURCE_PACKAGE="${agentkit_preview_test_resources}")
     # Native acceptance modes load resources from the executable's staged package.
     set_property(TARGET huxerui_agentkit_preview_tests APPEND PROPERTY HUXERUI_RESOURCE_PACKAGE_INPUTS
             "${HUXERUI_BUILTIN_RESOURCE_PACKAGE}")
@@ -206,7 +243,7 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS)
         target_compile_definitions(huxerui_agentkit_preview_tests PRIVATE
                 AGENTKIT_PREVIEW_BROWSER="${HUXERUI_AGENTKIT_TEST_BROWSER}")
     endif ()
-    target_link_libraries(huxerui_agentkit_preview_tests PRIVATE HuxerUI::AgentKit HuxerUI::testing nlohmann_json::nlohmann_json)
+    target_link_libraries(huxerui_agentkit_preview_tests PRIVATE HuxerUI::testing nlohmann_json::nlohmann_json)
     if (WIN32)
         target_link_libraries(huxerui_agentkit_preview_tests PRIVATE crypt32)
     endif ()
@@ -214,12 +251,14 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS)
     agentkit_preview_link_navigation(huxerui_agentkit_preview_tests)
     include(examples/preview/cmake/MarkdownImages.cmake)
     agentkit_preview_link_markdown_images(huxerui_agentkit_preview_tests)
-    agentkit_preview_link_sqlite(huxerui_agentkit_preview_tests)
+    agentkit_host_use_sqlite_session_store(huxerui_agentkit_preview_tests)
     agentkit_preview_link_archive(huxerui_agentkit_preview_tests)
-    agentkit_preview_link_terminal(huxerui_agentkit_preview_tests)
+    agentkit_host_link_terminal(huxerui_agentkit_preview_tests)
     include(examples/preview/cmake/CodeEditor.cmake)
     agentkit_preview_link_code_editor(huxerui_agentkit_preview_tests)
     add_test(NAME huxerui_agentkit_preview_tests COMMAND huxerui_agentkit_preview_tests)
+    add_test(NAME huxerui_agentkit_localization_tests COMMAND huxerui_agentkit_preview_tests --localization)
+    add_test(NAME huxerui_agentkit_code_turn_activity_tests COMMAND huxerui_agentkit_preview_tests --code-turn-activity)
     if (HUXERUI_AGENTKIT_TEST_BROWSER)
         add_test(NAME huxerui_agentkit_goal_completion_revision_tests COMMAND huxerui_agentkit_preview_tests --goal-completion-revision)
         add_test(NAME huxerui_agentkit_goal_completion_automatic_tests COMMAND huxerui_agentkit_preview_tests --goal-completion-automatic)
@@ -268,36 +307,6 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS)
         add_test(NAME huxerui_agentkit_candidate_recovery_tests COMMAND huxerui_agentkit_preview_tests --candidate-worktree-recovery)
         add_test(NAME huxerui_agentkit_approved_candidate_recovery_tests COMMAND huxerui_agentkit_preview_tests --approved-candidate-recovery)
     endif ()
-
-    add_executable(huxerui_agentkit_sqlite_tests
-            tests/sqlite_store_test.cpp
-            tests/fork_history_test.cpp
-            examples/preview/src/sqlite_store.cpp
-    )
-    target_include_directories(huxerui_agentkit_sqlite_tests PRIVATE examples/preview/src)
-    if (MSVC)
-        target_compile_options(huxerui_agentkit_sqlite_tests PRIVATE /bigobj)
-    endif ()
-    target_link_libraries(huxerui_agentkit_sqlite_tests PRIVATE HuxerUI::AgentKit HuxerUI::testing nlohmann_json::nlohmann_json)
-    agentkit_preview_link_sqlite(huxerui_agentkit_sqlite_tests)
-    add_test(NAME huxerui_agentkit_sqlite_tests COMMAND huxerui_agentkit_sqlite_tests)
-
-    add_executable(huxerui_agentkit_delegation_tests tests/delegation_test.cpp examples/preview/src/sqlite_store.cpp)
-    target_include_directories(huxerui_agentkit_delegation_tests PRIVATE examples/preview/src)
-    target_link_libraries(huxerui_agentkit_delegation_tests PRIVATE HuxerUI::AgentKit HuxerUI::testing nlohmann_json::nlohmann_json)
-    agentkit_preview_link_sqlite(huxerui_agentkit_delegation_tests)
-    add_test(NAME huxerui_agentkit_delegation_tests COMMAND huxerui_agentkit_delegation_tests)
-    set_tests_properties(huxerui_agentkit_delegation_tests PROPERTIES TIMEOUT 45)
-
-    add_executable(huxerui_agentkit_model_tests
-            tests/model_protocol_test.cpp
-            examples/preview/src/sqlite_store.cpp
-    )
-    target_include_directories(huxerui_agentkit_model_tests PRIVATE src examples/preview/src)
-    target_link_libraries(huxerui_agentkit_model_tests PRIVATE
-            HuxerUI::AgentKit HuxerUI::testing nlohmann_json::nlohmann_json)
-    agentkit_preview_link_sqlite(huxerui_agentkit_model_tests)
-    add_test(NAME huxerui_agentkit_model_tests COMMAND huxerui_agentkit_model_tests)
 
     add_executable(huxerui_agentkit_presentation_tests
             tests/presentation_test.cpp

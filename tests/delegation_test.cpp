@@ -1,4 +1,4 @@
-#include "preview_store.h"
+#include "sqlite_session_store.h"
 
 #include <huxerui/agentkit.h>
 #include <huxerui/huxerui.h>
@@ -403,7 +403,7 @@ Task<void> VerifyRetryWithUnknownChildEffect() {
 Task<void> VerifyRecovery(File file, bool model_driven) {
   auto probe = std::make_shared<Probe>();
   probe->ask = true;
-  auto runtime = Register(probe, 1, Take(co_await agentkit_preview::OpenSessionStoreAsync(file)));
+  auto runtime = Register(probe, 1, Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)));
   auto session = Take(co_await Start(runtime, model_driven ? "recover model panel" : "private parent prompt",
       model_driven ? "model-parent" : "parent", SessionRetention::Stored));
   auto waiting = co_await Wait(session, [](const auto& snapshot) { return PendingInteractions(snapshot).size() == 1; });
@@ -413,7 +413,7 @@ Task<void> VerifyRecovery(File file, bool model_driven) {
   Take(co_await runtime->CloseAsync());
   session.reset();
   runtime.reset();
-  runtime = Register(probe, 1, Take(co_await agentkit_preview::OpenSessionStoreAsync(file)));
+  runtime = Register(probe, 1, Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)));
   Take(co_await runtime->StartAsync());
   session = Take(co_await runtime->Sessions().OpenAsync(id));
   auto recovered = co_await Wait(session, [&](const auto& snapshot) {

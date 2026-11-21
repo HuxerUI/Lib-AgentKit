@@ -17,6 +17,7 @@ AgentResult<T> Fail(ErrorCode code, std::string message) {
 }
 
 bool Terminal(RunState state);
+void SetObservedRunState(RunSnapshot& run, RunState state, TimePoint now);
 
 std::optional<AgentError> RestartToolError(std::span<const ToolCallSnapshot> tools, const std::set<RunId>& runs,
                                           bool regenerate = false);

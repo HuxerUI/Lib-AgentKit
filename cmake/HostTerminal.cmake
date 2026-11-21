@@ -1,9 +1,9 @@
-function(agentkit_preview_link_terminal target)
+function(agentkit_host_link_terminal target)
     if (POLICY CMP0168)
         set(CMAKE_POLICY_DEFAULT_CMP0168 NEW)
     endif ()
     get_filename_component(terminal_sibling
-            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../../../../Lib-Terminal" ABSOLUTE)
+            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../../Lib-Terminal" ABSOLUTE)
     if (EXISTS "${terminal_sibling}/CMakeLists.txt")
         huxerui_use_library(${target} TARGET HuxerUI::Terminal PATH "${terminal_sibling}")
     else ()

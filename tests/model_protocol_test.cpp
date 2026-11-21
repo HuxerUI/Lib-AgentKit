@@ -1,6 +1,6 @@
 #include "model_provider_internal.h"
 #include "json_wire.h"
-#include "preview_store.h"
+#include "sqlite_session_store.h"
 
 #include <huxerui/agentkit/runtime.h>
 #include <huxerui/huxerui.h>
@@ -176,13 +176,13 @@ Task<void> ToolProtocol(TaskScope tasks) {
   };
   auto model = Take(kit::detail::MakeChatCompletionsModel(std::move(options), tasks, server.Open()));
   auto request = Request();
-  request.tools = {{{{"preview.confirm"}, 1, {}}, "preview.confirm", "A write",
+  request.tools = {{{{"fixture.confirm"}, 1, {}}, "fixture.confirm", "A write",
                     {kit::JsonValue{kit::JsonValue::Object{{"type", kit::JsonValue{std::string("object")}}}}}},
                    {{{"test.alt"}, 1, {}}, "agentkit_tool_1", "An alternative", {kit::JsonValue{true}}}};
   auto stream = Take(co_await model.provider->StartTurnAsync(request));
   auto events = co_await Collect(*stream);
   Check(events.size() == 10 && std::get<kit::ModelTextDelta>(events.front()).utf8 == utf8 &&
-        std::get<kit::ModelToolStarted>(events[1]).name == "preview.confirm" &&
+        std::get<kit::ModelToolStarted>(events[1]).name == "fixture.confirm" &&
         std::get<kit::ModelToolStarted>(events[2]).provider_call_id == "wire-b" &&
         std::get<kit::ModelFinished>(events.back()).reason == kit::ModelFinishReason::ToolCalls,
         "fragmented SSE yielded assistant text, indexed calls, and tools finish");
@@ -198,7 +198,7 @@ Task<void> ToolProtocol(TaskScope tasks) {
 
   auto value = kit::detail::FromWireJson(Json{{"value", 42}});
   request.items.push_back(kit::ModelContent{kit::ModelContent::Role::Assistant, utf8});
-  request.items.push_back(kit::ModelToolCall{"wire-a", "preview.confirm", value});
+  request.items.push_back(kit::ModelToolCall{"wire-a", "fixture.confirm", value});
   request.items.push_back(kit::ModelToolCall{"wire-b", "agentkit_tool_1", kit::JsonValue{kit::JsonValue::Object{}}});
   request.items.push_back(kit::ModelToolResult{"wire-a", kit::ToolCallId{"local-a"}, value, {}});
   request.items.push_back(kit::ModelToolResult{"wire-b", {}, {}, kit::AgentError{
@@ -336,6 +336,30 @@ std::string ResponseCompleted(Json output, std::string_view id = {}) {
   return ResponseFrame("response.completed", {{"response", std::move(response)}});
 }
 
+Task<void> ResponsesReasoningSummary(TaskScope tasks) {
+  const Json reasoning{{"type", "reasoning"}, {"id", "rs-summary"},
+      {"summary", Json::array({{{"type", "summary_text"}, {"text", "Check the visible evidence first."}}})},
+      {"encrypted_content", "private-continuation"}};
+  Script server;
+  server.reply = [&](const HttpRequest&, const Json& body) {
+    Check(body["reasoning"]["summary"] == "auto", "OpenAI Responses requests the model's public summary");
+    return ResponseItem("added", 0, reasoning) + ResponseItem("added", 1, ResponseMessage("")) +
+        ResponseText("Done", 1) + ResponseCompleted(Json::array({reasoning, ResponseMessage("Done")}));
+  };
+  auto options = ResponsesOptions();
+  options.reasoning_summary = true;
+  auto model = Take(kit::detail::MakeResponsesModel(options, tasks, server.Open()));
+  auto stream = Take(co_await model.provider->StartTurnAsync(Request()));
+  auto events = co_await Collect(*stream);
+  auto summary = std::ranges::find_if(events, [](const auto& event) {
+    return std::holds_alternative<kit::ModelReasoningSummary>(event);
+  });
+  Check(summary != events.end() && std::get<kit::ModelReasoningSummary>(*summary).text == "Check the visible evidence first.",
+      "The display event contains only the explicit public summary");
+  Check(std::get<kit::ModelFinished>(events.back()).resume.has_value(),
+      "Private continuation still goes to the existing resume channel");
+}
+
 Task<void> ResponsesToolProtocol(TaskScope tasks) {
   const std::string display = "\xe5\xae\xa1\xe9\x98\x85";
   const Json reasoning{{"type", "reasoning"}, {"id", "rs_1"}, {"summary", Json::array()},
@@ -387,14 +411,14 @@ Task<void> ResponsesToolProtocol(TaskScope tasks) {
         "Responses registered its actual protocol and default state policy");
   auto request = Request();
   request.allow_server_state = true;
-  request.tools = {{{{"test.confirm"}, 1, {}}, "preview.confirm", "Confirm", {kit::JsonValue{true}}},
+  request.tools = {{{{"test.confirm"}, 1, {}}, "fixture.confirm", "Confirm", {kit::JsonValue{true}}},
       {{{"test.inspect"}, 1, {}}, "agentkit_tool_1", "Inspect", {kit::JsonValue{true}}}};
   AddFixtureSkill(request);
   auto stream = Take(co_await model.provider->StartTurnAsync(request));
   auto events = co_await Collect(*stream);
   Check(std::get<kit::ModelTextDelta>(events.front()).utf8 == display, "UTF-8 fragments decoded");
   Check(std::get<kit::ModelToolStarted>(events[1]).provider_call_id == "call_a" &&
-      std::get<kit::ModelToolStarted>(events[1]).name == "preview.confirm" &&
+      std::get<kit::ModelToolStarted>(events[1]).name == "fixture.confirm" &&
       std::get<kit::ModelToolStarted>(events[2]).provider_call_id == "call_b",
       "output indices preserved call order and mapped names");
   std::string arguments;
@@ -411,7 +435,7 @@ Task<void> ResponsesToolProtocol(TaskScope tasks) {
       "encrypted reasoning is returned as state bound to this provider");
   const auto value = kit::detail::FromWireJson(Json{{"value", 42}});
   request.items.push_back(kit::ModelContent{kit::ModelContent::Role::Assistant, display});
-  request.items.push_back(kit::ModelToolCall{"call_a", "preview.confirm", value});
+  request.items.push_back(kit::ModelToolCall{"call_a", "fixture.confirm", value});
   request.items.push_back(kit::ModelToolCall{"call_b", "agentkit_tool_1", kit::JsonValue{kit::JsonValue::Object{}}});
   request.items.push_back(kit::ModelToolResult{"call_a", {}, value, {}});
   request.items.push_back(kit::ModelToolResult{"call_b", {}, {}, kit::AgentError{
@@ -729,7 +753,7 @@ Task<void> MessagesToolProtocol(TaskScope tasks, kit::MessagesDialect dialect) {
   Check(model.endpoint.protocol == "messages" && model.endpoint.provider == (native ? "anthropic" : "deepseek") &&
       !model.allow_persist_resume_state && !model.allow_server_state, "Messages registered the selected dialect");
   auto request = Request();
-  request.tools = {{{{"test.confirm"}, 1, {}}, "preview.confirm", "Confirm", {kit::JsonValue{true}}},
+  request.tools = {{{{"test.confirm"}, 1, {}}, "fixture.confirm", "Confirm", {kit::JsonValue{true}}},
       {{{"test.inspect"}, 1, {}}, "agentkit_tool_1", "Inspect", {kit::JsonValue{true}}}};
   AddFixtureSkill(request);
   auto opened = Take(co_await model.provider->StartTurnAsync(request));
@@ -753,7 +777,7 @@ Task<void> MessagesToolProtocol(TaskScope tasks, kit::MessagesDialect dialect) {
       "Messages returned private state bound to its model revision");
   const auto value = kit::detail::FromWireJson(Json{{"value", 42}});
   request.items.push_back(kit::ModelContent{kit::ModelContent::Role::Assistant, text});
-  request.items.push_back(kit::ModelToolCall{"toolu_a", "preview.confirm", value});
+  request.items.push_back(kit::ModelToolCall{"toolu_a", "fixture.confirm", value});
   request.items.push_back(kit::ModelToolCall{"toolu_b", "agentkit_tool_1", kit::JsonValue{kit::JsonValue::Object{}}});
   request.items.push_back(kit::ModelToolResult{"toolu_a", {}, value, {}});
   request.items.push_back(kit::ModelToolResult{"toolu_b", {}, {}, kit::AgentError{.code = kit::ErrorCode::PermissionDenied, .message = "Tool denied"}});
@@ -936,7 +960,7 @@ Task<void> InteractionsToolProtocol(TaskScope tasks, bool stateful) {
       "Interactions reflected opt-in model state policy");
   auto request = Request();
   request.allow_server_state = true;
-  request.tools = {{{{"test.confirm"}, 1, {}}, "preview.confirm", "Confirm", {kit::JsonValue{true}}},
+  request.tools = {{{{"test.confirm"}, 1, {}}, "fixture.confirm", "Confirm", {kit::JsonValue{true}}},
       {{{"test.inspect"}, 1, {}}, "agentkit_tool_1", "Inspect", {kit::JsonValue{true}}}};
   AddFixtureSkill(request);
   auto opened = Take(co_await model.provider->StartTurnAsync(request));
@@ -944,7 +968,7 @@ Task<void> InteractionsToolProtocol(TaskScope tasks, bool stateful) {
   Check(std::get<kit::ModelTextDelta>(events[0]).utf8 == visible.substr(0, 3) &&
       std::get<kit::ModelTextDelta>(events[1]).utf8 == visible.substr(3) &&
       std::get<kit::ModelToolStarted>(events[2]).provider_call_id == "int-call-a" &&
-      std::get<kit::ModelToolStarted>(events[2]).name == "preview.confirm" &&
+      std::get<kit::ModelToolStarted>(events[2]).name == "fixture.confirm" &&
       std::get<kit::ModelToolStarted>(events[3]).provider_call_id == "int-call-b",
       "Interactions emitted authorized tools in original step order and hid thought text");
   const auto usage = std::ranges::find_if(events, [](const auto& event) { return std::holds_alternative<kit::ModelUsage>(event); });
@@ -955,7 +979,7 @@ Task<void> InteractionsToolProtocol(TaskScope tasks, bool stateful) {
       "Interactions sealed calls and returned model-specific continuation");
   const auto value = kit::detail::FromWireJson(Json{{"value", 42}});
   request.items.push_back(kit::ModelContent{kit::ModelContent::Role::Assistant, visible});
-  request.items.push_back(kit::ModelToolCall{"int-call-a", "preview.confirm", value});
+  request.items.push_back(kit::ModelToolCall{"int-call-a", "fixture.confirm", value});
   request.items.push_back(kit::ModelToolCall{"int-call-b", "agentkit_tool_1", kit::JsonValue{kit::JsonValue::Object{}}});
   request.items.push_back(kit::ModelToolResult{"int-call-a", {}, value, {}});
   request.items.push_back(kit::ModelToolResult{"int-call-b", {}, {}, kit::AgentError{
@@ -1094,7 +1118,7 @@ Task<void> GeminiToolProtocol(TaskScope tasks) {
       model.endpoint.model == "fixture.8-model" && !model.allow_server_state && !model.allow_persist_resume_state,
       "Gemini registered its normalized model and stateless protocol");
   auto request = Request();
-  request.tools = {{{{"test.inspect"}, 1, {}}, "preview.lookup", "Lookup", {kit::JsonValue{true}}},
+  request.tools = {{{{"test.inspect"}, 1, {}}, "fixture.lookup", "Lookup", {kit::JsonValue{true}}},
       {{{"test.second"}, 1, {}}, "agentkit_tool_1", "Inspect", {kit::JsonValue{true}}}};
   AddFixtureSkill(request);
   auto opened = Take(co_await model.provider->StartTurnAsync(request));
@@ -1102,7 +1126,7 @@ Task<void> GeminiToolProtocol(TaskScope tasks) {
   Check(std::get<kit::ModelTextDelta>(events[0]).utf8 == display, "Gemini exposed only the visible text");
   const auto id_a = std::get<kit::ModelToolStarted>(events[1]);
   const auto id_b = std::get<kit::ModelToolStarted>(events[3]).provider_call_id;
-  Check(id_a.provider_call_id == "gemini-call-a" && id_a.name == "preview.lookup" && !id_b.empty() && id_b != id_a.provider_call_id,
+  Check(id_a.provider_call_id == "gemini-call-a" && id_a.name == "fixture.lookup" && !id_b.empty() && id_b != id_a.provider_call_id,
       "Gemini mapped provider and legacy calls to unique runtime IDs");
   const auto& usage = std::get<kit::ModelUsage>(events[events.size() - 4]).usage;
   Check(usage.input_tokens == 13 && usage.output_tokens == 10 &&
@@ -1114,7 +1138,7 @@ Task<void> GeminiToolProtocol(TaskScope tasks) {
       "Gemini returned signature state bound to the model revision");
   const auto value = kit::detail::FromWireJson(Json{{"value", 42}});
   request.items.push_back(kit::ModelContent{kit::ModelContent::Role::Assistant, display});
-  request.items.push_back(kit::ModelToolCall{id_a.provider_call_id, "preview.lookup", value});
+  request.items.push_back(kit::ModelToolCall{id_a.provider_call_id, "fixture.lookup", value});
   request.items.push_back(kit::ModelToolCall{id_b, "agentkit_tool_1", kit::JsonValue{kit::JsonValue::Object{}}});
   request.items.push_back(kit::ModelToolResult{id_b, {}, {}, kit::AgentError{.code = kit::ErrorCode::PermissionDenied, .message = "Tool denied"}});
   request.items.push_back(kit::ModelToolResult{id_a.provider_call_id, {}, value, {}});
@@ -1360,7 +1384,7 @@ Task<void> ExerciseAgent(TaskScope tasks, kit::ModelRegistration model,
   };
   const auto model_id = model.ref.id;
   std::shared_ptr<kit::SessionStore> store;
-  if (recovery) store = Take(co_await agentkit_preview::OpenSessionStoreAsync(recovery->database));
+  if (recovery) store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(recovery->database));
   if (recovery && recovery->resume) replay->expected = co_await StoredEncryptedReasoning(store);
   auto runtime = Take(kit::AgentRuntime::Create({
       .tasks = tasks,
@@ -1454,6 +1478,54 @@ Task<void> ExerciseAgent(TaskScope tasks, kit::ModelRegistration model,
   }
   watching.Reset();
   require(co_await runtime->CloseAsync());
+}
+
+Task<void> ResponsesSqliteRecovery(TaskScope tasks) {
+  struct DatabaseFixture {
+    std::filesystem::path path;
+
+    ~DatabaseFixture() {
+      std::error_code error;
+      for (const auto* suffix : {"", "-wal", "-shm", "-journal"}) {
+        auto file = path;
+        file += suffix;
+        std::filesystem::remove(file, error);
+      }
+    }
+  } fixture{std::filesystem::temp_directory_path() / ("agentkit-responses-" + kit::NewCommandId().value + ".sqlite3")};
+
+  const File database(fixture.path.u8string());
+  const Json reasoning{{"type", "reasoning"}, {"id", "rs_original"}, {"summary", Json::array()},
+      {"encrypted_content", "encrypted-recovery-fixture"}};
+  for (bool resume : {false, true}) {
+    Script server;
+    auto replay = std::make_shared<LiveResponseReplay>();
+    server.reply = [&](const HttpRequest&, const Json& body) {
+      ++replay->requests;
+      Check(!body.value("store", true) && !body.contains("previous_response_id"), "Responses recovery was not stateless");
+      if (!resume) {
+        const Json call{{"type", "function_call"}, {"id", "fc_original"}, {"call_id", "call_original"},
+            {"name", body.at("tools").at(0).at("name")}, {"arguments", "{}"}, {"status", "completed"}};
+        return ResponseItem("added", 0, reasoning) + ResponseItem("added", 1, call) + ResponseItem("done", 1, call) +
+            ResponseCompleted(Json::array({reasoning, call}));
+      }
+      const auto& input = body.at("input");
+      const auto result = std::ranges::find_if(input, [](const auto& item) {
+        return kit::detail::String(item, "type") == "function_call_output";
+      });
+      Check(replay->expected == Json::array({reasoning}) && std::ranges::count(input, reasoning) == 1 &&
+          result != input.end() && kit::detail::String(*result, "call_id") == "call_original" &&
+          Json::parse(kit::detail::String(*result, "output")) == "host-marker-M7Q2",
+          "Responses did not restore the original reasoning and tool result from SQLite");
+      return ResponseItem("added", 0, ResponseMessage("")) + ResponseText("host-marker-M7Q2") +
+          ResponseCompleted(Json::array({ResponseMessage("host-marker-M7Q2")}));
+    };
+    auto options = ResponsesOptions();
+    options.allow_persist_resume_state = true;
+    auto model = Take(kit::detail::MakeResponsesModel(std::move(options), tasks, server.Open()));
+    co_await ExerciseAgent(tasks, std::move(model), LiveResponseRecovery{database, resume}, replay, false);
+    Check(replay->requests == 1, "Unexpected number of Responses requests across SQLite recovery");
+  }
 }
 
 void ConfiguredProvider(std::optional<LiveResponseRecovery> recovery = {}, bool structured = false) {
@@ -1634,6 +1706,8 @@ int main(int argc, char** argv) {
             co_await StructuredOutput(scope, kit::ChatOutputFormat::JsonObject);
             co_await ErrorsAndCancellation(scope);
             co_await ResponsesToolProtocol(scope);
+            co_await ResponsesReasoningSummary(scope);
+            co_await ResponsesSqliteRecovery(scope);
             co_await CompatibleResponsesProtocol(scope, kit::ResponsesDialect::DeepSeek, false);
             co_await CompatibleResponsesProtocol(scope, kit::ResponsesDialect::GlmCompatible, false);
             co_await CompatibleResponsesProtocol(scope, kit::ResponsesDialect::GlmCompatible, true);

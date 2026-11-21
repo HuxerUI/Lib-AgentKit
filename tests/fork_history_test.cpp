@@ -1,4 +1,4 @@
-#include "preview_store.h"
+#include "sqlite_session_store.h"
 
 #include <huxerui/agentkit.h>
 
@@ -314,7 +314,7 @@ kit::Async<kit::CommandProgress> WaitForCommand(const std::shared_ptr<kit::Agent
 }
 
 huxerui::Task<void> StoreArtifactFork(huxerui::File file, ArtifactForkProbe& probe) {
-  auto runtime = ArtifactForkRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto runtime = ArtifactForkRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(co_await runtime->StartAsync());
   auto created = Take(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
       .options = {.agent = {"fork.author"}, .project = kit::ProjectId{"source"}}, .initial = kit::SendInput{.text = "Sealed source note"}}));
@@ -372,7 +372,7 @@ huxerui::Task<void> StoreArtifactFork(huxerui::File file, ArtifactForkProbe& pro
 }
 
 huxerui::Task<void> StageCardExport(huxerui::File file, ArtifactForkProbe& probe) {
-  auto runtime = ArtifactForkRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto runtime = ArtifactForkRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(co_await runtime->StartAsync());
   auto source = Take(co_await runtime->Sessions().OpenAsync(probe.source));
   auto sent = Take(co_await source->SendAsync(kit::NewCommandId(), {.text = "Export the report chart"}));
@@ -433,7 +433,7 @@ huxerui::Task<void> StageCardExport(huxerui::File file, ArtifactForkProbe& probe
 }
 
 huxerui::Task<void> FinishCardExport(huxerui::File file, ArtifactForkProbe& probe) {
-  auto runtime = ArtifactForkRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto runtime = ArtifactForkRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(co_await runtime->StartAsync());
   auto source = Take(co_await runtime->Sessions().OpenAsync(probe.source));
   auto pending = Take(co_await runtime->Commands().ReadAsync(probe.pending_export));
@@ -470,7 +470,7 @@ huxerui::Task<void> FinishCardExport(huxerui::File file, ArtifactForkProbe& prob
 }
 
 huxerui::Task<void> ReopenArtifactFork(huxerui::File file, ArtifactForkProbe& probe) {
-  auto runtime = ArtifactForkRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto runtime = ArtifactForkRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(co_await runtime->StartAsync());
   auto branch = Take(co_await runtime->Sessions().OpenAsync(probe.branch));
   auto history = Take(co_await runtime->Sessions().ReadHistoryAsync(probe.branch, {}));
@@ -590,7 +590,7 @@ huxerui::Task<void> ReopenArtifactFork(huxerui::File file, ArtifactForkProbe& pr
 huxerui::Task<void> VerifyApprovalAttachment(huxerui::File file, ArtifactForkProbe& probe) {
   probe.deny_artifact = false;
   probe.deny_source = false;
-  auto runtime = ArtifactForkRuntime(Take(co_await agentkit_preview::OpenSessionStoreAsync(file)), probe);
+  auto runtime = ArtifactForkRuntime(Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)), probe);
   Take(co_await runtime->StartAsync());
   const auto create = [&](kit::ProjectId project) {
     return runtime->Sessions().CreateAsync(kit::NewCommandId(), {

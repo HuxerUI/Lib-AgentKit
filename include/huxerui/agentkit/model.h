@@ -263,9 +263,16 @@ struct ModelFinished {
   std::optional<ModelResumeState> resume;
 };
 
+/// @brief User-visible reasoning summary explicitly supplied by the provider.
+/// Adapters only emit text meant for display. Continuation data, signatures and private reasoning remain in ModelResumeState.
+struct ModelReasoningSummary {
+  /// Non-empty UTF-8 text suitable for display in a collapsible activity section.
+  std::string text;
+};
+
 /// @brief Event returned in provider order by a ModelTurnStream.
 using ModelEvent = std::variant<ModelTextDelta, ModelToolStarted, ModelToolArguments,
-    ModelToolFinished, ModelStructuredOutput, ModelUsage, ModelFinished>;
+    ModelToolFinished, ModelStructuredOutput, ModelUsage, ModelFinished, ModelReasoningSummary>;
 
 /// @brief Final output of a host-controlled completion.
 struct ModelReply {

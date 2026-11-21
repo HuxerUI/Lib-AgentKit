@@ -6,6 +6,18 @@
 
 当前实现的调用路径、字段使用和命名评估记录于 [公开接口审计](api-audit.md)。
 
+## 库与参考应用的边界
+
+`HuxerUI::AgentKit` 是通用 Agent App 开发套件。它交付执行引擎、会话与事件契约、协议适配器和可选的默认对话组件。第三方宿主可以只接入运行时并自绘界面，也可以直接使用 `AgentChat`。库的公开 API、构建和默认行为独立于 Preview 的助手、配置及资源。
+
+`examples/preview` 是消费公开 API 的参考应用。应用负责工作台及其主题、导航和设置，注册代码、PPT、设计与通用助手，选择模型与凭据存储、授权范围及本地存储方案。补丁、Git、CTest、PPTX、设计画板和发布协作由 Preview 的工作流、工具及视图实现。其他宿主按自己的业务注册同类扩展。
+
+Run 状态、耗时、工具记录和提供方公开摘要属于会话事件。使用默认对话的宿主可通过 `AgentChatLayoutStyle` 选择布局和活动区，通过 `AgentChatOptions::tool_label` 提供工具显示名，通过 `AgentChatWithSidePane` 把旁聊放在相邻面板。自定义输入控件可以使用 `AgentChatComposerAnchor` 附着浮层。自绘聊天界面的宿主可直接订阅 `Conversation::ObserveEventsAsync`，在无聊天页的业务流程中也可使用相同的 Run 和权限语义。
+
+逐文件差异的视图与具体补丁格式由宿主提供。库通过版本化产物和审批接口提供访问及执行约束。第三方宿主验收检查独立接入，Preview 验收检查参考应用自己的设置、渲染及跨领域流程。
+
+核心测试与原生 Preview 共用 `support/` 中的 SQLite `SessionStore` 实现。会话事务、版本和回执使用相同的表与编码。Preview 单独管理导航和输入偏好。配置 `HUXERUI_AGENTKIT_BUILD_TESTS=ON` 和 `HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS=OFF` 可独立构建模型协议、委派、SQLite 及运行时回归。
+
 ## 阅读顺序
 
 | 接入任务 | 对应章节 |
