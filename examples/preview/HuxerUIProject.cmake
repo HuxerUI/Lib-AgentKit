@@ -8,9 +8,9 @@ if (HUXERUI_PROJECT_PLAN_OUTPUT)
 {
   "schema": 1,
   "kind": "app",
-  "name": "AgentKit Preview",
-  "id": "org.huxerui.lib.agentkit.preview",
-  "target": "example_agent_kit"
+  "name": "GanWork",
+  "id": "org.huxerui.ganwork",
+  "target": "ganwork"
 }
 ]=])
 endif ()

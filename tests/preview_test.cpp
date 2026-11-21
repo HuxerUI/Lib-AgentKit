@@ -240,6 +240,14 @@ void VerifyReportChart(const File& root) {
   }
 }
 
+void ClickPreviewMouse(UiTest& preview, Rect bounds) {
+  const Point position{bounds.x + bounds.width * 0.5F, bounds.y + bounds.height * 0.5F};
+  preview.SendPointer({.type = PointerEventType::Move, .pointer_id = 1, .position = position,
+      .device_kind = PointerDeviceKind::Mouse});
+  preview.Pump(16ms);
+  preview.TapAt(position, {.device_kind = PointerDeviceKind::Mouse});
+}
+
 void TapControl(UiTest& preview, UiSelector selector, const char* label, const char* scroll_key = "ppt-form-scroll",
                 float scroll_step = 95.0F) {
   auto control = preview.Find(selector);
@@ -263,7 +271,7 @@ UiNodeQuery ConversationRow(UiTest& preview, const std::string& title) {
 void FocusPreviewEditor(UiTest& preview, const UiNodeQuery& editor, const char* failure) {
   Wait(preview, [&] {
     if (!editor.Exists() || !editor.One().in_viewport) return false;
-    if (!editor.One().focused || !preview.ActiveTextInput()) editor.Tap({.device_kind = PointerDeviceKind::Mouse});
+    if (!editor.One().focused || !preview.ActiveTextInput()) ClickPreviewMouse(preview, editor.One().visible_bounds);
     return editor.One().focused && preview.ActiveTextInput().has_value();
   }, failure);
 }
@@ -286,35 +294,19 @@ void TapReviewCard(UiTest& preview, const char* label) {
   TapControl(preview, ReviewCard(label), label);
 }
 
-void OpenConversationOptions(UiTest& preview) {
-  const auto panel = preview.Find(UiSelector::Key("conversation-options-panel"));
-  const auto trigger = preview.Find(UiSelector::Key("conversation-options"));
-  for (int attempt = 0; attempt < 2 && !panel.Exists(); ++attempt) {
-    Wait(preview, [&] { return trigger.Exists() && trigger.One().in_viewport && trigger.One().enabled; },
-        "The conversation options trigger was unavailable");
-    trigger.Tap({.device_kind = PointerDeviceKind::Mouse});
-    preview.Pump(250ms);
-  }
-  Wait(preview, [&] { return panel.Exists() && panel.One().in_viewport; }, "The conversation options did not open");
-}
-
 void ChooseDraftAssistant(UiTest& preview, const char* label) {
-  const auto summary = preview.Find(UiSelector::Key("conversation-options-summary"));
-  const auto chosen = [&] {
-    return summary.Exists() && summary.One().text && summary.One().text->starts_with(std::string(label) + " ");
-  };
-  Wait(preview, [&] { return summary.Exists(); }, "The conversation options did not mount");
-  if (chosen()) return;
-  OpenConversationOptions(preview);
-  auto selector = preview.Find(UiSelector::Key("draft-assistant"));
-  Wait(preview, [&] { return selector.Exists() && selector.One().in_viewport; }, "The draft assistant selector did not mount");
-  selector.Tap();
-  auto choice = preview.Find(UiSelector::Text(label));
-  Wait(preview, [&] { return choice.Count() == 1 && choice.One().in_viewport && choice.One().enabled; },
+  const auto selector = preview.Find(UiSelector::Key("draft-assistant"));
+  Wait(preview, [&] { return selector.Exists() && selector.One().enabled && selector.One().in_viewport; },
+      "The draft assistant selector did not mount");
+  const auto chosen = selector.Find(UiSelector::Text(label));
+  if (chosen.Exists()) return;
+  ClickPreviewMouse(preview, selector.One().visible_bounds);
+  const auto item = preview.FindSemantics(UiSemanticSelector::AllOf(
+      UiSemanticSelector::Role(SemanticRole::MenuItem), UiSemanticSelector::Label(label)));
+  Wait(preview, [&] { return item.Exists() && !item.One().offscreen && item.One().enabled; },
       "The draft assistant option did not open");
-  choice.Tap({.device_kind = PointerDeviceKind::Mouse});
-  const auto panel = preview.Find(UiSelector::Key("conversation-options-panel"));
-  Wait(preview, [&] { return chosen() && !panel.Exists() && !choice.Exists(); }, "The draft assistant did not change");
+  ClickPreviewMouse(preview, item.One().bounds);
+  Wait(preview, [&] { return chosen.Exists() && !item.Exists(); }, "The draft assistant did not change");
   preview.Pump(250ms);
 }
 
@@ -375,8 +367,8 @@ void CheckReturnedConclusion(UiTest& preview, const std::string& text) {
 
 void DraftPresentationOutline(UiTest& preview) {
   ChooseDraftAssistant(preview, "PPT");
-  auto prompt = preview.Find(UiSelector::Type<TextField>());
-  prompt.Tap();
+  auto prompt = preview.Find(UiSelector::Key("new-conversation-composer"));
+  FocusPreviewEditor(preview, prompt, "The presentation draft did not receive focus");
   prompt.ReplaceText("Product rollout");
   Wait(preview, [&] { return preview.Find(ButtonText("Send")).One().enabled; }, "PPT conversation is not ready");
   preview.Find(ButtonText("Send")).Tap();
@@ -536,8 +528,8 @@ void VerifyPresentationFailures(const File& root) {
 void StageDesign(const Application& application, const std::filesystem::path& storage) {
   UiTest preview(application, {.viewport = {1080.0F, 880.0F}, .resource_provider = std::make_shared<PreviewTestResources>()});
   ChooseDraftAssistant(preview, "Design");
-  auto draft = preview.Find(UiSelector::Type<TextField>());
-  draft.Tap();
+  auto draft = preview.Find(UiSelector::Key("new-conversation-composer"));
+  FocusPreviewEditor(preview, draft, "The design draft did not receive focus");
   draft.ReplaceText("Settings wireframe");
   auto send = preview.Find(ButtonText("Send"));
   Wait(preview, [&] { return send.One().enabled; }, "design input is not ready");
@@ -1573,7 +1565,7 @@ void VerifyConversationNavigation(const File& root) {
   const auto menu_item = [](UiTest& ui, const char* label) {
     auto item = ui.Find(UiSelector::Text(label));
     Wait(ui, [&] { return item.Count() == 1 && item.One().in_viewport && item.One().enabled; }, label);
-    item.Tap({.device_kind = PointerDeviceKind::Mouse});
+    ClickPreviewMouse(ui, item.One().visible_bounds);
     ui.Pump(250ms);
   };
   const auto save_name = [&](UiTest& ui, const char* value) {
@@ -1596,30 +1588,25 @@ void VerifyConversationNavigation(const File& root) {
     };
     Wait(ui, aligned, "The new conversation heading and composer did not share a column");
     const auto choices = ui.Find(UiSelector::Key("draft-choices"));
-    const auto assistant_choice = ui.Find(UiSelector::Key("conversation-options-summary"));
+    const auto assistant_choice = choices.Find(UiSelector::Key("draft-assistant"));
     const auto has_assistant = [&](std::string_view label) {
-      return assistant_choice.Exists() && assistant_choice.One().text &&
-          assistant_choice.One().text->starts_with(std::string(label) + " ");
+      return assistant_choice.Exists() && assistant_choice.Find(UiSelector::Text(std::string(label))).Exists();
     };
     const auto workspace_choice = choices.Find(UiSelector::Key("draft-workspace"));
-    const auto workspace_path = choices.Find(UiSelector::Key("draft-workspace-path"));
     const auto group_choice = choices.Find(UiSelector::Key("draft-group"));
+    const auto workspace_hint = ui.FindSemantics(UiSemanticSelector::AllOf(
+        UiSemanticSelector::Role(SemanticRole::Button), UiSemanticSelector::Label("Workspace")));
+    const auto has_workspace_path = [&] {
+      return std::ranges::any_of(workspace_hint.All(), [&](const auto& control) { return control.hint == workspace.Path(); });
+    };
     const auto draft_context = [&] {
-      if (!assistant_choice.Exists() || !workspace_choice.Exists() || !group_choice.Exists() || !workspace_path.Exists()) return false;
-      const auto assistant_bounds = assistant_choice.One().bounds;
-      const auto workspace_bounds = workspace_choice.One().bounds;
-      const auto group_bounds = group_choice.One().bounds;
-      const auto path = workspace_path.One().bounds;
-      const auto composer_bounds = compose_box.One().bounds;
+      if (!assistant_choice.Exists() || !workspace_choice.Exists() || !group_choice.Exists()) return false;
       const auto visibility = [&](const auto& item) {
         const auto node = item.One();
-        return node.in_viewport && node.visible_bounds.width >= node.bounds.width - 1.0F;
+        return node.in_viewport && node.visible_bounds.width >= node.bounds.width - 1.0F &&
+            node.bounds.y + node.bounds.height <= compose_box.One().bounds.y;
       };
-      return path.y + path.height <= composer_bounds.y &&
-          assistant_bounds.y >= composer_bounds.y &&
-          std::abs(path.x - composer_bounds.x) < 1.0F &&
-          workspace_bounds.y + workspace_bounds.height <= path.y && group_bounds.y + group_bounds.height <= path.y &&
-          visibility(assistant_choice) && visibility(workspace_choice) && visibility(group_choice) && visibility(workspace_path);
+      return visibility(assistant_choice) && visibility(workspace_choice) && visibility(group_choice);
     };
     Wait(ui, [&] { return draft_context() && has_assistant("General"); },
         "The draft context controls did not fit above the composer");
@@ -1632,16 +1619,16 @@ void VerifyConversationNavigation(const File& root) {
         workspace_choice.Find(UiSelector::Text("workspace")).Exists(); }, "The startup workspace selection did not return at desktop width");
     const auto draft_input = ui.Find(UiSelector::Key("new-conversation-composer"));
     const auto permissions = ui.Find(UiSelector::Key("run-permissions"));
-    const auto permission_summary = ui.Find(UiSelector::Key("run-permission-summary"));
+    const auto permission_summary = ui.FindSemantics(UiSemanticSelector::AllOf(
+        UiSemanticSelector::Role(SemanticRole::Button), UiSemanticSelector::Label("Permissions")));
     const auto workspace_row = ui.Find(UiSelector::Key("workspace-new/" + workspace_id->value));
     constexpr auto workspace_text = "Keep the workspace draft";
     ChooseDraftAssistant(ui, "PPT");
-    OpenConversationOptions(ui);
     Wait(ui, [&] { return permissions.Exists() && permissions.One().in_viewport; }, "The draft permissions did not mount");
-    permissions.Tap({.device_kind = PointerDeviceKind::Mouse});
+    ClickPreviewMouse(ui, permissions.One().visible_bounds);
     menu_item(ui, "Auto Review");
-    Wait(ui, [&] { return !permissions.Exists() && permission_summary.Exists() &&
-        permission_summary.One().text == "Auto Review"; }, "The workspace permissions were not applied");
+    Wait(ui, [&] { return permission_summary.Exists() &&
+        permission_summary.One().value == "Auto Review"; }, "The workspace permissions were not applied");
     FocusPreviewEditor(ui, draft_input, "The workspace draft did not receive focus");
     draft_input.ReplaceText(workspace_text);
 
@@ -1652,21 +1639,21 @@ void VerifyConversationNavigation(const File& root) {
       static_cast<void>(root.Child("draft-workspace-menu.snapshot").WriteString(ui.CaptureSnapshot().ToString()));
       throw;
     }
-    Wait(ui, [&] { return workspace_choice.Find(UiSelector::Text("No workspace")).Exists() && !workspace_path.Exists() &&
+    Wait(ui, [&] { return workspace_choice.Find(UiSelector::Text("No workspace")).Exists() && !has_workspace_path() &&
         draft_input.One().value == "" && has_assistant("General") &&
-        permission_summary.Exists() && permission_summary.One().text == "Ask"; },
+        permission_summary.Exists() && permission_summary.One().value == "Ask"; },
         "The standalone draft inherited the workspace text or settings");
     constexpr auto standalone_title = "Standalone navigation check";
     FocusPreviewEditor(ui, draft_input, "The standalone draft did not receive focus");
     draft_input.ReplaceText(standalone_title);
     workspace_row.Tap();
-    Wait(ui, [&] { return workspace_path.Exists() && draft_input.One().value == workspace_text &&
-        has_assistant("PPT") && permission_summary.Exists() && permission_summary.One().text == "Auto Review"; },
+    Wait(ui, [&] { return has_workspace_path() && draft_input.One().value == workspace_text &&
+        has_assistant("PPT") && permission_summary.Exists() && permission_summary.One().value == "Auto Review"; },
         "The workspace did not recover its text, assistant and permissions");
     workspace_choice.Tap({.device_kind = PointerDeviceKind::Mouse});
     menu_item(ui, "No workspace");
     Wait(ui, [&] { return draft_input.One().value == standalone_title &&
-        has_assistant("General") && permission_summary.Exists() && permission_summary.One().text == "Ask"; },
+        has_assistant("General") && permission_summary.Exists() && permission_summary.One().value == "Ask"; },
         "Returning to the standalone draft lost its text or settings");
     FocusPreviewEditor(ui, draft_input, "The restored standalone draft did not receive focus");
     creation->paused = true;
@@ -1678,7 +1665,7 @@ void VerifyConversationNavigation(const File& root) {
       throw;
     }
     workspace_row.Tap();
-    Wait(ui, [&] { return workspace_path.Exists() && draft_input.One().value == workspace_text; },
+    Wait(ui, [&] { return has_workspace_path() && draft_input.One().value == workspace_text; },
         "A pending create blocked switching drafts");
     creation->paused = false;
     kit::SessionId standalone;
@@ -1697,7 +1684,7 @@ void VerifyConversationNavigation(const File& root) {
     Wait(ui, [&] { return ShowsText(ui, "Received: Standalone navigation check"); }, "The created standalone conversation could not be opened");
     workspace_row.Tap();
     Wait(ui, [&] { return workspace_choice.Find(UiSelector::Text("workspace")).Exists() &&
-        workspace_path.Exists() && draft_input.Exists() && draft_input.One().value == workspace_text &&
+        has_workspace_path() && draft_input.Exists() && draft_input.One().value == workspace_text &&
         draft_input.One().focused && ui.ActiveTextInput().has_value(); },
         "Opening a listed folder did not restore the saved draft and focus");
     for (const auto* name : {"Plans", "Release"}) {
@@ -2225,7 +2212,7 @@ constexpr auto MarkdownFirstDelta = "## Streamed heading\r\n\r\nThe model is str
 constexpr auto MarkdownReportUrl = "https://example.test/report?part=2#verified";
 constexpr auto MarkdownSelectionWord = "\xe6\x96\xb9\xe6\xa1\x88\xf0\x9f\x98\x80";
 constexpr auto MarkdownSecondDelta = " another delta\n\n**\xe6\x96\xb9\xe6\xa1\x88\xf0\x9f\x98\x80** "
-    "[\xe6\x96\xb9\xe6\xa1\x88\xf0\x9f\x98\x80](https://example.test/unselected) &amp;\n\n```text\nrun ok\n```\n\n"
+    "[\xe6\x96\xb9\xe6\xa1\x88\xf0\x9f\x98\x80](https://example.test/unselected) &amp;\n\n```cpp\nconst int ready = 1;\n```\n\n"
     "| Check | Result |\n| --- | --- |\n| Render | Pass |\n\n"
     "[Verification report](https://example.test/report?part=2#verified)\n\n[Local path](file:///report.txt)\n";
 
@@ -2327,26 +2314,25 @@ void VerifyComposerIme(const File& root) {
   Wait(ui, [&] { return first.Exists(); }, "New conversation composer did not mount");
   ui.SetWindowMetrics({.viewport = {520.0F, 650.0F}});
   Wait(ui, [&] { return ui.Find(UiSelector::Key("open-navigation")).Exists(); }, "The compact layout did not mount");
-  const auto popup = ui.Find(UiSelector::Key("conversation-options-panel"));
-  const auto check_anchor = [&](const char* key) {
-    OpenConversationOptions(ui);
-    const auto anchor = ui.Find(UiSelector::Key(key)).One().bounds;
-    const auto panel = popup.One().bounds;
-    if (panel.y + panel.height > anchor.y + 1.0F)
-      throw std::runtime_error("Conversation options overlap the composer");
-    if (std::string_view(key) == "new-draft-composer") {
-      const auto assistant = ui.Find(UiSelector::Key("draft-assistant")).One().bounds;
-      const auto model = ui.Find(UiSelector::Key("run-model")).One().bounds;
-      const auto permissions = ui.Find(UiSelector::Key("run-permissions")).One().bounds;
-      if (std::abs(assistant.x - model.x) > 1.0F || std::abs(assistant.x - permissions.x) > 1.0F ||
-          std::abs(assistant.width - model.width) > 1.0F || std::abs(assistant.width - permissions.width) > 1.0F)
-        throw std::runtime_error("The Assistant, Model and Permissions fields did not align");
-    }
-    ui.PressKey(Key::Escape);
-    Wait(ui, [&] { return !popup.Exists(); }, "Escape did not dismiss the conversation options");
+  const auto menu_items = [&](const char* label) {
+    return ui.FindSemantics(UiSemanticSelector::AllOf(
+        UiSemanticSelector::Role(SemanticRole::MenuItem), UiSemanticSelector::Label(label)));
   };
-  check_anchor("new-draft-composer");
-  first.Tap();
+  const auto check_anchor = [&](const char* key, const char* item_label) {
+    const auto trigger = ui.Find(UiSelector::Key(key));
+    Wait(ui, [&] { return trigger.Exists() && trigger.One().in_viewport; }, "The composer setting did not mount");
+    ClickPreviewMouse(ui, trigger.One().visible_bounds);
+    const auto item = menu_items(item_label);
+    Wait(ui, [&] { return item.Exists() && !item.One().offscreen; }, item_label);
+    if (item.One().bounds.y >= trigger.One().bounds.y)
+      throw std::runtime_error("The setting menu did not open above its control");
+    ui.PressKey(Key::Escape);
+    Wait(ui, [&] { return !item.Exists(); }, "Escape did not dismiss the setting menu");
+    ui.Pump(250ms);
+  };
+  check_anchor("run-model", "Local demo model");
+  check_anchor("run-permissions", "Auto Review");
+  FocusPreviewEditor(ui, first, "The first composer did not receive focus");
   first.ReplaceText("Stream review");
   ui.PressKey(Key::Enter);
   if (first.One().value != "Stream review\n") throw std::runtime_error("Enter did not insert a new line");
@@ -2359,14 +2345,14 @@ void VerifyComposerIme(const File& root) {
   Wait(ui, [&] { return composer.Exists() && stop.Exists() && send_mode.Exists() && ShowsText(ui, "The model is streaming"); },
        "The first model delta did not appear");
   const auto original_send = send.One().bounds;
-  const auto options = ui.Find(UiSelector::Key("conversation-options"));
+  const auto options = ui.Find(UiSelector::Key("run-model"));
   const auto original_options = options.One().bounds;
   const auto same_box = [](Rect left, Rect right) {
     return std::abs(left.x - right.x) < 1.0F && std::abs(left.y - right.y) < 1.0F &&
         std::abs(left.width - right.width) < 1.0F && std::abs(left.height - right.height) < 1.0F;
   };
   const auto mode = [&](const char* label, const char* send_label) {
-    send_mode.Tap({.device_kind = PointerDeviceKind::Mouse});
+    ClickPreviewMouse(ui, send_mode.One().visible_bounds);
     auto item = ui.Find(UiSelector::Text(label));
     Wait(ui, [&] { return item.Exists() && item.One().in_viewport && item.One().enabled; }, "Send mode did not open");
     item.Tap({.device_kind = PointerDeviceKind::Mouse});
@@ -2377,9 +2363,9 @@ void VerifyComposerIme(const File& root) {
   };
   mode("Queue", "Queue message");
   mode("Send now", "Send");
-  composer.Tap();
+  FocusPreviewEditor(ui, composer, "The running composer did not receive focus");
   composer.ReplaceText("One\nTwo\nThree\nFour");
-  check_anchor("agent-chat-composer");
+  check_anchor("run-model", "Local demo model");
   if (!ShowsText(ui, "Streamed heading") || ShowsText(ui, MarkdownFirstDelta) ||
       ui.Find(UiSelector::Key("markdown-source-toggle")).Exists()) {
     throw std::runtime_error("The unfinished reply did not render its heading or exposed source selection");
@@ -2387,7 +2373,7 @@ void VerifyComposerIme(const File& root) {
   if (ShowsText(ui, R"({"internal":"route"})"))
     throw std::runtime_error("A model payload marked for the host appeared in the conversation");
 
-  composer.Tap();
+  FocusPreviewEditor(ui, composer, "The composer did not recover focus after closing the menu");
   composer.ReplaceText(prefix + "B");
   composer.SetSelection({3, 3});
   edit({.kind = TextInputCommandKind::UpdateComposition, .selection_after = TextSelection{5, 4}, .text = "ni"});
@@ -2424,7 +2410,7 @@ void VerifyComposerIme(const File& root) {
   send.Tap();
   Wait(ui, [&] { return ShowsText(ui, prefix + chinese + "B") && composer.One().value == ""; },
        "Sending did not publish or clear the committed Chinese draft");
-  const auto title = ui.Find(UiSelector::Key("agent-chat-title"));
+  const auto title = ui.Find(UiSelector::Key("agent-chat-heading"));
   const auto history = ui.Find(UiSelector::Key("agent-chat-history"));
   const auto box = ui.Find(UiSelector::Key("agent-chat-composer"));
   const auto area = ui.Find(UiSelector::Key("preview-content"));
@@ -2542,6 +2528,10 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
   auto paragraph = ui.Find(UiSelector::Key("agent-chat-history")).Find(UiSelector::Text(rendered));
   Wait(ui, [&] { return paragraph.Count() == 1 && paragraph.One().in_viewport && report.Exists(); },
       "The completed formatted reply did not render");
+  const auto code = ui.Find(UiSelector::Key("markdown-code-block"));
+  Wait(ui, [&] { return code.Exists() && code.Find(UiSelector::Text("C++")).Exists() &&
+      code.Find(UiSelector::Key("markdown-copy-code")).Exists(); },
+      "The readonly code block did not show its language and copy action");
   auto remove = ui.Find(ButtonText("Remove quote"));
   if (verify_images) {
     Wait(ui, [&] {
@@ -2725,7 +2715,7 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
     extended.push_back({message, {}, kit::SourceTextRange{block, start, start + text.size()}});
     model_passages.emplace_back(text);
   };
-  for (const auto* part : {"run ok\n", "Check", "Result", "Render", "Pass", "Verification report", "Local path"})
+  for (const auto* part : {"const int ready = 1;\n", "Check", "Result", "Render", "Pass", "Verification report", "Local path"})
     add_source(link.message, link.block, part);
   if (verify_images) {
     for (const auto* part : {"Delayed diagram", "Missing diagram", "Damaged diagram", "Local diagram", "Before ",
@@ -2737,7 +2727,7 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
   add_source(last.ref, last_block.id, "Streamed heading");
   add_source(last.ref, last_block.id, later_prefix);
   for (auto& part : model_passages) part.insert(0, "Selected passage:\n");
-  auto earlier_excerpt = excerpt + "\nrun ok\n\nCheck\nResult\nRender\nPass\nVerification report\nLocal path";
+  auto earlier_excerpt = excerpt + "\nconst int ready = 1;\n\nCheck\nResult\nRender\nPass\nVerification report\nLocal path";
   if (verify_images) earlier_excerpt +=
       "\nDelayed diagram\nMissing diagram\nDamaged diagram\nLocal diagram\nBefore Inline icon after.\nFollowing text";
   const auto later_excerpt = "Streamed heading\n" + later_prefix;
@@ -3383,21 +3373,17 @@ void VerifyPreviewRunSettings(const File& root) {
       root.Child("sessions.sqlite3"), workspace, models, [clock] { return *clock; }, start)}}};
   UiTest preview(application, {.viewport = {1100.0F, 940.0F},
       .resource_provider = std::make_shared<PreviewTestResources>()});
-  Wait(preview, [&] { return runtime && preview.Find(UiSelector::Key("conversation-options")).Exists(); }, "Run settings did not mount");
+  Wait(preview, [&] { return runtime && preview.Find(UiSelector::Key("run-model")).Exists(); }, "Run settings did not mount");
   const auto choose = [&preview](const char* key, const char* label) {
-    const bool in_panel = std::string_view(key) != "send-mode";
-    if (in_panel) OpenConversationOptions(preview);
     auto trigger = preview.Find(UiSelector::Key(key));
     Wait(preview, [&] { return trigger.Exists() && trigger.One().in_viewport; }, "Settings control did not mount");
-    trigger.Tap({.device_kind = PointerDeviceKind::Mouse});
-    auto item = preview.Find(UiSelector::Text(label));
-    Wait(preview, [&] { return item.Exists() && item.One().enabled; }, "Settings menu item is unavailable");
-    item.Tap({.device_kind = PointerDeviceKind::Mouse});
-    if (in_panel) {
-      Wait(preview, [&] { return !preview.FindSemantics(UiSemanticSelector::Role(SemanticRole::MenuItem)).Exists() &&
-          !preview.Find(UiSelector::Key("conversation-options-panel")).Exists(); },
-          "Selecting an option did not close the conversation options");
-    }
+    ClickPreviewMouse(preview, trigger.One().visible_bounds);
+    auto item = preview.FindSemantics(UiSemanticSelector::AllOf(
+        UiSemanticSelector::Role(SemanticRole::MenuItem), UiSemanticSelector::Label(label)));
+    Wait(preview, [&] { return item.Exists() && item.One().enabled && !item.One().offscreen; }, label);
+    item.PerformSemanticAction({SemanticActionKind::Activate, {}});
+    Wait(preview, [&] { return !preview.FindSemantics(UiSemanticSelector::Role(SemanticRole::MenuItem)).Exists(); },
+        "Selecting an option did not close the setting menu");
     preview.Pump(250ms);
   };
   const auto grant = [&] {
@@ -3432,13 +3418,8 @@ void VerifyPreviewRunSettings(const File& root) {
 
   choose("run-model", "Model B  \xc2\xb7  test / script");
   choose("run-permissions", "Auto Review");
-  OpenConversationOptions(preview);
   Wait(preview, [&] { return ShowsText(preview, "This run  \xc2\xb7  Model A  \xc2\xb7  test / script  \xc2\xb7  Ask"); },
        "Changing future settings changed the active binding");
-  preview.PressKey(Key::Escape);
-  Wait(preview, [&] { return !preview.Find(UiSelector::Key("conversation-options-panel")).Exists(); },
-      "Escape did not dismiss the conversation options");
-  preview.Pump(250ms);
   enter("Keep the current file scope", "Send");
   Wait(preview, [&] { return ShowsText(preview, "Waiting to apply"); }, "Direct supplement was not accepted by the active run");
   choose("send-mode", "Queue");
@@ -3587,9 +3568,12 @@ void VerifyRunSettingsReload(const File& root) {
   Wait(preview, [&] { return conversation.Exists(); }, "The persisted code conversation was not available");
   conversation.Tap();
   Wait(preview, [&] {
-    const auto options = preview.Find(UiSelector::Key("conversation-options-summary"));
-    return options.Exists() && options.One().text.value_or("").find("Model B") != std::string::npos &&
-           preview.Find(UiSelector::AllOf(UiSelector::Key("run-permission-summary"), UiSelector::Text("Auto Review"))).Exists();
+    const auto options = preview.FindSemantics(UiSemanticSelector::AllOf(
+        UiSemanticSelector::Role(SemanticRole::Button), UiSemanticSelector::Label("Model")));
+    const auto permission = preview.FindSemantics(UiSemanticSelector::AllOf(
+        UiSemanticSelector::Role(SemanticRole::Button), UiSemanticSelector::Label("Permissions")));
+    return options.Exists() && options.One().value.find("Model B") != std::string::npos &&
+           permission.Exists() && permission.One().value == "Auto Review";
   }, "Reopening used a default or the last run binding instead of the saved preferences");
   preview.Find(ButtonText("Edit queued input")).Tap();
   Wait(preview, [&] { return ShowsText(preview, "Queued reference\nConfiguration"); }, "The rejected quote was lost after reopen");
@@ -4328,8 +4312,8 @@ void VerifyForkReview(const File& directory, PublicationInterruption scenario = 
     UiTest ui(app, {.viewport = {1080.0F, 900.0F}, .resource_provider = std::make_shared<PreviewTestResources>()});
     Wait(ui, [&] { return runtime && tasks; }, "Comparison workspace did not start");
     ChooseDraftAssistant(ui, "Design");
-    auto composer = ui.Find(UiSelector::Type<TextField>());
-    composer.Tap();
+    auto composer = ui.Find(UiSelector::Key("new-conversation-composer"));
+    FocusPreviewEditor(ui, composer, "The comparison draft did not receive focus");
     composer.ReplaceText(title);
     TapFormButton(ui, "Send");
     TapFormButton(ui, "Review design");
@@ -4385,7 +4369,7 @@ void VerifyForkReview(const File& directory, PublicationInterruption scenario = 
         static_cast<void>(directory.Child("comparison-field.snapshot").WriteString(ui.CaptureSnapshot().ToString()));
         throw std::runtime_error("The comparison field did not mount: " + std::string(key) + " for " + value);
       }
-      input.Tap();
+      FocusPreviewEditor(ui, input, key);
       input.ReplaceText(value);
     };
     const auto start = [&](const char* criteria, const char* first, const char* second) {
@@ -4432,7 +4416,7 @@ void VerifyForkReview(const File& directory, PublicationInterruption scenario = 
     };
 
     auto source_draft = ui.Find(UiSelector::Key("composer"));
-    source_draft.Tap();
+    FocusPreviewEditor(ui, source_draft, "The comparison source draft did not receive focus");
     source_draft.ReplaceText("Keep the comparison source draft");
     TapFormButton(ui, "Compare alternatives");
     auto powerpoint = ui.Find(UiSelector::Text("PowerPoint"));
@@ -4479,7 +4463,11 @@ void VerifyForkReview(const File& directory, PublicationInterruption scenario = 
     TapFormButton(ui, "Compare alternatives");
     side_by_side(decks);
     TapFormButton(ui, "All comparisons");
-    TapFormButton(ui, "New comparison");
+    auto new_comparison = ui.FindSemantics(UiSemanticSelector::AllOf(
+        UiSemanticSelector::Role(SemanticRole::Button), UiSemanticSelector::Label("Compare two approaches")));
+    Wait(ui, [&] { return new_comparison.Count() == 1 && !new_comparison.One().offscreen && new_comparison.One().enabled; },
+        "The comparison entry did not mount");
+    new_comparison.PerformSemanticAction({SemanticActionKind::Activate, {}});
     const auto boards = start(design_criteria, "Compact navigation", "Spacious navigation");
     for (const auto& candidate : boards.candidates) {
       open_branch(candidate);
@@ -4539,8 +4527,8 @@ void VerifyForkReview(const File& directory, PublicationInterruption scenario = 
 
     ui.Find(UiSelector::Key("new-conversation")).Tap();
     ChooseDraftAssistant(ui, "PPT");
-    composer = ui.Find(UiSelector::Type<TextField>());
-    composer.Tap();
+    composer = ui.Find(UiSelector::Key("new-conversation-composer"));
+    FocusPreviewEditor(ui, composer, "The presentation comparison draft did not receive focus");
     composer.ReplaceText(deck_title);
     TapFormButton(ui, "Send");
     TapFormButton(ui, "Draft outline");
@@ -4550,7 +4538,7 @@ void VerifyForkReview(const File& directory, PublicationInterruption scenario = 
     Wait(ui, [&] { return name.Exists(); }, "The target deck did not stage");
     if (!name.One().in_viewport)
       name = ui.Find(UiSelector::Key("ppt-form-scroll")).ScrollUntil(UiSelector::Key("ppt-file_name"), {.step = {0.0F, 94.0F}});
-    name.Tap();
+    FocusPreviewEditor(ui, name, "The presentation export name did not receive focus");
     name.ReplaceText("OriginalDeck.pptx");
     TapFormButton(ui, "Review export");
     Wait(ui, [&] { return ShowsText(ui, "Export PowerPoint"); }, "The original deck export was not prepared");
@@ -4865,7 +4853,7 @@ void VerifyCandidateWorktreeRecovery(const File& directory, bool requires_approv
       if (!error.empty()) throw std::runtime_error(error);
       return;
     }
-    TapFormButton(ui, "New comparison");
+    TapFormButton(ui, "Compare two approaches");
     review(ui, canceled_criteria, unused_title, blocked_title);
     const auto occupied = plan_named(blocked_title);
     if (!occupied.path.CreateDirectories()) throw std::runtime_error("Could not create the occupied checkout fixture");
@@ -5877,10 +5865,9 @@ void VerifyCodeEditorBaseline(const File& directory, EditorBaselineCase scenario
   } else {
     ChooseDraftAssistant(preview, "Code");
     if (scenario == EditorBaselineCase::FullAccess) {
-      OpenConversationOptions(preview);
       auto permissions = preview.Find(UiSelector::Key("run-permissions"));
       Wait(preview, [&] { return permissions.Exists() && permissions.One().in_viewport; }, "Code permission control did not mount");
-      permissions.Tap();
+      ClickPreviewMouse(preview, permissions.One().visible_bounds);
       auto full_access = preview.Find(UiSelector::Text("Full Access"));
       Wait(preview, [&] { return full_access.Exists() && full_access.One().enabled; }, "Full Access was unavailable");
       full_access.Tap();
@@ -6454,7 +6441,10 @@ void VerifyReleaseCompletionRevision(const File& root, bool complete_automatical
       Wait(preview, [&] { return card.Exists(); }, "The completed presentation did not reopen for review");
       if (!card.One().in_viewport)
         card = preview.Find(UiSelector::Key("agent-chat-history")).ScrollUntil(review, {.step = {0.0F, -95.0F}});
-      card.Tap();
+      auto review_button = preview.FindSemantics(UiSemanticSelector::Identifier(screenshot_review_key));
+      Wait(preview, [&] { return review_button.Count() == 1 && !review_button.One().offscreen; },
+          "The completed presentation review was not actionable");
+      review_button.PerformSemanticAction({SemanticActionKind::Activate, {}});
       auto picture = preview.Find(ButtonText("Select implementation screenshot"));
       Wait(preview, [&] { return ShowsText(preview, "1 / 5"); }, "The selected review did not open the approved five-slide deck");
       if (picture.Exists()) throw std::runtime_error("The screenshot appeared on the wrong page");
@@ -6534,7 +6524,7 @@ void VerifyLiveCodeTurnActivity(const File& root) {
     app.Quit();
   };
   const Application application{App, {
-      .window = {.title = "AgentKit Preview Live Acceptance"},
+      .window = {.title = "GanWork Live Acceptance"},
       .application_hooks = {MakeConfiguredPreviewTestInstaller(root.Child("sessions.sqlite3"), workspace,
           File(AGENTKIT_PREVIEW_CTEST), std::move(drive))}}};
   static_cast<void>(RunApplication());
@@ -7720,9 +7710,10 @@ void VerifyLiveSettings(const File& root, const std::string& url, const std::str
   {
     const Application application{App, {.application_hooks = {MakePreviewInstaller(database, true)}}};
     UiTest ui(application, {.viewport = {1080.0F, 960.0F}, .resource_provider = std::make_shared<PreviewTestResources>()});
-    auto picker = ui.Find(UiSelector::Key("conversation-options-summary"));
+    auto picker = ui.FindSemantics(UiSemanticSelector::AllOf(
+        UiSemanticSelector::Role(SemanticRole::Button), UiSemanticSelector::Label("Model")));
     Wait(ui, [&] { return picker.Exists(); }, "Conversation options did not mount after restart");
-    if (picker.One().text.value_or("").find(model) == std::string::npos) {
+    if (picker.One().value.find(model) == std::string::npos) {
       throw std::runtime_error("The daily model was not selected after restart");
     }
     const auto heading = ui.Find(UiSelector::Key("new-conversation-heading"));
@@ -7752,10 +7743,9 @@ void VerifyLiveSettings(const File& root, const std::string& url, const std::str
     TapControl(ui, UiSelector::Key("Check Markdown references"), "Draft starter");
     if (ui.Find(UiSelector::Key("new-conversation-composer")).One().value.value_or("").find("UTF-8") == std::string::npos)
       throw std::runtime_error("The draft starter did not prefill the composer");
-    OpenConversationOptions(ui);
     if (!ui.Find(UiSelector::Key("run-model")).Exists() || !ui.Find(UiSelector::Key("run-permissions")).Exists() ||
         !ui.Find(UiSelector::Key("draft-assistant")).Exists()) {
-      throw std::runtime_error("The draft controls were missing from the single conversation options surface");
+      throw std::runtime_error("The draft controls were not available directly");
     }
   }
   const auto expected_model = saved.at("daily_model").at("id").get<std::string>();
@@ -8399,7 +8389,7 @@ int main(int argc, char** argv) {
       };
     }
     const Application application{App, {
-        .window = {.title = "AgentKit Preview Live Acceptance"},
+        .window = {.title = "GanWork Live Acceptance"},
         .application_hooks = {MakeConfiguredPreviewTestInstaller(data.Child("sessions.sqlite3"), workspace,
             File(AGENTKIT_PREVIEW_CTEST), std::move(drive))}}};
     const auto exit = RunApplication();

@@ -1,4 +1,4 @@
-# AgentKit Preview 文档索引
+# GanWork 文档索引
 
 产品交互与验收见 [总体设计](design.md#preview-应用)，接口、状态与失败行为见 [API 设计](api-design.md)。
 

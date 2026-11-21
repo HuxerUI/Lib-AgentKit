@@ -47,12 +47,12 @@ android {
         buildConfig = true
     }
 
-    namespace = "org.huxerui.lib.agentkit.preview"
+    namespace = "org.huxerui.ganwork"
     compileSdk = huxeruiCompileSdk
     ndkVersion = huxeruiNdkVersion
 
     defaultConfig {
-        applicationId = "org.huxerui.lib.agentkit.preview"
+        applicationId = "org.huxerui.ganwork"
         minSdk = huxeruiMinSdk
         targetSdk = huxeruiTargetSdk
         versionCode = 1

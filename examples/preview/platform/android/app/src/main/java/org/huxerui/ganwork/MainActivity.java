@@ -1,4 +1,4 @@
-package org.huxerui.lib.agentkit.preview;
+package org.huxerui.ganwork;
 
 import org.huxerui.HuxerUIActivity;
 

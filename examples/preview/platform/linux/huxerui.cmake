@@ -26,8 +26,8 @@ function(huxerui_configure_linux_project_package target_name install_component)
             COMPONENT "${install_component}"
     )
     install(FILES
-            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/package/example_agent_kit.desktop"
-            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/package/example_agent_kit.svg"
+            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/package/ganwork.desktop"
+            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/package/ganwork.svg"
             DESTINATION .
             COMPONENT "${install_component}"
     )

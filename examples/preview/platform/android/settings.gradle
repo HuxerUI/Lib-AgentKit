@@ -38,7 +38,7 @@ dependencyResolutionManagement {
 gradle.ext.huxeruiHome = huxeruiHome
 gradle.ext.huxeruiUsesSource = huxeruiUsesSource
 gradle.ext.huxeruiAndroidArchive = huxeruiArchive
-rootProject.name = "AgentKit Preview"
+rootProject.name = "GanWork"
 if (huxeruiUsesSource) {
     include(":HuxerUI")
     project(":HuxerUI").projectDir = huxeruiLibrary

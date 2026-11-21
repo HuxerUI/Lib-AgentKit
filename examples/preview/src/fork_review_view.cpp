@@ -245,6 +245,7 @@ View NewComparison(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_ptr<k
   const auto field_style = PreviewFormFieldStyle(UseEnvironment<TextFieldStyle>(), colors);
   std::vector<View> content{
       Text(::app::strings::ui_new_comparison, TextRole::Title),
+      Text(::app::strings::ui_comparison_explainer).With(Foreground(colors.on_surface_variant)),
       SegmentedButton(std::move(domains), domain.Get()).OnChanged([domain, keep_form](std::size_t value) {
           domain = value;
           keep_form();

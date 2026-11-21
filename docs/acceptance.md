@@ -64,7 +64,7 @@ Windows 从 520×680 逻辑像素的原生窄窗实际操作代码、PPT 和设�
 
 在同一原生窄窗的消息输入框用 Windows 简体中文拼音输入法键入 `ni`，观察实际候选窗和组字期间禁用的发送按钮。空格确认候选「你」后才可发送，核对同名会话、单条原消息与本地模型回复。模型流式更新时的中文组字与选区由 IME 专项验证。
 
-复跑可先用 `huxerui_agentkit_preview_tests --native-review-approval <新验收目录>` 生成数据库、工作区及三类产物，再并排准备同名的验收可执行文件和 `.resources` 目录。资源目录使用 Windows SDK 消费构建生成的 `example_agent_kit.resources`。启动验收可执行文件时传入 `--native-preview-compact <sessions.sqlite3> <workspace>`，第二个路径用于加载与原验收一致的本地代码模型夹具。只传数据库可用来验收缺少原 Agent 修订的路径。
+复跑可先用 `huxerui_agentkit_preview_tests --native-review-approval <新验收目录>` 生成数据库、工作区及三类产物，再并排准备同名的验收可执行文件和 `.resources` 目录。资源目录使用 Windows SDK 消费构建生成的 `ganwork.resources`。启动验收可执行文件时传入 `--native-preview-compact <sessions.sqlite3> <workspace>`，第二个路径用于加载与原验收一致的本地代码模型夹具。只传数据库可用来验收缺少原 Agent 修订的路径。
 
 Windows 原生窄窗在缺少原 Agent 修订时从旧代码会话选择单文件回撤。队列拒绝后，回撤页显示实际原因、保留文件选择并恢复重试按钮。会话及重启后仍显示该原因，两份文件维持原字节。恢复代码模型后，显式提交同一单文件范围，审批出现才提示返回审阅。批准后只有 `config.txt` 恢复原值，`settings.html` 哈希保持一致。SQLite 核对首条队列项和命令保持 `Rejected`、`Failed` 且无 Run，重试以新队列项和命令完成。Windows 消费构建、代码回撤、回撤恢复和 SQLite 专项通过。SQLite 另验证有会话读取权限的另一身份无法读取原提交者的产物变更队列。
 

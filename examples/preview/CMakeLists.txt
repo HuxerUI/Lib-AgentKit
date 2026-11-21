@@ -8,7 +8,7 @@ if (CMAKE_HOST_APPLE AND (NOT CMAKE_SYSTEM_NAME OR CMAKE_SYSTEM_NAME STREQUAL "D
     set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS deployment target")
 endif ()
 
-project(example_agent_kit VERSION 0.1.0 LANGUAGES NONE)
+project(ganwork VERSION 0.1.0 LANGUAGES NONE)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/HuxerUIProject.cmake")
 if (HUXERUI_PROJECT_PLAN_ONLY)
@@ -35,7 +35,7 @@ if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     endif ()
 endif ()
 
-huxerui_add_app(example_agent_kit
+huxerui_add_app(ganwork
         SOURCES
             ${APP_SOURCE_FILES}
         RESOURCES
@@ -44,43 +44,43 @@ huxerui_add_app(example_agent_kit
             app
         ${HUXERUI_APP_RESOURCE_OUTPUT_ARGUMENTS}
         BUNDLE_NAME
-            "AgentKit Preview"
+            "GanWork"
         BUNDLE_IDENTIFIER
-            "org.huxerui.lib.agentkit.preview"
+            "org.huxerui.ganwork"
 )
 
-huxerui_configure_project_app(example_agent_kit)
+huxerui_configure_project_app(ganwork)
 
-huxerui_use_library(example_agent_kit
+huxerui_use_library(ganwork
         TARGET HuxerUI::AgentKit
         PATH "${CMAKE_CURRENT_SOURCE_DIR}/../.."
 )
 if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
-    target_link_libraries(example_agent_kit PRIVATE nlohmann_json::nlohmann_json)
+    target_link_libraries(ganwork PRIVATE nlohmann_json::nlohmann_json)
     if (WIN32)
-        target_link_libraries(example_agent_kit PRIVATE crypt32)
+        target_link_libraries(ganwork PRIVATE crypt32)
     endif ()
     include(cmake/LinkNavigation.cmake)
-    agentkit_preview_link_navigation(example_agent_kit)
+    agentkit_preview_link_navigation(ganwork)
     include(cmake/MarkdownImages.cmake)
-    agentkit_preview_link_markdown_images(example_agent_kit)
+    agentkit_preview_link_markdown_images(ganwork)
     if (MSVC)
-        target_compile_options(example_agent_kit PRIVATE /bigobj)
+        target_compile_options(ganwork PRIVATE /bigobj)
     endif ()
     include(cmake/Skills.cmake)
-    agentkit_preview_embed_skills(example_agent_kit)
+    agentkit_preview_embed_skills(ganwork)
 endif ()
 if (EMSCRIPTEN)
     if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
-        target_include_directories(example_agent_kit PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../support")
+        target_include_directories(ganwork PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../support")
     endif ()
 else ()
     include(../../cmake/HostSQLite.cmake)
-    agentkit_host_use_sqlite_session_store(example_agent_kit)
+    agentkit_host_use_sqlite_session_store(ganwork)
 endif ()
 include(cmake/Archive.cmake)
-agentkit_preview_link_archive(example_agent_kit)
+agentkit_preview_link_archive(ganwork)
 include(../../cmake/HostTerminal.cmake)
-agentkit_host_link_terminal(example_agent_kit)
+agentkit_host_link_terminal(ganwork)
 include(cmake/CodeEditor.cmake)
-agentkit_preview_link_code_editor(example_agent_kit)
+agentkit_preview_link_code_editor(ganwork)

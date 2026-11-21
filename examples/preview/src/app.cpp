@@ -1089,6 +1089,22 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
 
 using PreviewStoreAdapter = std::function<std::shared_ptr<kit::SessionStore>(std::shared_ptr<kit::SessionStore>)>;
 
+File DefaultGanWorkDatabase() {
+  const auto data = UseApplication().Directories().data_directory;
+  const auto database = data.Child("agentkit-preview").Child("sessions.sqlite3");
+#ifdef _WIN32
+  if (!database.Exists()) {
+    const auto app = data.Parent();
+    const auto local = app ? app->Parent() : std::nullopt;
+    if (local) {
+      auto previous = local->Child("example_agent_kit").Child(data.Name()).Child("agentkit-preview").Child("sessions.sqlite3");
+      if (previous.Exists()) return previous;
+    }
+  }
+#endif
+  return database;
+}
+
 std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std::optional<File> database, bool read_model_configuration,
                     std::optional<File> startup_workspace = {}, std::optional<kit::ModelRegistration> code_model = {},
                     std::optional<File> test_runner = {}, PreviewStoreAdapter adapt_store = {},
@@ -1101,8 +1117,7 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
   context.Provide(std::make_shared<State<agentkit_preview::PreviewSettings>>(service->settings));
   context.Provide(selection);
   const auto tasks = UseApplicationTaskScope();
-  auto file = database ? *database : UseApplication().Directories().data_directory
-      .Child("agentkit-preview").Child("sessions.sqlite3");
+  auto file = database ? *database : DefaultGanWorkDatabase();
   std::optional<File> temporary;
 #ifdef __EMSCRIPTEN__
   temporary = UseApplication().Directories().temporary_directory;
@@ -1458,6 +1473,7 @@ View DraftChoice(NavigationSymbol icon, StringVariant label, std::string value, 
       .With(anchor, Enabled(enabled), Focusable{}, Frame{.height = 34.0F}, Padding(EdgeInsets::Symmetric(10.0F, 0.0F)),
           Spacing(7.0F), CrossAlign(CrossAxisAlignment::Center), CornerRadius(9.0F), Border{colors.outline},
           Background(hovered.Get() && enabled ? colors.surface_container_highest : colors.surface_container_low),
+          Tooltip(hint.empty() ? value : hint),
           Semantics{.role = SemanticRole::Button, .label = label, .value = value, .hint = hint}).Key(key);
 }
 
@@ -1466,7 +1482,7 @@ View PreviewWordmark(const ColorScheme& colors) {
       .With(Frame{.width = 26.0F, .height = 26.0F}, Background(colors.primary_container), CornerRadius(7.0F));
   return Row{
       std::move(mark),
-      Text(::app::strings::ui_agentkit).Style({Font::System(14.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}),
+      Text(::app::strings::app_name).Style({Font::System(14.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}),
   }.With(Spacing(9.0F), CrossAlign(CrossAxisAlignment::Center));
 }
 
@@ -1860,7 +1876,6 @@ View PreviewShell() {
   const auto presentation_pages = UseState(agentkit_preview::PresentationReviewPages{});
   const auto draft_focused = UseState(false);
   const auto draft_input = UseViewHandle();
-  const auto draft_composer = UseViewHandle();
   const auto focus_draft = UseState(false);
   using WorkspaceDrafts = std::map<std::optional<kit::WorkspaceId>, NewConversationDraft>;
   const auto drafts = UseState(std::make_shared<WorkspaceDrafts>());
@@ -2419,20 +2434,25 @@ View PreviewShell() {
           comparison = std::move(route);
         });
         if (!returning) compare = std::move(compare).With(comparison_entry);
-        actions.push_back(std::move(compare).With(Tooltip(label)).Key(returning ? "comparison-return" : "comparison-entry"));
+        actions.push_back(std::move(compare).With(Tooltip(returning ? label : ::app::strings::ui_comparison_explainer))
+            .Key(returning ? "comparison-return" : "comparison-entry"));
       }
-      actions.push_back(IconButton(::app::images::goal, ::app::strings::ui_goal)
-          .OnClick([goal_session, id = selection.id] { goal_session = id; }).With(Tooltip(::app::strings::ui_goal)).Key("conversation-goal"));
       kit::AgentChatOptions options{
           .draft_sources = composer.sources,
           .draft = composer.text,
           .run_controls = kit::AgentChatRunControls{composer.next,
-              [service, resources, next = composer.next, skills = composer.skills, error = composer.preference_error, sources = composer.sources](
+              [service, goal_session, conversation_action_style, next = composer.next, skills = composer.skills,
+               error = composer.preference_error, sources = composer.sources](
                   const kit::SessionSummary& summary, std::optional<kit::RunStartBinding> current) {
                 const auto folder = summary.workspace ? service->workspaces->Find(*summary.workspace) : std::nullopt;
-                std::optional<View> skill_picker;
+                std::vector<View> actions{
+                    ProvideEnvironment(conversation_action_style,
+                        IconButton(::app::images::goal, ::app::strings::ui_goal)
+                            .OnClick([goal_session, id = summary.id] { goal_session = id; })
+                            .With(Tooltip(::app::strings::ui_goal)).Key("conversation-goal")),
+                };
                 if (summary.agent.id == agentkit_preview::GeneralAgent)
-                  skill_picker = agentkit_preview::SkillPicker(service->runtime, {summary.id}, skills);
+                  actions.push_back(agentkit_preview::SkillPicker(service->runtime, {summary.id}, skills));
                 auto caps = service->run_settings->Capabilities(next->model, summary.agent.id);
                 if (current) {
                   const auto active = service->run_settings->Capabilities(current->model, summary.agent.id);
@@ -2440,13 +2460,12 @@ View PreviewShell() {
                   caps.file_input |= active.file_input;
                 }
                 auto save_preference = [service, id = summary.id] { SaveComposerPreference(service, id); };
-                if (auto picker = PreviewAttachmentAction(service, summary.agent.id, next, sources, caps, save_preference)) {
-                  if (skill_picker) skill_picker = Row{std::move(*skill_picker), std::move(*picker)}.With(Spacing(8.0F));
-                  else skill_picker = std::move(*picker);
-                }
+                if (auto picker = PreviewAttachmentAction(service, summary.agent.id, next, sources, caps, save_preference))
+                  actions.push_back(std::move(*picker));
                 auto controls = agentkit_preview::RunSettingsControls(service->run_settings, next, summary.agent.id, summary.workspace,
                     folder ? folder->NativeFolder() : std::nullopt, std::move(current),
-                    std::move(save_preference), std::move(skill_picker), AddModelAction(service), resources->GetString(PreviewAgentLabel(summary.agent)));
+                    std::move(save_preference), Flow(std::move(actions)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center)),
+                    AddModelAction(service));
                 if (error.Get().empty()) return controls;
                 return View(Column{std::move(controls), Text(error.Get(), TextRole::Label)}.With(Spacing(4.0F)));
               },
@@ -2478,8 +2497,21 @@ View PreviewShell() {
           OpenPreviewArtifactReview(application, conversation, runtime, agent, std::move(request), std::move(initial_pages), draft_sources);
         };
       }
+      std::string location;
+      if (snapshot && snapshot->summary.workspace) {
+        const auto folder = service->workspaces->Find(*snapshot->summary.workspace);
+        location = folder ? folder_name(*folder) : UseString(::app::strings::ui_workspace_unavailable);
+      }
+      if (const auto group = GroupFor(nav, selection.id)) {
+        const auto found = std::ranges::find(nav.groups, *group, &ConversationGroup::id);
+        if (found != nav.groups.end()) {
+          if (!location.empty()) location += " · ";
+          location += found->name;
+        }
+      }
       auto chrome = std::make_shared<const agentkit_preview::ChatHeader>(
-          [actions = std::move(actions), snapshot, conversation_action_style, open_review = std::move(open_review), review_window_error](
+          [actions = std::move(actions), snapshot, location = std::move(location), conversation_action_style,
+           open_review = std::move(open_review), review_window_error](
               const kit::AgentChatPage& page, std::optional<View> workspace_actions) -> std::optional<View> {
             if (const auto* review = std::get_if<kit::AgentChatReviewRequest>(&page)) {
               if (!open_review) return {};
@@ -2509,7 +2541,16 @@ View PreviewShell() {
             auto controls = ProvideEnvironment(conversation_action_style,
                 Row(std::move(buttons)).With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Center)))
                 .Key("agent-chat-header-actions");
-            std::vector<View> row{std::move(title).With(Grow())};
+            std::vector<View> row;
+            if (!location.empty()) {
+              row.push_back(Row{
+                  NavigationIcon(NavigationSymbol::Folder, colors.on_surface_variant),
+                  Text(location).Style({Font::System(12.0F), colors.on_surface_variant})
+                      .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Frame{.max_width = compact ? 72.0F : 152.0F}),
+                  NavigationIcon(NavigationSymbol::Right, colors.on_surface_variant),
+              }.With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Center), Tooltip(location)).Key("conversation-location"));
+            }
+            row.push_back(std::move(title).With(Grow()));
             if (snapshot->summary.pending_interactions && !compact)
               row.push_back(Text(::app::strings::ui_action_required, TextRole::Label).With(Foreground(colors.on_surface_variant)));
             row.push_back(std::move(controls));
@@ -2585,11 +2626,11 @@ View PreviewShell() {
     const auto chosen_group = draft_group.Get();
     const auto group = chosen_group ? std::ranges::find(nav.groups, *chosen_group, &ConversationGroup::id) : nav.groups.end();
     const auto workspace_path = native_workspace ? native_workspace->Path() : std::string{};
-    const auto choose_assistant = [assistants, assistant, new_start, new_skills](PopupContext popup) {
+    const auto choose_assistant = [assistants, assistant, new_start, new_skills, focus_draft] {
       std::vector<MenuEntry> choices;
       for (std::size_t index = 0; index < assistants.size(); ++index) {
-        choices.emplace_back(MenuItem(assistants[index], [assistant, new_start, new_skills, popup, index] {
-          popup.Dismiss();
+        choices.emplace_back(MenuItem(assistants[index], [assistant, new_start, new_skills, focus_draft, index] {
+          focus_draft = true;
           if (assistant.Get() == index) return;
           assistant = index;
           new_start = default_draft_start;
@@ -2599,6 +2640,8 @@ View PreviewShell() {
       return choices;
     };
     std::vector<View> selectors{
+        DraftChoice(NavigationSymbol::Chat, ::app::strings::ui_assistant, UseString(assistants[assistant.Get()]),
+            {}, "draft-assistant", choose_assistant, ready.Get()),
         DraftChoice(NavigationSymbol::Folder, ::app::strings::ui_workspace, workspace ? folder_name(*workspace) :
             UseString(workspace_id ? ::app::strings::ui_workspace_unavailable : ::app::strings::ui_no_workspace),
             workspace_path, "draft-workspace", [use_workspace, workspace_id, folders, folder_name] {
@@ -2673,9 +2716,8 @@ View PreviewShell() {
         if (draft_action) draft_action = Row{std::move(*draft_action), std::move(*picker)}.With(Spacing(8.0F));
         else draft_action = std::move(*picker);
       }
-      controls = ProvideEnvironment(kit::AgentChatComposerAnchor{draft_composer},
-          agentkit_preview::RunSettingsControls(service->run_settings, new_start, new_agent, workspace_id,
-              native_workspace, {}, {}, std::move(draft_action), AddModelAction(service), UseString(assistants[assistant.Get()]), choose_assistant));
+      controls = agentkit_preview::RunSettingsControls(service->run_settings, new_start, new_agent, workspace_id,
+          native_workspace, {}, {}, std::move(draft_action), AddModelAction(service));
     }
     compose.push_back(std::move(message_field));
     const bool can_send = ready.Get() && !creating.Get() && (!draft->text.empty() || !new_sources->attachments.empty()) &&
@@ -2697,9 +2739,6 @@ View PreviewShell() {
     std::vector<View> context{
         Flow(std::move(selectors)).With(Spacing(7.0F), CrossAlign(CrossAxisAlignment::Center)),
     };
-    if (!workspace_path.empty()) context.push_back(Text(workspace_path)
-        .Style({Font::System(12.0F), colors.on_surface_variant}).LineLimit(2).Overflow(TextOverflow::Ellipsis)
-        .With(Tooltip(workspace_path)).Key("draft-workspace-path"));
     std::vector<View> start_page{
         Text(::app::strings::ui_new_conversation, TextRole::Title)
             .Style({Font::System(compact ? 26.0F : 31.0F).WithWeight(FontWeight::SemiBold), colors.on_surface})
@@ -2754,7 +2793,7 @@ View PreviewShell() {
         Text(::app::strings::ui_assistant, TextRole::Label),
         Text(::app::strings::ui_sending_message, TextRole::Label).With(Foreground(colors.on_surface_variant)),
     }.With(Spacing(8.0F)).Key("chat-sending-message"));
-    lane.push_back(Column(std::move(compose)).With(draft_composer, Spacing(3.0F), CrossAlign(CrossAxisAlignment::Stretch),
+    lane.push_back(Column(std::move(compose)).With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Stretch),
         Padding(11.0F), CornerRadius(17.0F), Background(colors.surface_container),
         Border{draft_focused.Get() ? colors.on_primary_container : colors.outline}).Key("new-draft-composer"));
     main = Row{
@@ -2797,27 +2836,6 @@ View PreviewShell() {
                 Tooltip(::app::strings::ui_open_conversation_list)).Key("open-navigation");
   };
   if (compact && !custom_preview_chrome) header.push_back(navigation_button());
-  const auto group = heading_snapshot ? GroupFor(nav, heading_snapshot->summary.id) : draft_group.Get();
-  if (!showing_pending.Get() && heading_snapshot && (current_folder || group)) {
-    std::vector<View> location;
-    if (current_folder) {
-      const auto folder = service->workspaces->Find(*current_folder);
-      location.push_back(NavigationIcon(NavigationSymbol::Folder, colors.on_surface_variant));
-      location.push_back(Text(folder ? folder_name(*folder) : UseString(::app::strings::ui_workspace_unavailable))
-          .Style({Font::System(12.0F).WithWeight(FontWeight::SemiBold), colors.on_surface})
-          .LineLimit(1).Overflow(TextOverflow::Ellipsis));
-    }
-    if (group) {
-      const auto found = std::ranges::find(nav.groups, *group, &ConversationGroup::id);
-      if (found != nav.groups.end()) {
-        if (!location.empty()) location.push_back(NavigationIcon(NavigationSymbol::Right, colors.on_surface_variant));
-        location.push_back(Text(found->name).Style({Font::System(12.0F), colors.on_surface_variant})
-            .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow()));
-      }
-    }
-    if (!location.empty())
-      header.push_back(Row(std::move(location)).With(Grow(), Spacing(7.0F), CrossAlign(CrossAxisAlignment::Center)));
-  }
   if (!header.empty()) {
     content.push_back(Column{
         Row(std::move(header)).With(Frame{.height = 42.0F},
@@ -2934,7 +2952,7 @@ ApplicationHook MakeCodeTestInstaller(File database, File workspace, kit::ModelR
 #if !defined(AGENTKIT_PREVIEW_TEST)
 const Application application{
     App,
-    {.window = {.title = "AgentKit Preview", .initial_size = {1080.0F, 760.0F},
+    {.window = {.title = "GanWork", .initial_size = {1080.0F, 760.0F},
 #ifdef _WIN32
         .minimum_size = Size{460.0F, 560.0F}, .chrome_mode = WindowChromeMode::Custom, .title_bar_height = 46.0F
 #endif

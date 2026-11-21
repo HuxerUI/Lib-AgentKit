@@ -22,10 +22,6 @@ constexpr std::string_view full_access_prefix = "preview.full/";
 constexpr std::string_view model_slot_prefix = "preview.profile/";
 constexpr auto separator = "  \xc2\xb7  ";
 
-View RunOptionGlyph(const ImageResource& icon, Color ink) {
-  return Image(icon).Tint(ink).With(Frame{.width = 14.0F, .height = 14.0F});
-}
-
 StringVariant ProfileLabel(const std::optional<kit::ExecutionProfileRef>& profile) {
   if (!profile || *profile == AskProfile) return ::app::strings::ui_ask;
   if (*profile == ReviewProfile) return ::app::strings::ui_auto_review;
@@ -342,92 +338,83 @@ void ShowAddModel(const huxerui::DialogHandle& dialog, AddModelProfile add_model
 
 namespace {
 
-View RunOptionRow(StringVariant name, View control) {
-  return Row{Text(name, TextRole::Label).With(Grow()),
-      Column{std::move(control)}.With(Frame{.width = 212.0F}, CrossAlign(CrossAxisAlignment::Stretch))}
-      .With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
-}
-
 [[huxerui::composable]]
-View RunOptionPicker(std::string text, StringVariant label, ViewHandle anchor, std::function<void()> open,
-    Color ink, bool enabled = true) {
+View RunOptionTrigger(std::string value, StringResource label, std::string key, ViewHandle anchor,
+                      std::function<void()> open, Color ink, bool enabled, bool permission = false) {
   const auto colors = UseTheme().colors;
-  const auto hovered = UseState(false);
-  return Row{
-      Text(text).Style({Font::System(13.0F).WithWeight(FontWeight::Medium), ink})
-          .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow()),
-      RunOptionGlyph(::app::images::chevron_down, ink),
-  }.OnClick(open).On<ViewEvents::KeyDown>([open](const KeyEvent& event) {
-    if (event.key != Key::Enter && event.key != Key::Space) return false;
-    if (!event.repeat) open();
-    return true;
-  }).On<ViewEvents::Hover>([hovered](const HoverEvent& event) { hovered = event.type != HoverEventType::Leave; })
-      .With(anchor, Focusable{}, Enabled(enabled), Frame{.height = 34.0F}, Padding(EdgeInsets::Symmetric(10.0F, 0.0F)),
-          Spacing(6.0F), CrossAlign(CrossAxisAlignment::Center), CornerRadius(8.0F), Tooltip(text),
-          Background(hovered.Get() && enabled ? colors.surface_container_highest : colors.surface_container_high),
-          Semantics{.role = SemanticRole::Button, .label = std::move(label), .value = std::move(text)});
+  const auto compact = UseViewportClass() == ViewportClass::Compact;
+  auto style = UseEnvironment<ChipStyle>();
+  style.background = colors.surface_container_low;
+  style.border = Border{Color::Transparent()};
+  style.label_style = {Font::System(12.0F).WithWeight(FontWeight::Medium), ink};
+  style.padding = EdgeInsets::Symmetric(8.0F, 3.0F);
+  style.minimum_height = 32.0F;
+  style.icon_size = 14.0F;
+  style.icon_spacing = 5.0F;
+  style.corner_radii = CornerRadii{7.0F};
+  const auto& icon = permission ? ::app::images::shield : ::app::images::chevron_down;
+  return ProvideEnvironment(style, Chip(icon, value).OnClick(std::move(open))
+      .With(anchor, Enabled(enabled), Frame{.max_width = permission ? 170.0F : compact ? 156.0F : 240.0F},
+          Semantics{.role = SemanticRole::Button, .label = label, .value = std::move(value)})
+      .Key(std::move(key)));
 }
 
+} // namespace
+
 [[huxerui::composable]]
-View RunOptionsPanel(PopupContext popup, std::shared_ptr<RunSettings> settings, State<kit::UserRunOptions> next, kit::AgentId agent,
+View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserRunOptions> next, kit::AgentId agent,
     std::optional<kit::WorkspaceId> workspace, std::optional<File> workspace_root, std::optional<kit::RunStartBinding> current,
-    std::function<void()> changed, AddModelProfile add_model, std::string assistant,
-    std::function<std::vector<MenuEntry>(PopupContext)> draft_assistant) {
-  const auto menu = UseMenu();
+    std::function<void()> changed, std::optional<View> extra_action, AddModelProfile add_model) {
+  const auto model_menu = UseMenu();
+  const auto permission_menu = UseMenu();
   const auto dialogs = UseDialog();
-  const auto assistant_anchor = UseViewHandle();
   const auto model_anchor = UseViewHandle();
   const auto permission_anchor = UseViewHandle();
-  const auto theme = UseTheme();
-  const auto& colors = theme.colors;
-  auto choices = settings->Models(agent);
+  const auto colors = UseTheme().colors;
+  const auto choices = settings->Models(agent);
   const auto effective_model = next->model ? next->model : settings->DefaultModel(agent);
   const auto selected = effective_model ? std::ranges::find(choices, *effective_model, &ModelChoice::ref) : choices.end();
-  const auto model_name = effective_model == DemoModel ? UseString(::app::strings::ui_local_demo_model) : selected == choices.end() ?
-      (effective_model ? UseString(settings->ModelLabel(effective_model)) : UseString(::app::strings::ui_select_model)) : selected->name;
+  auto model = effective_model == DemoModel ? UseString(::app::strings::ui_local_demo_model) :
+      selected != choices.end() ? selected->name : effective_model ? UseString(::app::strings::ui_unavailable_model) :
+      UseString(::app::strings::ui_select_model);
   const auto effective_profile = next->execution_profile.value_or(AskProfile);
-  const auto next_model = current && effective_model != current->model;
-  const auto next_permission = current && effective_profile != current->execution_profile.value_or(AskProfile);
+  const bool next_model = current && effective_model != current->model;
+  const bool next_permission = current && effective_profile != current->execution_profile.value_or(AskProfile);
   const bool full_access = agent == CodeAgent && workspace && workspace_root;
-  const auto select_model = [next, changed, popup](kit::ModelProviderRef ref) {
+  const auto select_model = [next, changed](kit::ModelProviderRef ref) {
     auto selected = next.Get();
     selected.model = std::move(ref);
     next = std::move(selected);
     if (changed) changed();
-    popup.Dismiss();
   };
-  auto choose_model = [menu, dialogs, popup, model_anchor, choices, effective_model, select_model, add_model] {
+  const auto choose_model = [model_menu, dialogs, model_anchor, choices, effective_model, select_model, add_model] {
     std::vector<MenuEntry> items;
     for (const auto& choice : choices) {
       auto label = choice.ref == DemoModel ? StringVariant{::app::strings::ui_local_demo_model} : StringVariant{choice.label};
-      items.emplace_back(MenuItem(std::move(label), [select_model, ref = choice.ref] {
-        select_model(ref);
-      }).Checked(effective_model == choice.ref));
+      items.emplace_back(MenuItem(std::move(label), [select_model, ref = choice.ref] { select_model(ref); })
+          .Checked(effective_model == choice.ref));
     }
     if (add_model) {
       if (!items.empty()) items.emplace_back(MenuSection{});
-      items.emplace_back(MenuItem(::app::strings::ui_add_model_ellipsis, [dialogs, popup, add_model, select_model] {
-        popup.Dismiss();
+      items.emplace_back(MenuItem(::app::strings::ui_add_model_ellipsis, [dialogs, add_model, select_model] {
         ShowAddModel(dialogs, add_model, select_model);
       }));
     }
-    if (!items.empty()) menu.Show(model_anchor, std::move(items));
+    if (!items.empty()) model_menu.Show(model_anchor, std::move(items), {.placement = {AnchorSide::Above, AnchorAlignment::Start}});
   };
-  auto choose_permission = [menu, popup, permission_anchor, dialogs, settings, next, effective_profile, full_access, workspace,
-                            workspace_root, changed] {
-    const auto set = [next, changed, popup](kit::ExecutionProfileRef profile) {
+  const auto choose_permission = [permission_menu, permission_anchor, dialogs, settings, next, effective_profile, full_access,
+                                  workspace, workspace_root, changed] {
+    const auto set = [next, changed](kit::ExecutionProfileRef profile) {
       auto selected = next.Get();
       selected.execution_profile = std::move(profile);
       next = std::move(selected);
       if (changed) changed();
-      popup.Dismiss();
     };
-    menu.Show(permission_anchor, {
+    permission_menu.Show(permission_anchor, {
         MenuItem(::app::strings::ui_ask, [set] { set(AskProfile); }).Checked(effective_profile == AskProfile),
         MenuItem(::app::strings::ui_auto_review, [set] { set(ReviewProfile); }).Checked(effective_profile == ReviewProfile),
-        MenuItem(::app::strings::ui_full_access, [dialogs, popup, settings, workspace, workspace_root, set] {
+        MenuItem(::app::strings::ui_full_access, [dialogs, settings, workspace, workspace_root, set] {
           if (!workspace || !workspace_root) return;
-          popup.Dismiss();
           ShowPreviewDialog(dialogs, DialogFactory{[settings, workspace = *workspace, root = *workspace_root, set](DialogContext dialog) {
             return Column{
                 Text(::app::strings::ui_allow_patches_in_this_workspace, TextRole::Title),
@@ -441,94 +428,34 @@ View RunOptionsPanel(PopupContext popup, std::shared_ptr<RunSettings> settings, 
             }.With(Frame{.max_width = 470.0F}, Padding(20.0F), Spacing(12.0F));
           }});
         }).Checked(effective_profile.id.value.starts_with(full_access_prefix)).Enabled(full_access),
-    });
+    }, {.placement = {AnchorSide::Above, AnchorAlignment::Start}});
   };
-  std::vector<View> views{Text(::app::strings::ui_conversation_options, TextRole::Title)};
-  if (next_model || next_permission) views.push_back(Text(UseString(::app::strings::ui_this_run) + std::string(separator) + settings->Describe(*current, *UseService<Resources>()),
-      TextRole::Label));
-  const auto permission = std::string(settings->NeedsRenewal(effective_profile, workspace)
-      ? UseString(::app::strings::ui_renew_full_access) : UseString(ProfileLabel(effective_profile)));
-  const auto menu_label = [](std::string value, bool next_run) {
-    if (next_run) value += " \xc2\xb7 Next";
-    return value;
-  };
-  if (draft_assistant) {
-    views.push_back(RunOptionRow(::app::strings::ui_assistant, RunOptionPicker(assistant, ::app::strings::ui_assistant, assistant_anchor,
-        [menu, assistant_anchor, draft_assistant, popup] { menu.Show(assistant_anchor, draft_assistant(popup)); },
-        colors.on_surface).Key("draft-assistant")));
-  } else if (!assistant.empty()) {
-    views.push_back(RunOptionRow(::app::strings::ui_assistant, Text(assistant).With(Padding(EdgeInsets{.left = 10.0F}))));
-  }
+  auto permission = settings->NeedsRenewal(effective_profile, workspace)
+      ? UseString(::app::strings::ui_renew_full_access) : UseString(ProfileLabel(effective_profile));
+  if (next_model) model += std::string(separator) + UseString(::app::strings::ui_next);
+  if (next_permission) permission += std::string(separator) + UseString(::app::strings::ui_next);
   const auto permission_ink = effective_profile.id.value.starts_with(full_access_prefix)
-      ? theme.brightness == ThemeBrightness::Dark ? Color::Rgb(240, 189, 130) : Color::Rgb(136, 82, 35) : colors.on_surface;
-  views.push_back(RunOptionRow(::app::strings::ui_model, RunOptionPicker(menu_label(model_name, next_model),
-      next_model ? "Model for next task" : "Model", model_anchor, choose_model, colors.on_surface,
-      !choices.empty() || bool(add_model)).Key("run-model")));
-  views.push_back(RunOptionRow(::app::strings::ui_permissions, RunOptionPicker(menu_label(permission, next_permission),
-      next_permission ? "Permissions for next task" : "Permissions", permission_anchor, choose_permission,
-      permission_ink).Key("run-permissions")));
-  return Column(std::move(views)).With(Frame{.width = 360.0F}, Padding(14.0F), Spacing(9.0F),
-      CrossAlign(CrossAxisAlignment::Stretch), CornerRadius(12.0F), Background(colors.surface_container_low),
-      Border{colors.outline}).Key("conversation-options-panel");
-}
-
-} // namespace
-
-[[huxerui::composable]]
-View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserRunOptions> next, kit::AgentId agent,
-    std::optional<kit::WorkspaceId> workspace, std::optional<File> workspace_root, std::optional<kit::RunStartBinding> current,
-    std::function<void()> changed, std::optional<View> extra_action, AddModelProfile add_model, std::string assistant,
-    std::function<std::vector<MenuEntry>(PopupContext)> draft_assistant) {
-  const auto trigger = UseViewHandle();
-  const auto anchor = UseEnvironment<kit::AgentChatComposerAnchor>().view.value_or(trigger);
-  const auto popup = UsePopup();
-  const auto hovered = UseState(false);
-  const bool compact = UseViewportClass() == ViewportClass::Compact;
-  const auto colors = UseTheme().colors;
-  auto style = UseEnvironment<ButtonStyle>();
-  style.background = Color::Transparent();
-  style.label_style = {Font::System(12.0F).WithWeight(FontWeight::Medium), colors.on_surface_variant};
-  style.padding = EdgeInsets::Symmetric(7.0F, 5.0F);
-  style.minimum_height = 32.0F;
-  const auto choices = settings->Models(agent);
-  const auto model = next->model ? next->model : settings->DefaultModel(agent);
-  const auto selected = model ? std::ranges::find(choices, *model, &ModelChoice::ref) : choices.end();
-  const auto name = model == DemoModel ? UseString(::app::strings::ui_local_demo_model) : selected != choices.end() ? selected->name :
-      model ? UseString(::app::strings::ui_unavailable_model) : UseString(::app::strings::ui_select_model);
-  const auto effective_profile = next->execution_profile.value_or(AskProfile);
-  const bool next_model = current && model != current->model;
-  const bool next_permission = current && effective_profile != current->execution_profile.value_or(AskProfile);
-  auto profile = settings->NeedsRenewal(effective_profile, workspace) ? UseString(::app::strings::ui_renew_full_access) : UseString(ProfileLabel(effective_profile));
-  if (next_permission) profile += std::string(separator) + UseString(::app::strings::ui_next);
-  const auto open = [popup, anchor, settings, next, agent, workspace, workspace_root, current, changed, add_model, assistant, draft_assistant] {
-    popup.Show(anchor, PopupFactory{[settings, next, agent, workspace, workspace_root, current, changed, add_model,
-                                     assistant, draft_assistant](PopupContext context) {
-      return RunOptionsPanel(context, settings, next, agent, workspace, workspace_root, current, changed,
-          add_model, assistant, draft_assistant);
-    }}, {.placement = {AnchorSide::Above, AnchorAlignment::Start}, .gap = 8.0F});
-  };
-  auto label = assistant.empty() ? name : assistant + separator + name;
-  if (next_model) label += std::string(separator) + UseString(::app::strings::ui_next);
+      ? colors.on_primary_container : colors.on_surface_variant;
   std::vector<View> controls{
-      Row{
-          Text(label).Style(style.label_style).LineLimit(1).Overflow(TextOverflow::Ellipsis)
-              .With(Frame{.max_width = compact ? 156.0F : 280.0F}).Key("conversation-options-summary"),
-          RunOptionGlyph(::app::images::chevron_down, colors.on_surface_variant),
-      }.OnClick(open).On<ViewEvents::KeyDown>([open](const KeyEvent& event) {
-        if (event.key != Key::Enter && event.key != Key::Space) return false;
-        if (!event.repeat) open();
-        return true;
-      }).On<ViewEvents::Hover>([hovered](const HoverEvent& event) { hovered = event.type != HoverEventType::Leave; })
-          .With(trigger, Focusable{}, Frame{.height = 32.0F}, Padding(EdgeInsets::Symmetric(7.0F, 0.0F)), Spacing(5.0F),
-              CornerRadius(7.0F), CrossAlign(CrossAxisAlignment::Center), Tooltip(label),
-              Background(hovered.Get() ? colors.surface_container_high : Color::Transparent()),
-              Semantics{.role = SemanticRole::Button, .label = ::app::strings::ui_conversation_options, .value = name}).Key("conversation-options"),
-      Row{RunOptionGlyph(::app::images::shield, colors.on_surface_variant),
-          Text(profile, TextRole::Label).With(Foreground(colors.on_surface_variant)).Key("run-permission-summary")}
-          .With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center), Frame{.height = 32.0F}),
+      RunOptionTrigger(std::move(model), ::app::strings::ui_model, "run-model", model_anchor, choose_model,
+          colors.on_surface_variant, !choices.empty() || bool(add_model)),
+      RunOptionTrigger(std::move(permission), ::app::strings::ui_permissions, "run-permissions", permission_anchor, choose_permission,
+          permission_ink, true, true),
   };
-  if (extra_action) controls.push_back(ProvideEnvironment(style, std::move(*extra_action)));
-  return Flow(std::move(controls)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center));
+  if (extra_action) {
+    auto style = UseEnvironment<ButtonStyle>();
+    style.background = Color::Transparent();
+    style.label_style = {Font::System(12.0F).WithWeight(FontWeight::Medium), colors.on_surface_variant};
+    style.padding = EdgeInsets::Symmetric(7.0F, 5.0F);
+    style.minimum_height = 32.0F;
+    controls.push_back(ProvideEnvironment(style, std::move(*extra_action)));
+  }
+  auto row = Flow(std::move(controls)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center));
+  if (next_model || next_permission) return Column{std::move(row),
+      Text(UseString(::app::strings::ui_this_run) + separator + settings->Describe(*current, *UseService<Resources>()), TextRole::Label)
+          .With(Foreground(colors.on_surface_variant)).Key("active-run-settings")}
+      .With(Spacing(2.0F), CrossAlign(CrossAxisAlignment::Stretch));
+  return row;
 }
 
 } // namespace agentkit_preview

@@ -4,6 +4,8 @@
 #include <huxerui/clipboard.h>
 #include <huxerui/modifier.h>
 #include <huxerui/paint.h>
+#include <huxerui/richeditor/extension.h>
+#include <huxerui_agentkit_resources.h>
 #include <huxerui/text_input.h>
 
 #include <algorithm>
@@ -70,6 +72,62 @@ View RenderMarkdownImage(MarkdownImage image, MarkdownImageLoad load, View fallb
         .Key("markdown-image");
     return decorate ? decorate(std::move(view)) : std::move(view);
   });
+}
+
+View ReadOnlyCodePanel(StringVariant language, std::string code, View body, markdown::MarkdownStyle style) {
+  return Scope([language = std::move(language), code = std::move(code), body = std::move(body), style]() -> View {
+    using namespace huxerui_agentkit::strings;
+    const auto clipboard = UseApplication().Clipboard();
+    const auto tasks = UseTaskScope();
+    const auto copied = UseState(std::optional<bool>{});
+    auto button_style = UseEnvironment<ButtonStyle>();
+    button_style.background = Color::Transparent();
+    button_style.label_style = {style.body.font.WithSize(12.0F).WithWeight(FontWeight::Medium), style.muted};
+    button_style.padding = EdgeInsets::Symmetric(8.0F, 2.0F);
+    button_style.minimum_height = 26.0F;
+    const auto copy = [clipboard, tasks, copied, code] {
+      if (!clipboard) return;
+      auto write = clipboard->WriteItemAsync({.text = code});
+      tasks.Launch([copied, write = std::move(write)]() mutable -> Task<void> {
+        copied = co_await std::move(write);
+      });
+    };
+    auto label = copied.Get() ? (*copied.Get() ? ui_code_copied : ui_code_copy_failed) : ui_copy_code;
+    return Column{
+        Row{Text(language, TextRole::Label)
+                .Style({style.body.font.WithSize(12.0F).WithWeight(FontWeight::Medium), style.muted})
+                .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow()),
+            ProvideEnvironment(button_style, Button(label).OnClick(copy).With(Enabled(bool(clipboard) && !code.empty())))
+                .Key("markdown-copy-code"),
+        }.With(Frame{.min_height = 34.0F}, Padding(EdgeInsets::Symmetric(12.0F, 2.0F)),
+            Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)),
+        ProvideEnvironment(DividerStyle{style.border}, Divider()),
+        body,
+    }.With(CrossAlign(CrossAxisAlignment::Stretch), Background(style.code_background),
+        Border{style.border}, CornerRadius(style.corner_radius), ClipChildren{}).Key("markdown-code-block");
+  });
+}
+
+std::pair<AttributedText, StringVariant> StyledCode(const markdown::MarkdownNode& node, Color background) {
+  const auto first = node.fence_info.find_first_not_of(" \t");
+  auto word = first == std::string::npos ? std::string{} :
+      node.fence_info.substr(first, node.fence_info.find_first_of(" \t", first) - first);
+  std::ranges::transform(word, word.begin(), [](char c) {
+    return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c;
+  });
+  AttributedText text(node.text);
+  if (word.empty() || word == "text" || word == "txt" || word == "plain" || word == "plaintext")
+    return {std::move(text), huxerui_agentkit::strings::ui_plain_text};
+  const auto& highlighter = richeditor::DefaultCodeBlockHighlighting();
+  const auto language = std::ranges::find_if(highlighter.languages, [&word](const auto& item) {
+    return item.id == word || std::ranges::find(item.aliases, word) != item.aliases.end();
+  });
+  if (language == highlighter.languages.end()) return {std::move(text), std::move(word)};
+  std::vector<TextStyleRange> styles;
+  for (const auto& span : highlighter.highlight(node.text, language->id, background))
+    styles.push_back({span.range, {.foreground = span.foreground}});
+  if (!styles.empty()) text = text.WithStyles(std::move(styles));
+  return {std::move(text), language->label};
 }
 
 #ifdef HUXERUI_MARKDOWN_SOURCE_MAPPING
@@ -477,6 +535,19 @@ View SelectableMarkdown(markdown::MarkdownDocument document, markdown::MarkdownO
                         ViewHandle focus, std::optional<MarkdownRange> selection,
                         std::function<void(std::optional<MarkdownExcerpt>)> changed,
                         std::function<void(const markdown::MarkdownLinkActivation&)> activate, MarkdownImageLoad load) {
+  if (options.style) {
+    options.code_block_renderer = [style = *options.style, selectable = static_cast<bool>(changed)](const markdown::MarkdownNode& node) {
+      auto [text, language] = StyledCode(node, style.code_background);
+      auto body = Text(text).Style(style.code).With(Padding(style.code_padding)).Key("markdown-code-text");
+#ifdef HUXERUI_MARKDOWN_SOURCE_MAPPING
+      if (selectable) body = std::move(body).LayoutValue<ParagraphKey>(std::make_shared<ParagraphText>(
+          ParagraphText{text, style.code, TextAlign::Leading, node.source_segments}));
+#else
+      static_cast<void>(selectable);
+#endif
+      return ReadOnlyCodePanel(std::move(language), node.text, std::move(body), style);
+    };
+  }
 #ifdef HUXERUI_MARKDOWN_SOURCE_MAPPING
   if (changed) options.selectable = false;
   if (changed || load) {

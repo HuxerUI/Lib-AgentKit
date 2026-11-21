@@ -4,7 +4,7 @@ function(agentkit_preview_link_archive target)
     endif ()
     get_filename_component(archive_sibling
             "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../../../../Lib-Archive" ABSOLUTE)
-    set(HUXERUI_AGENTKIT_ARCHIVE_SOURCE_DIR "" CACHE PATH "Local Lib-Archive source for AgentKit Preview")
+    set(HUXERUI_AGENTKIT_ARCHIVE_SOURCE_DIR "" CACHE PATH "Local Lib-Archive source for GanWork")
     if (HUXERUI_AGENTKIT_ARCHIVE_SOURCE_DIR)
         huxerui_use_library(${target} TARGET HuxerUI::Archive PATH "${HUXERUI_AGENTKIT_ARCHIVE_SOURCE_DIR}")
     elseif (EXISTS "${archive_sibling}/CMakeLists.txt")

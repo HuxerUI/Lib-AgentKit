@@ -9,9 +9,9 @@
                         buildForAnalyzing="YES">
         <BuildableReference BuildableIdentifier="primary"
                             BlueprintIdentifier="000000000000000000000500"
-                            BuildableName="AgentKit Preview.app"
-                            BlueprintName="example_agent_kit"
-                            ReferencedContainer="container:example_agent_kit.xcodeproj"/>
+                            BuildableName="GanWork.app"
+                            BlueprintName="ganwork"
+                            ReferencedContainer="container:ganwork.xcodeproj"/>
       </BuildActionEntry>
     </BuildActionEntries>
   </BuildAction>
@@ -31,9 +31,9 @@
     <BuildableProductRunnable runnableDebuggingMode="0">
       <BuildableReference BuildableIdentifier="primary"
                           BlueprintIdentifier="000000000000000000000500"
-                          BuildableName="AgentKit Preview.app"
-                          BlueprintName="example_agent_kit"
-                          ReferencedContainer="container:example_agent_kit.xcodeproj"/>
+                          BuildableName="GanWork.app"
+                          BlueprintName="ganwork"
+                          ReferencedContainer="container:ganwork.xcodeproj"/>
     </BuildableProductRunnable>
   </LaunchAction>
   <ProfileAction buildConfiguration="Release"
@@ -44,9 +44,9 @@
     <BuildableProductRunnable runnableDebuggingMode="0">
       <BuildableReference BuildableIdentifier="primary"
                           BlueprintIdentifier="000000000000000000000500"
-                          BuildableName="AgentKit Preview.app"
-                          BlueprintName="example_agent_kit"
-                          ReferencedContainer="container:example_agent_kit.xcodeproj"/>
+                          BuildableName="GanWork.app"
+                          BlueprintName="ganwork"
+                          ReferencedContainer="container:ganwork.xcodeproj"/>
     </BuildableProductRunnable>
   </ProfileAction>
   <AnalyzeAction buildConfiguration="Debug"/>

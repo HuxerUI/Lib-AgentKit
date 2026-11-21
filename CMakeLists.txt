@@ -105,6 +105,23 @@ if (HUXERUI_AGENTKIT_BUILD_VIEWS)
         endif ()
     endif ()
     huxerui_use_library(huxerui_agentkit TARGET HuxerUI::Markdown)
+    if (NOT TARGET HuxerUI::RichEditor)
+        cmake_policy(PUSH)
+        if (POLICY CMP0168)
+            cmake_policy(SET CMP0168 NEW)
+        endif ()
+        include(FetchContent)
+        FetchContent_Declare(agentkit_richeditor
+                GIT_REPOSITORY https://github.com/HuxerUI/Lib-RichEditor.git
+                GIT_TAG 28905110529d896d9d9c31bb6e6de56bd61c55bf
+        )
+        FetchContent_MakeAvailable(agentkit_richeditor)
+        cmake_policy(POP)
+    endif ()
+    huxerui_use_library(huxerui_agentkit TARGET HuxerUI::RichEditor)
+    if (MSVC AND TARGET huxerui_richeditor AND NOT HUXERUI_LIBRARY_GRAPH_ONLY)
+        target_compile_options(huxerui_richeditor PRIVATE /utf-8)
+    endif ()
 endif()
 
 if (HUXERUI_LIBRARY_GRAPH_ONLY)
