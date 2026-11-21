@@ -312,7 +312,7 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
 
   const auto gutter = compact ? 14.0F : 24.0F;
   const auto settings_lane = [gutter](View view) {
-    return Row{Column{std::move(view)}.With(Frame{.width = 760.0F}, CrossAlign(CrossAxisAlignment::Stretch)), Spacer()}
+    return Row{Column{std::move(view)}.With(Grow(), CrossAlign(CrossAxisAlignment::Stretch))}
         .With(Padding(EdgeInsets::Symmetric(gutter, 0.0F)), CrossAlign(CrossAxisAlignment::Stretch));
   };
   auto content_area = ScrollView(settings_lane(Column(std::move(content)).With(Spacing(14.0F),

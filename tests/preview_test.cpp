@@ -3480,7 +3480,12 @@ void VerifyPreviewRunSettings(const File& root) {
   };
   const auto approve_patch = [&] {
     auto approval = preview.Find(ButtonText("Approve"));
-    Wait(preview, [&] { return approval.Exists() && approval.One().in_viewport; }, "Code patch bypassed its mandatory approval");
+    try {
+      Wait(preview, [&] { return approval.Exists() && approval.One().in_viewport; }, "Code patch approval was not visible");
+    } catch (...) {
+      static_cast<void>(root.Child("run-settings-approval.snapshot").WriteString(preview.CaptureSnapshot().ToString()));
+      throw;
+    }
     approval.Tap();
   };
   ChooseDraftAssistant(preview, "Code");
@@ -6680,9 +6685,27 @@ void VerifyWorkspaceTools(const File& root) {
   ChooseDraftAssistant(ui, "Code");
   SendNewConversation(ui, timeline_layout_prompt);
   const auto history = ui.Find(UiSelector::Key("agent-chat-history"));
+  const auto list = ui.Find(UiSelector::Text("List workspace files · Completed"));
+  const auto search = ui.Find(UiSelector::Text("Search workspace files · Completed"));
   const auto read = ui.Find(UiSelector::Text("Read workspace files · Completed"));
   const auto heading = ui.Find(UiSelector::Text("Workspace overview"));
-  Wait(ui, [&] { return read.Exists() && heading.Exists(); }, "The reading step and streamed heading did not mount");
+  Wait(ui, [&] { return list.Exists() && search.Exists() && read.Exists() && heading.Exists(); },
+      "The workspace steps and streamed heading did not mount");
+  const auto avatar = history.Find(UiSelector::Key("chat-agent-avatar"));
+  if (avatar.Count() != 1) throw std::runtime_error("The tool steps and reply did not share an assistant avatar");
+  const auto identity = avatar.One().bounds;
+  const auto first_step = list.One().bounds;
+  const auto answer = heading.One().bounds;
+  const auto step_indent = first_step.x - answer.x;
+  const auto avatar_gap = answer.x - identity.x - identity.width;
+  if (first_step.y < identity.y || first_step.y + first_step.height > identity.y + identity.height ||
+      avatar_gap <= 0.0F || step_indent <= 0.0F || step_indent >= identity.width)
+    throw std::runtime_error("The assistant avatar and reply did not align with the first tool step");
+  const auto list_to_search = search.One().bounds.y - list.One().bounds.y - list.One().bounds.height;
+  const auto search_to_read = read.One().bounds.y - search.One().bounds.y - search.One().bounds.height;
+  if (list_to_search <= 0.0F || search_to_read <= 0.0F || std::abs(list_to_search - search_to_read) > 1.0F)
+    throw std::runtime_error("Consecutive workspace steps have unequal spacing: " + std::to_string(list_to_search) +
+        " and " + std::to_string(search_to_read));
   const auto gap = [&] {
     const auto step = read.One().bounds;
     return heading.One().bounds.y - step.y - step.height;
@@ -8225,11 +8248,11 @@ void VerifyLocalization(const File& root) {
       !package.GetVectorImage(huxerui_agentkit::images::arrow_down).HasValue()) {
     throw std::runtime_error("A Preview or library icon was not in the resource package");
   }
-  const auto verify = [&](const char* language, const char* new_conversation, const char* send, const char* settings,
+  const auto verify = [&](float viewport_width, const char* language, const char* new_conversation, const char* send, const char* settings,
                           const char* models, const char* api_key, const char* placeholder) {
     const ResourceConfiguration configuration{.locale = Locale::FromLanguageTag(language)};
     const Application app{App, {.application_hooks = {MakePreviewInstaller(root.Child(std::string(language) + ".sqlite3"), true)}}};
-    UiTest ui(app, {.viewport = {1080.0F, 900.0F}, .resources = configuration});
+    UiTest ui(app, {.viewport = {viewport_width, 900.0F}, .resources = configuration});
     const auto heading = ui.Find(UiSelector::Key("new-conversation-heading"));
     const auto send_button = ui.Find(UiSelector::Key("chat-send/Send"));
     const auto open_settings = ui.Find(UiSelector::Key("open-settings"));
@@ -8248,13 +8271,17 @@ void VerifyLocalization(const File& root) {
     const auto add = ui.Find(UiSelector::Key("settings-add-model"));
     Wait(ui, [&] { return categories.Exists() && categories.Find(UiSelector::Text(models)).Exists() && add.Exists(); },
         "The settings page did not use the requested locale");
+    const auto content = ui.Find(UiSelector::Key("settings-content")).One().bounds;
+    const auto scroll = ui.Find(UiSelector::Key("settings-scroll")).One().bounds;
+    if (content.width < scroll.width - 80.0F || content.x + content.width > scroll.x + scroll.width)
+      throw std::runtime_error("The settings content did not use the available pane width");
     add.Tap();
     const auto field = ui.FindSemantics(UiSemanticSelector::Label(api_key));
     Wait(ui, [&] { return field.Count() == 1 && field.One().placeholder == placeholder && field.One().secure; },
         "The API key field did not preserve its localized placeholder");
   };
-  verify("en-US", "New conversation", "Send", "Settings", "Models", "API Key", "Optional. Paste a key or enter ${ENV_NAME}");
-  verify("zh-Hans-CN",
+  verify(1600.0F, "en-US", "New conversation", "Send", "Settings", "Models", "API Key", "Optional. Paste a key or enter ${ENV_NAME}");
+  verify(1080.0F, "zh-Hans-CN",
        "\xe6\x96\xb0\xe5\xbb\xba\xe5\xaf\xb9\xe8\xaf\x9d", "\xe5\x8f\x91\xe9\x80\x81", "\xe8\xae\xbe\xe7\xbd\xae",
       "\xe6\xa8\xa1\xe5\x9e\x8b", "API \xe5\xaf\x86\xe9\x92\xa5", "\xe9\x80\x89\xe5\xa1\xab\xe3\x80\x82\xe7\xb2\x98\xe8\xb4\xb4\xe5\xaf\x86\xe9\x92\xa5\xe6\x88\x96\xe8\xbe\x93\xe5\x85\xa5 ${ENV_NAME}");
 }

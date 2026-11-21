@@ -367,6 +367,7 @@ struct ChatActivityRows {
   std::map<ToolCallId, const InteractionSnapshot*> approvals;
   std::set<MessageId> outputs;
   std::vector<std::size_t> history;
+  std::set<std::variant<MessageId, ToolCallId, RunId>> assistant_starts;
 };
 
 bool ShowsToolOutputInHistory(const ContentBlock& block) {
@@ -450,6 +451,25 @@ ChatActivityRows ActivityRows(const SessionSnapshot& snapshot, const ChatActivit
   for (const auto& [id, turn] : rows.turns) {
     if (turn.last_message) rows.footers.emplace(*turn.last_message, id);
   }
+  std::optional<RunId> assistant_run;
+  const auto begin_assistant = [&](const std::optional<RunId>& run, std::variant<MessageId, ToolCallId, RunId> entry) {
+    if (!run || run != assistant_run) rows.assistant_starts.insert(std::move(entry));
+    assistant_run = run;
+  };
+  for (const auto index : rows.history) {
+    const auto& message = snapshot.messages[index];
+    if (message.author == MessageAuthor::Agent || (message.author == MessageAuthor::Tool && message.run &&
+        (!rows.outputs.contains(message.ref.message) || std::ranges::any_of(message.blocks, ShowsToolOutputInHistory)))) {
+      begin_assistant(message.run, message.ref.message);
+    } else if (message.author != MessageAuthor::Tool) {
+      assistant_run.reset();
+    }
+    if (const auto steps = rows.steps.find(message.ref.message); steps != rows.steps.end()) {
+      for (const auto& tool : steps->second) begin_assistant(tool.run, tool.id);
+    }
+    if (const auto footer = rows.footers.find(message.ref.message); footer != rows.footers.end())
+      begin_assistant(footer->second, footer->second);
+  }
   return rows;
 }
 
@@ -461,6 +481,12 @@ std::optional<std::size_t> HistoryIndex(const ChatActivityRows* activity, std::s
   if (position == history.end() ||
       (alignment == ScrollAlignment::End && *position != message && position != history.begin())) --position;
   return static_cast<std::size_t>(position - history.begin());
+}
+
+Indication ActivityDisclosureIndication(const ThemeSpec& theme) {
+  auto indication = theme.interactions.indication;
+  indication.ripple.reset();
+  return indication;
 }
 
 [[huxerui::composable]]
@@ -518,7 +544,8 @@ View ChatRunActivity(RunSnapshot run, std::vector<RunSnapshot> delegates, bool w
   const auto theme = UseTheme();
   const auto& colors = theme.colors;
   const auto style = ChatActionStyle(UseEnvironment<ButtonStyle>(), theme);
-  const auto toggle = [style, &colors, keep_reading](StringResource title, std::string key, bool open, std::function<void()> change) {
+  const auto toggle = [style, &colors, keep_reading, indication = ActivityDisclosureIndication(theme)](
+      StringResource title, std::string key, bool open, std::function<void()> change) {
     auto activate = [keep_reading, change = std::move(change)] { keep_reading(); change(); };
     return Row{
         Image(open ? huxerui_agentkit::images::chevron_down : huxerui_agentkit::images::chevron_right)
@@ -530,7 +557,7 @@ View ChatRunActivity(RunSnapshot run, std::vector<RunSnapshot> delegates, bool w
       return true;
     }).With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Center), Frame{.min_height = 24.0F},
         Padding(EdgeInsets::Symmetric(4.0F, 0.0F)),
-        Focusable{}, Semantics{.role = SemanticRole::Button, .label = title, .expanded = open}).Key(std::move(key));
+        indication, Focusable{}, Semantics{.role = SemanticRole::Button, .label = title, .expanded = open}).Key(std::move(key));
   };
   const bool show_wait = run.state != RunState::WaitingForInput && waiting >= Duration{1000};
   const bool has_work = !delegates.empty() || !run.reasoning_summary.empty() || show_wait;
@@ -564,7 +591,7 @@ View ChatRunActivity(RunSnapshot run, std::vector<RunSnapshot> delegates, bool w
         Column(std::move(entries)).With(Grow(), Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch)),
     }.With(Spacing(11.0F), CrossAlign(CrossAxisAlignment::Stretch), Padding(EdgeInsets{.left = 3.0F})));
   }
-  return Column(std::move(content)).With(Spacing(5.0F), Padding(EdgeInsets{.top = 5.0F, .left = 3.0F}),
+  return Column(std::move(content)).With(Spacing(5.0F), Padding(EdgeInsets{.top = 5.0F, .bottom = 8.0F, .left = 3.0F}),
       CrossAlign(CrossAxisAlignment::Stretch)).Key("chat-turn/" + run.id.value);
 }
 
@@ -748,6 +775,28 @@ View ConversationArtifactCard(ArtifactBlock block, ArtifactMessagePosition posit
       name.empty() ? "Artifact" : name, name.empty() ? std::string{} : "Review " + name + version, position);
 }
 
+constexpr float chat_avatar_size = 26.0F;
+constexpr float chat_avatar_gap = 7.0F;
+
+View ChatAvatar(MessageAuthor author, const std::string& agent, const ColorScheme& colors, std::optional<Image> model = {}) {
+  const bool user = author == MessageAuthor::User;
+  View icon = model
+      ? std::move(*model).Key("chat-model-avatar")
+      : View{Image(user ? huxerui_agentkit::images::person : huxerui_agentkit::images::assistant)
+            .Tint(user ? colors.on_surface_variant : colors.on_primary_container)};
+  return Stack{std::move(icon)}.With(Frame{.width = chat_avatar_size, .height = chat_avatar_size},
+      Padding(model ? 5.0F : 0.0F), CornerRadius(8.0F),
+      Background(user || model ? colors.surface_container_high : colors.primary_container),
+      Semantics{.role = SemanticRole::Image, .label = AuthorLabel(author, agent)},
+      LayoutPriority(1.0F)).Key(user ? "chat-user-avatar" : "chat-agent-avatar");
+}
+
+View AssistantChatLine(View body, std::optional<View> avatar, bool narrow) {
+  View leading = avatar ? std::move(*avatar) : View{Spacer().With(Frame{.width = chat_avatar_size}, Grow(0.0F))};
+  return Row{std::move(leading), std::move(body).With(Grow())}.With(Spacing(chat_avatar_gap),
+      Padding(EdgeInsets{.right = narrow ? 14.0F : 40.0F}));
+}
+
 View MessageView(const Message& message, const std::shared_ptr<Conversation>& conversation,
                  const OpenArtifactReview& open_artifact,
                  State<std::optional<SelectedText>> selection, bool selectable, std::optional<SteerState> steer,
@@ -755,7 +804,7 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
                  const ThemeSpec& theme,
                  Revision access_revision, const std::shared_ptr<const AgentChatLinkHandler>& links,
                  const std::optional<InlineArtifactSummary>& inline_summary,
-                 const decltype(AgentChatOptions::render_block)& render_block, std::optional<Image> model_avatar,
+                 const decltype(AgentChatOptions::render_block)& render_block, std::optional<View> assistant_avatar,
                  bool bubbles, bool narrow) {
   const auto& colors = theme.colors;
   const bool user = message.author == MessageAuthor::User;
@@ -812,19 +861,9 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
         ? std::move(body).With(Padding(EdgeInsets::Symmetric(14.0F, 9.0F)),
             CornerRadius(13.0F), Background(colors.primary_container)).Key("chat-user-bubble")
         : std::move(body).With(Padding(EdgeInsets{.top = 2.0F, .bottom = 3.0F})).Key("chat-agent-bubble");
-    View avatar_image = model_avatar
-        ? std::move(*model_avatar).Key("chat-model-avatar")
-        : View{Image(user ? huxerui_agentkit::images::person : huxerui_agentkit::images::assistant)
-              .Tint(user ? colors.on_surface_variant : colors.on_primary_container)};
-    auto avatar = Stack{std::move(avatar_image)}.With(Frame{.width = 26.0F, .height = 26.0F},
-              Padding(model_avatar ? 5.0F : 0.0F), CornerRadius(8.0F),
-              Background(user || model_avatar ? colors.surface_container_high : colors.primary_container),
-              Semantics{.role = SemanticRole::Image, .label = AuthorLabel(message.author, agent)},
-              LayoutPriority(1.0F)).Key(user ? "chat-user-avatar" : "chat-agent-avatar");
-    if (user) return Row{std::move(tile), std::move(avatar)}
-        .With(MainAlign(MainAxisAlignment::End), Spacing(7.0F), Padding(EdgeInsets{.left = narrow ? 30.0F : 64.0F}));
-    return Row{std::move(avatar), std::move(tile).With(Grow())}
-        .With(Spacing(7.0F), Padding(EdgeInsets{.right = narrow ? 14.0F : 40.0F}));
+    if (user) return Row{std::move(tile), ChatAvatar(message.author, agent, colors)}
+        .With(MainAlign(MainAxisAlignment::End), Spacing(chat_avatar_gap), Padding(EdgeInsets{.left = narrow ? 30.0F : 64.0F}));
+    return AssistantChatLine(std::move(tile), std::move(assistant_avatar), narrow);
   }
   if (!user) return body;
   return Row{
@@ -983,13 +1022,14 @@ View ChatToolStep(ToolCallSnapshot call, std::string label, std::shared_ptr<cons
   if (applied) header.push_back(Text(StringVariant::Format(huxerui_agentkit::strings::ui_tool_changes_applied, applied),
       TextRole::Label).Style({Font::System(12.0F), colors.on_surface_variant}));
   View heading = Flow(std::move(header)).With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Center),
-      Frame{.min_height = 22.0F}, Padding(EdgeInsets::Symmetric(3.0F, 1.0F)));
+      Frame{.min_height = 22.0F}, Padding(EdgeInsets::Symmetric(0.0F, 1.0F)));
   if (can_expand && !approval) {
     heading = std::move(heading).OnClick(toggle).On<ViewEvents::KeyDown>([toggle](const KeyEvent& event) {
       if (event.key != Key::Enter && event.key != Key::Space) return false;
       if (!event.repeat) toggle();
       return true;
-    }).With(Focusable{}, Semantics{.role = SemanticRole::Button, .label = text, .expanded = expanded});
+    }).With(ActivityDisclosureIndication(theme), Focusable{},
+        Semantics{.role = SemanticRole::Button, .label = text, .expanded = expanded});
   }
   std::vector<View> body {std::move(heading).Key("chat-tool-toggle/" + call.id.value)};
   if (approval) body.push_back(std::move(*approval));
@@ -1019,7 +1059,8 @@ View ChatToolStep(ToolCallSnapshot call, std::string label, std::shared_ptr<cons
     if (!details.empty()) body.push_back(Column(std::move(details)).With(Spacing(6.0F),
         Padding(EdgeInsets{.bottom = 6.0F, .left = 22.0F}), CrossAlign(CrossAxisAlignment::Stretch)));
   }
-  return Column(std::move(body)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch))
+  return Column(std::move(body)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch),
+      Padding(EdgeInsets{.bottom = 4.0F}))
       .Key("chat-tool/" + call.id.value);
 }
 
@@ -1565,7 +1606,14 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
   const auto history_loading = UseState(false);
   const auto history_initialized = UseState(false);
   const auto history_controller = UseScrollController();
-  using ScrollRequest = std::pair<Sequence, ScrollAlignment>;
+  struct ScrollRequest {
+    Sequence sequence;
+    ScrollAlignment alignment;
+    std::optional<InteractionId> approval;
+    ScrollMetrics before_approval;
+
+    bool operator==(const ScrollRequest&) const = default;
+  };
   const auto history_scroll = UseState(std::optional<ScrollRequest>{});
   const auto follow_paused = UseState(false);
   const auto keep_reading = [history_controller, history_scroll, follow_paused] {
@@ -1718,9 +1766,10 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
               if (call != incoming->tools.end() && call->registered_sequence) {
                 const auto after = std::ranges::upper_bound(incoming->messages, *call->registered_sequence, {}, &Message::sequence);
                 const auto anchor = after == incoming->messages.begin() ? after : std::prev(after);
-                history_scroll = ScrollRequest{anchor->sequence, ScrollAlignment::End};
+                history_scroll = ScrollRequest{anchor->sequence, ScrollAlignment::End, approval->id, viewport};
               }
-            } else if (first || sent || (!follow_paused.Get() && (!previous || previous->through_sequence != incoming->through_sequence) &&
+            } else if (first || sent || (!follow_paused.Get() && (!history_scroll.Get() || !history_scroll.Get()->approval) &&
+                                        (!previous || previous->through_sequence != incoming->through_sequence) &&
                                         viewport.viewport_extent > 0.0F && viewport.maximum_offset - viewport.offset <= 24.0F)) {
               history_scroll = ScrollRequest{incoming->messages.back().sequence, ScrollAlignment::End};
             }
@@ -2016,16 +2065,24 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
   const auto request = history_scroll.Get();
   std::optional<std::size_t> scroll_item;
   if (request && !current->messages.empty()) {
-    const auto position = std::ranges::lower_bound(current->messages, request->first, {}, &Message::sequence);
+    const auto position = std::ranges::lower_bound(current->messages, request->sequence, {}, &Message::sequence);
     const auto message = position == current->messages.end() ? current->messages.size() - 1 :
         static_cast<std::size_t>(position - current->messages.begin());
-    scroll_item = HistoryIndex(activity.get(), message, request->second);
+    scroll_item = HistoryIndex(activity.get(), message, request->alignment);
   }
-  Lifecycle([history_scroll, history_controller, request, scroll_item, earlier] {
+  const auto scroll_metrics = history_controller.Metrics();
+  const bool approval_pending = !request || !request->approval || std::ranges::any_of(current->interactions, [&](const auto& item) {
+    return item.id == *request->approval && InlineToolApproval(item);
+  });
+  const bool waiting_for_approval_layout = request && request->approval &&
+      scroll_metrics.content_extent == request->before_approval.content_extent &&
+      scroll_metrics.viewport_extent == request->before_approval.viewport_extent;
+  Lifecycle([history_scroll, history_controller, request, scroll_item, earlier, approval_pending, waiting_for_approval_layout] {
     if (!request) return;
+    if (approval_pending && waiting_for_approval_layout) return;
     history_scroll = std::nullopt;
-    if (scroll_item) history_controller.ScrollToItem(*scroll_item + earlier, request->second);
-  }, request, scroll_item, earlier);
+    if (scroll_item && approval_pending) history_controller.ScrollToItem(*scroll_item + earlier, request->alignment);
+  }, request, scroll_item, earlier, approval_pending, waiting_for_approval_layout);
   const auto summary_item = summary_scroll ? HistoryIndex(activity.get(), *summary_scroll, ScrollAlignment::Start) : std::nullopt;
   Lifecycle([history_controller, summary_item, earlier] {
     if (summary_item) history_controller.ScrollToItem(*summary_item + earlier, ScrollAlignment::Start);
@@ -2052,7 +2109,6 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
     std::optional<SteerState> steer;
     std::optional<View> recover;
     std::string agent;
-    std::optional<Image> model_avatar;
     if (message.run) {
       const auto run = std::ranges::find(current->runs, *message.run, &RunSnapshot::id);
       if (run != current->runs.end()) {
@@ -2063,10 +2119,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
               Button(huxerui_agentkit::strings::ui_restore_draft).OnClick([restore, command = *found->recovery] { restore(command); })
                   .With(Enabled(can_restore)).Key("restore-supplement"));
         }
-        if (message.author == MessageAuthor::Agent) {
-          if (agent_label) agent = agent_label(run->agent);
-          if (avatar_for) model_avatar = (*avatar_for)(run->model, theme.colors.on_surface);
-        }
+        if (agent_label && message.author == MessageAuthor::Agent) agent = agent_label(run->agent);
       }
     }
     std::optional<View> selection_actions;
@@ -2075,22 +2128,37 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
       selection_actions = MessageSelectionActions(conversation, snapshot, *selected, selection, range_anchor, draft_sources, selection_focus,
           focus_cited_draft);
     }
+    const auto assistant_avatar = [&](const auto& entry, const std::optional<RunId>& run_id) -> std::optional<View> {
+      if (!bubbles || (activity && !activity->assistant_starts.contains(entry))) return std::nullopt;
+      const auto run = run_id ? std::ranges::find(current->runs, *run_id, &RunSnapshot::id) : current->runs.end();
+      if (run == current->runs.end()) return ChatAvatar(MessageAuthor::Agent, {}, theme.colors);
+      return ChatAvatar(MessageAuthor::Agent, agent_label ? agent_label(run->agent) : std::string{}, theme.colors,
+          avatar_for ? (*avatar_for)(run->model, theme.colors.on_surface) : std::nullopt);
+    };
     const auto make_message = [&](const Message& displayed) {
       return MessageView(displayed, conversation, open_artifact, selection,
         selection_enabled && (!side_chat || message.author == MessageAuthor::Agent), steer, std::move(recover),
         std::move(selection_actions),
         std::move(agent), theme, current->access_revision, links, inline_summary, render_block,
-        std::move(model_avatar), bubbles, narrow)
+        message.author == MessageAuthor::Agent ? assistant_avatar(message.ref.message, message.run) : std::nullopt,
+        bubbles, narrow)
         .Key(message.ref.message.value);
     };
     if (!activity) return make_message(message).With(Padding(EdgeInsets{.top = 2.0F, .bottom = 18.0F}));
     std::vector<View> row;
+    const auto add_message = [&](const Message& displayed) {
+      auto view = make_message(displayed);
+      if (bubbles && message.author == MessageAuthor::Tool && message.run)
+        view = AssistantChatLine(std::move(view), assistant_avatar(message.ref.message, message.run), narrow);
+      row.push_back(Column{std::move(view)}.With(CrossAlign(CrossAxisAlignment::Stretch),
+          Padding(EdgeInsets{.top = 2.0F, .bottom = 10.0F})));
+    };
     if (activity->outputs.contains(message.ref.message)) {
       auto artifacts = message;
       std::erase_if(artifacts.blocks, [](const auto& block) { return !ShowsToolOutputInHistory(block); });
-      if (!artifacts.blocks.empty()) row.push_back(make_message(artifacts));
+      if (!artifacts.blocks.empty()) add_message(artifacts);
     } else {
-      row.push_back(make_message(message));
+      add_message(message);
     }
     if (const auto steps = activity->steps.find(message.ref.message); steps != activity->steps.end()) {
       for (const auto& tool : steps->second) {
@@ -2104,9 +2172,11 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
           approval = PendingApprovalView(*pending->second, conversation, tasks, error, *current, open_artifact,
               action_style, theme.colors, attachment_label).Key(pending->second->id.value);
         }
-        row.push_back(ChatToolStep(tool, ActivityToolLabel(tool.tool, tool_label),
+        auto step = ChatToolStep(tool, ActivityToolLabel(tool.tool, tool_label),
             std::shared_ptr<const Message>(current, &message), std::move(output), conversation, render_block,
-            opened_steps, keep_reading, std::move(approval)));
+            opened_steps, keep_reading, std::move(approval));
+        row.push_back(bubbles ? AssistantChatLine(std::move(step), assistant_avatar(tool.id, tool.run), narrow).Key(tool.id.value)
+                              : std::move(step));
       }
     }
     if (const auto footer = activity->footers.find(message.ref.message); footer != activity->footers.end()) {
@@ -2123,12 +2193,11 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
           };
         }
       }
-      row.push_back(ChatRunActivity(turn.run, turn.delegates, turn.waits_for_approval, keep_reading, std::move(show_changes)));
+      auto details = ChatRunActivity(turn.run, turn.delegates, turn.waits_for_approval, keep_reading, std::move(show_changes));
+      row.push_back(bubbles ? AssistantChatLine(std::move(details), assistant_avatar(turn.run.id, turn.run.id), narrow).Key(turn.run.id.value)
+                            : std::move(details));
     }
-    const bool steps_only = activity->outputs.contains(message.ref.message) &&
-        !std::ranges::any_of(message.blocks, ShowsToolOutputInHistory);
-    return Column(std::move(row)).With(Spacing(steps_only ? 3.0F : 6.0F), CrossAlign(CrossAxisAlignment::Stretch),
-        Padding(EdgeInsets{.top = steps_only ? 0.0F : 2.0F, .bottom = steps_only ? 2.0F : 10.0F}))
+    return Column(std::move(row)).With(Spacing(0.0F), CrossAlign(CrossAxisAlignment::Stretch))
         .Key("chat-history-row/" + message.ref.message.value);
   }).EstimatedItemExtent(76.0F).Controller(history_controller).With(Grow(), ScrollBar(), ResumeHistoryFollow{.paused = follow_paused})
       .Key("agent-chat-history");
