@@ -246,6 +246,7 @@ Task<void> VerifyModelAttachments() {
   const ArtifactRef first{{"preview-image"}, 1};
   const ArtifactRef second{first.id, 2};
   const ArtifactRef imported{{"picked-image"}, 1};
+  const ArtifactRef side_image{{"side-image"}, 1};
   const ToolId publish{"attachment.publish"};
   auto model = std::make_shared<AttachmentModel>();
   bool allow_send = true;
@@ -261,7 +262,7 @@ Task<void> VerifyModelAttachments() {
       .artifact_store = {.open = [&](ArtifactResolveRequest request) -> Async<AsyncInputStream> {
         ++opens;
         Check(request.actor.kind == ActionParty::Kind::Agent && request.storage_handle ==
-              (request.artifact == imported ? "3" : std::to_string(request.artifact.version)),
+              ((request.artifact == imported || request.artifact == side_image) ? "3" : std::to_string(request.artifact.version)),
               "Opening did not use the authorized artifact version");
         co_return AgentResult<AsyncInputStream>::Success(AsyncInputStream::FromReader(
             [&, bytes = "v" + request.storage_handle, offset = std::size_t{0}](std::stop_token stop, std::size_t limit) mutable
@@ -275,7 +276,7 @@ Task<void> VerifyModelAttachments() {
       }, .resolve_staged_attachment = [&](ActionParty actor, SessionId session, ArtifactId id) -> Async<ArtifactDraft> {
         ++imports;
         Check(actor.principal == PrincipalId{"operator"} && actor.kind == ActionParty::Kind::User &&
-              !session.value.empty() && id == imported.id, "Staged attachment resolution lost the user submission");
+              !session.value.empty() && (id == imported.id || id == side_image.id), "Staged attachment resolution lost the user submission");
         co_return AgentResult<ArtifactDraft>::Success({.id = std::move(id), .type = "image/png",
             .name = "Picked image", .storage_handle = "3", .size_bytes = 2});
       }}}));
@@ -314,6 +315,8 @@ Task<void> VerifyModelAttachments() {
   Take(co_await source->SendAsync(NewCommandId(), {.text = "Revise"}));
   co_await done(source);
   Check(source->Snapshot()->artifacts == std::vector{first, second}, "The fixture did not publish two image versions");
+  const auto source_id = source->Snapshot()->summary.id;
+  const auto source_message = source->Snapshot()->messages.front().ref;
 
   auto reader = co_await start({"attachment.reader"}, {.text = "Read the old image", .attachments = {first, first}});
   co_await done(reader);
@@ -389,6 +392,37 @@ Task<void> VerifyModelAttachments() {
     const auto* artifact = std::get_if<ArtifactBlock>(&block.body);
     return artifact && artifact->artifact == imported && artifact->name == "Picked image";
   }), "First-message attachment was not visible at its committed version");
+  const auto side_command = NewCommandId();
+  const CreateSessionRequest side_request{
+      .options = {.agent = {"attachment.reader"}, .retention = SessionRetention::Ephemeral},
+      .initial = SendInput{.text = "Compare the selection with this image", .staged_attachments = {side_image.id}},
+      .side_chat = SideChatSeed{source_id, {SourceSlice{source_message}}}};
+  allow_send = false;
+  Take(co_await runtime->RefreshAccessAsync());
+  CheckError(co_await runtime->Sessions().CreateAsync(side_command, side_request), ErrorCode::PermissionDenied,
+      "A side-chat attachment bypassed authorization");
+  Check(imports == 1, "An unauthorized side-chat attachment was imported");
+  allow_send = true;
+  Take(co_await runtime->RefreshAccessAsync());
+  const auto side = std::get<SessionCreated>(
+      Take(co_await runtime->Sessions().CreateAsync(side_command, side_request)).outcome);
+  const auto side_replay = std::get<SessionCreated>(
+      Take(co_await runtime->Sessions().CreateAsync(side_command, side_request)).outcome);
+  const auto side_chat = Take(co_await runtime->Sessions().OpenAsync(side.session));
+  co_await done(side_chat);
+  Check(side.session == side_replay.session && imports == 2 && side_chat->Snapshot()->artifacts == std::vector{side_image} &&
+        side_chat->Snapshot()->summary.workspace == std::nullopt &&
+        model->turns.size() == 5 && model->turns.back().media == std::vector{std::pair{side_image, std::string("v3")}},
+        "The side-chat attachment did not remain separate from its parent and submit exactly once");
+  CheckError(co_await side_chat->SendAsync(NewCommandId(), {.text = "Read the original file", .attachments = {first}}),
+      ErrorCode::PermissionDenied, "Side chat attached a file from its parent");
+  CheckError(co_await side_chat->SendAsync(NewCommandId(), {.text = "Quote its message", .context = {SourceSlice{source_message}}}),
+      ErrorCode::PermissionDenied, "Side chat bypassed the original parent selection");
+  const auto own_message = side_chat->Snapshot()->messages.front().ref;
+  Take(co_await side_chat->SendAsync(NewCommandId(), {.text = "Explain this again", .context = {SourceSlice{own_message}}}));
+  co_await done(side_chat);
+  Check(side_chat->Snapshot()->runs.back().state == RunState::Succeeded, "Side chat could not quote its own message");
+
   Take(co_await runtime->CloseAsync());
 }
 

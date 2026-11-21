@@ -11,6 +11,10 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <cctype>
+#include <initializer_list>
+#include <span>
 
 namespace agentkit_preview {
 namespace {
@@ -21,6 +25,72 @@ using namespace std::chrono_literals;
 constexpr std::string_view full_access_prefix = "preview.full/";
 constexpr std::string_view model_slot_prefix = "preview.profile/";
 constexpr auto separator = "  \xc2\xb7  ";
+
+struct ModelBrand {
+  std::initializer_list<std::string_view> families;
+  ImageResource image;
+  bool tint = false;
+
+  Image Icon(Color foreground) const {
+    Image icon(image);
+    return tint ? std::move(icon).Tint(foreground) : std::move(icon);
+  }
+};
+
+const ModelBrand model_brands[]{
+    {{"gpt", "chatgpt", "codex", "o1", "o3", "o4"}, ::app::images::model_openai, true},
+    {{"claude"}, ::app::images::model_claude},
+    {{"gemini"}, ::app::images::model_gemini},
+    {{"gemma"}, ::app::images::model_gemma},
+    {{"deepseek"}, ::app::images::model_deepseek},
+    {{"qwen", "qwq", "qvq"}, ::app::images::model_qwen},
+    {{"grok"}, ::app::images::model_grok, true},
+    {{"llama", "code-llama", "codellama"}, ::app::images::model_llama},
+    {{"mistral", "mixtral", "ministral", "codestral", "devstral", "pixtral", "magistral"}, ::app::images::model_mistral},
+    {{"kimi", "moonshot"}, ::app::images::model_kimi, true},
+    {{"glm", "chatglm"}, ::app::images::model_glm},
+    {{"doubao", "seed-oss"}, ::app::images::model_doubao},
+    {{"hunyuan"}, ::app::images::model_hunyuan},
+    {{"minimax", "abab"}, ::app::images::model_minimax},
+    {{"command", "aya"}, ::app::images::model_cohere},
+    {{"sonar"}, ::app::images::model_perplexity},
+    {{"nova"}, ::app::images::model_nova, true},
+    {{"nemotron"}, ::app::images::model_nvidia},
+    {{"ernie", "wenxin"}, ::app::images::model_wenxin},
+    {{"spark"}, ::app::images::model_spark},
+    {{"step", "stepfun"}, ::app::images::model_stepfun},
+    {{"longcat"}, ::app::images::model_longcat, true},
+    {{"mimo"}, ::app::images::model_mimo, true},
+    {{"baichuan"}, ::app::images::model_baichuan},
+    {{"yi"}, ::app::images::model_yi, true},
+};
+
+std::string SearchableModelName(std::string text) {
+  std::ranges::transform(text, text.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  return text;
+}
+
+const ModelBrand* FindModelBrand(const std::string& model) {
+  const auto name = SearchableModelName(model);
+  std::string_view id = name;
+  if (const auto slash = id.find_last_of('/'); slash != std::string_view::npos) id.remove_prefix(slash + 1);
+  constexpr std::string_view regions[]{"us.", "eu.", "apac.", "global.", "jp.", "au."};
+  constexpr std::string_view publishers[]{
+      "amazon.", "anthropic.", "cohere.", "deepseek.", "google.", "meta.", "mistral.", "openai.", "qwen."};
+  for (const auto prefixes : {std::span<const std::string_view>{regions}, std::span<const std::string_view>{publishers}}) {
+    const auto prefix = std::ranges::find_if(prefixes, [id](auto part) { return id.starts_with(part); });
+    if (prefix != prefixes.end()) id.remove_prefix(prefix->size());
+  }
+  const auto brand = std::ranges::find_if(model_brands, [id](const auto& entry) {
+    return std::ranges::any_of(entry.families, [id](std::string_view family) {
+      if (!id.starts_with(family)) return false;
+      if (id.size() == family.size()) return true;
+      const char suffix = id[family.size()];
+      return suffix == '-' || suffix == '_' || suffix == '.' || suffix == ':' || (suffix >= '0' && suffix <= '9');
+    });
+  });
+  return brand == std::end(model_brands) ? nullptr : brand;
+}
 
 StringVariant ProfileLabel(const std::optional<kit::ExecutionProfileRef>& profile) {
   if (!profile || *profile == AskProfile) return ::app::strings::ui_ask;
@@ -103,20 +173,22 @@ kit::Async<kit::ToolReviewResult> ReviewChartWithModel(const kit::ModelRegistrat
 RunSettings::RunSettings(std::function<kit::TimePoint()> clock)
     : clock_(clock ? std::move(clock) : [] { return std::chrono::time_point_cast<kit::Duration>(std::chrono::system_clock::now()); }) {}
 
-void RunSettings::AddModel(const kit::ModelRegistration& registration, std::string label) {
+void RunSettings::AddModel(const kit::ModelRegistration& registration, std::string label, ModelLimits limits) {
   if (std::ranges::find(models_, registration.ref, &ModelChoice::ref) != models_.end()) return;
   const auto& endpoint = registration.endpoint;
-  auto name = label.empty() ? endpoint.model : label;
-  if (label.empty()) label = name + separator + endpoint.provider + " / " + endpoint.protocol;
+  auto name = label.empty() ? endpoint.model : std::move(label);
   if (std::string_view identity = registration.ref.id.value; identity.starts_with(model_slot_prefix)) {
     identity.remove_prefix(model_slot_prefix.size());
-    auto profile = std::string(separator) + std::string(identity.substr(0, identity.find('/')));
-    label += profile;
-    name += profile;
+    name += std::string(separator) + std::string(identity.substr(0, identity.find('/')));
+  }
+  auto location = endpoint.provider;
+  if (endpoint.base_url) {
+    const auto uri = Uri::Parse(*endpoint.base_url);
+    if (uri && uri->Authority()) location = std::string(*uri->Authority()) + std::string(uri->Path());
   }
   const auto caps = registration.provider->Capabilities();
-  models_.push_back({registration.ref, std::move(label), std::move(name), registration.ref != DemoModel,
-                     caps.text_stream && caps.structured_output, caps});
+  models_.push_back({registration.ref, name, std::move(name), registration.ref != DemoModel,
+      caps.text_stream && caps.structured_output, caps, std::move(location), endpoint.protocol, limits, endpoint.model});
 }
 
 void RunSettings::SetDefaults(kit::ModelProviderRef general, std::optional<kit::ModelProviderRef> code) {
@@ -133,13 +205,26 @@ std::vector<ModelChoice> RunSettings::Models(const kit::AgentId& agent) const {
   std::ranges::copy_if(models_, std::back_inserter(result), [&](const ModelChoice& choice) {
     return choice.suitable && (agent != CodeAgent || choice.code);
   });
+  for (auto& choice : result) {
+    if (std::ranges::count(result, choice.name, &ModelChoice::name) > 1) choice.label += separator + choice.endpoint;
+  }
   return result;
 }
 
 StringVariant RunSettings::ModelLabel(const std::optional<kit::ModelProviderRef>& ref) const {
   if (ref == DemoModel) return ::app::strings::ui_local_demo_model;
   const auto found = ref ? std::ranges::find(models_, *ref, &ModelChoice::ref) : models_.end();
-  return found == models_.end() ? StringVariant{::app::strings::ui_unavailable_model} : StringVariant{found->label};
+  if (found == models_.end()) return ::app::strings::ui_unavailable_model;
+  return std::ranges::count(models_, found->name, &ModelChoice::name) > 1
+      ? found->name + separator + found->endpoint : found->name;
+}
+
+std::optional<Image> RunSettings::ModelAvatar(const kit::ModelProviderRef& ref, Color foreground) const {
+  const auto found = std::ranges::find(models_, ref, &ModelChoice::ref);
+  if (found == models_.end()) return {};
+  const auto* brand = FindModelBrand(found->model_id);
+  if (!brand) return {};
+  return brand->Icon(foreground);
 }
 
 kit::ModelCapabilities RunSettings::Capabilities(const std::optional<kit::ModelProviderRef>& ref,
@@ -250,80 +335,280 @@ constexpr bool saves_direct_api_keys = true;
 constexpr bool saves_direct_api_keys = false;
 #endif
 
+using LimitFields = std::array<TextEditingValue, 3>;
+using CatalogSelection = std::map<std::string, LimitFields, std::less<>>;
+
+LimitFields EditLimits(const ModelLimits& limits = {}) {
+  const auto field = [](auto value) { return TextEditingValue::FromText(value ? std::to_string(*value) : ""); };
+  return {field(limits.context_window), field(limits.max_input_tokens), field(limits.max_output_tokens)};
+}
+
+ModelLimits ReadLimits(const LimitFields& fields) {
+  const auto read = [](const TextEditingValue& field) -> std::optional<std::uint64_t> {
+    if (field.text.empty()) return {};
+    const auto* end = field.text.data() + field.text.size();
+    std::uint64_t amount = 0;
+    const auto parsed = std::from_chars(field.text.data(), end, amount);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || !amount)
+      throw std::invalid_argument("Token limits must be positive whole numbers.");
+    return amount;
+  };
+  return {read(fields[0]), read(fields[1]), read(fields[2])};
+}
+
+View ModelLimitFields(const LimitFields& fields, bool enabled, const ColorScheme& colors,
+                      std::function<void(std::size_t, TextEditingValue)> change) {
+  const auto& strings = std::array{::app::strings::ui_model_context_window, ::app::strings::ui_model_max_input,
+      ::app::strings::ui_model_max_output};
+  std::vector<View> row;
+  for (std::size_t i = 0; i < fields.size(); ++i) {
+    auto input = TextField(fields[i]).Label(strings[i]).Placeholder(::app::strings::ui_model_limit_unknown)
+        .Variant(TextFieldVariant::Outlined).InputConfiguration({.type = TextInputType::Number})
+        .OnChanged([change, i](const TextEditingValue& value) { change(i, value); })
+        .With(Enabled(enabled)).Key("model-limit-" + std::to_string(i));
+    row.push_back(PreviewLabeledField(strings[i], std::move(input), colors).With(Grow()));
+  }
+  return Row(std::move(row)).With(Spacing(6.0F));
+}
+
 [[huxerui::composable]]
 View AddModelDialog(DialogContext dialog, AddModelProfile add_model, std::function<void(kit::ModelProviderRef)> select) {
   const auto format = UseState(std::size_t{0});
   const auto model = UseState(TextEditingValue::FromText({}));
   const auto url = UseState(TextEditingValue::FromText({}));
   const auto api_key = UseState(TextEditingValue::FromText({}));
+  const auto search = UseState(TextEditingValue::FromText({}));
+  const auto limits = UseState(EditLimits());
+  const auto catalog = UseState(std::shared_ptr<const std::vector<DiscoveredModel>>{});
+  const auto selected = UseState(CatalogSelection{});
+  const auto show_catalog = UseState(false);
+  const auto show_connection = UseState(false);
+  const auto show_limits = UseState(false);
   const auto image_input = UseState(false);
   const auto file_input = UseState(false);
   const auto reasoning_summary = UseState(false);
-  const auto busy = UseState(false);
+  const auto fetching = UseState(false);
+  const auto saving = UseState(false);
   const auto error = UseState(std::string{});
-  const auto tasks = UseApplicationTaskScope();
-  const auto theme = UseTheme();
-  const auto color = theme.colors;
-  const auto save = [dialog, add_model, select, format, model, url, api_key, image_input, file_input, reasoning_summary, busy, error, tasks] {
-    if (busy.Get() || model->text.empty() || url->text.empty()) return;
+  const auto tasks = UseTaskScope();
+  const auto application_tasks = UseApplicationTaskScope();
+  const auto client = UseService<HttpClient>();
+  const auto color = UseTheme().colors;
+  const auto busy = fetching.Get() || saving.Get();
+  const auto invalid_limits = UseString(::app::strings::ui_model_token_limit_invalid);
+  const auto profile = [format, url, api_key, image_input, file_input, reasoning_summary] {
     const auto api = model_api_formats.at(format.Get());
     const bool gemini = std::string_view(api.provider) == "gemini";
-    ModelProfileInput input{.model = model->text, .base_url = url->text, .protocol = api.protocol, .provider = api.provider,
+    return ModelProfileInput{.base_url = url->text, .protocol = api.protocol, .provider = api.provider,
         .api_key = api_key->text, .image_input = gemini && image_input.Get(), .file_input = gemini && file_input.Get(),
-        .reasoning_summary = std::string_view(api.provider) == "openai" && std::string_view(api.protocol) == "responses" &&
-            reasoning_summary.Get()};
-    busy = true;
+        .reasoning_summary = std::string_view(api.protocol) == "responses" && reasoning_summary.Get()};
+  };
+  const auto clear_catalog = [catalog, selected, show_catalog, error] {
+    catalog = std::shared_ptr<const std::vector<DiscoveredModel>>{};
+    selected = CatalogSelection{};
+    show_catalog = false;
     error = "";
-    tasks.Launch([dialog, add_model, select, api_key, busy, error, input = std::move(input)]() mutable -> Task<void> {
-      auto result = co_await add_model(std::move(input));
-      busy = false;
+  };
+  const auto fetch = [profile, client, tasks, fetching, saving, catalog, show_catalog, show_connection, search, error] {
+    if (!client || fetching.Get() || saving.Get()) return;
+    fetching = true;
+    error = "";
+    tasks.Launch([request = profile(), client, fetching, catalog, show_catalog, show_connection, search, error]() mutable -> Task<void> {
+      auto result = co_await DiscoverModels(std::move(request), client);
+      fetching = false;
       if (!result.Succeeded()) { error = result.Error().message; co_return; }
+      catalog = std::make_shared<const std::vector<DiscoveredModel>>(std::move(result).Value());
+      show_catalog = true;
+      show_connection = false;
+      search = TextEditingValue::FromText({});
+    });
+  };
+  const auto save = [dialog, profile, add_model, select, model, limits, selected, show_catalog, api_key, saving, fetching,
+                     error, invalid_limits, show_limits, application_tasks] {
+    if (saving.Get() || fetching.Get()) return;
+    std::vector<ModelProfileInput> entries;
+    const auto make = [&entries, &profile](std::string name, const LimitFields& fields) {
+      auto value = profile();
+      value.model = std::move(name);
+      value.limits = ReadLimits(fields);
+      entries.push_back(std::move(value));
+    };
+    try {
+      if (show_catalog.Get()) {
+        for (const auto& [id, fields] : selected.Get()) make(id, fields);
+      } else if (!TrimModelField(model->text).empty()) {
+        make(model->text, limits.Get());
+      }
+    } catch (const std::invalid_argument&) {
+      if (!show_catalog.Get()) show_limits = true;
+      error = invalid_limits;
+      return;
+    }
+    if (entries.empty() || TrimModelField(entries.front().base_url).empty()) return;
+    saving = true;
+    error = "";
+    application_tasks.Launch([dialog, add_model, select, api_key, selected, saving, error,
+                              entries = std::move(entries)]() mutable -> Task<void> {
+      std::optional<kit::ModelProviderRef> added;
+      std::string failures;
+      for (auto& entry : entries) {
+        const auto name = entry.model;
+        auto result = co_await add_model(std::move(entry));
+        if (result.Succeeded()) {
+          if (!added) added = std::move(result).Value();
+          auto pending = selected.Get();
+          pending.erase(name);
+          selected = std::move(pending);
+        } else {
+          if (!failures.empty()) failures += '\n';
+          failures += name + separator + result.Error().message;
+        }
+      }
+      saving = false;
+      if (added && select) select(*added);
+      if (!failures.empty()) { error = std::move(failures); co_return; }
       api_key = TextEditingValue::FromText({});
-      select(std::move(result).Value());
       dialog.Dismiss();
     });
   };
   const auto button_style = UseEnvironment<ButtonStyle>();
   const auto secondary = PreviewSecondaryButton(button_style, color);
-  const auto save_style = PreviewPrimaryButton(button_style, color);
-  const auto fields = PreviewFormFieldStyle(UseEnvironment<TextFieldStyle>(), color);
-  std::vector<View> content{
-      Text(::app::strings::ui_add_model, TextRole::Title)
-          .Style({Font::System(23.0F).WithWeight(FontWeight::SemiBold), color.on_surface}),
-      Select(model_api_formats, format, [](const ModelApiFormat& item) { return Text(item.label); })
-          .Label(::app::strings::ui_api_format).OnChanged([format](std::size_t index) { format = index; }).Key("add-model-api"),
-      TextField(url).Label(::app::strings::ui_api_base_url).Placeholder("https://provider.example/v1").Variant(TextFieldVariant::Outlined)
-          .OnChanged([url](const TextEditingValue& value) { url = value; }).Key("add-model-url"),
-      TextField(model).Label(::app::strings::ui_model_id).Variant(TextFieldVariant::Outlined)
-          .OnChanged([model](const TextEditingValue& value) { model = value; }).Key("add-model-id"),
-      TextField(api_key).Label(::app::strings::ui_api_key).Placeholder(::app::strings::ui_optional_paste_a_key_or_enter_env)
-          .Variant(TextFieldVariant::Outlined).Secure()
-          .OnChanged([api_key](const TextEditingValue& value) { api_key = value; }).Key("add-model-key"),
-  };
-  if (!saves_direct_api_keys && !api_key->text.empty() && !api_key->text.starts_with("${")) {
-    content.push_back(Text(::app::strings::ui_direct_keys_are_available_until_preview_closes, TextRole::Label));
-  }
-  if (std::string_view(model_api_formats.at(format.Get()).provider) == "gemini") {
-    content.push_back(Row{
-        Checkbox(::app::strings::ui_image_input, image_input.Get()).OnChanged([image_input](bool enabled) { image_input = enabled; }),
-        Checkbox(::app::strings::ui_pdf_input, file_input.Get()).OnChanged([file_input](bool enabled) { file_input = enabled; }),
-    }.With(Spacing(12.0F)));
-  }
+  const auto primary = PreviewPrimaryButton(button_style, color);
+  auto fields = UseEnvironment<TextFieldStyle>();
+  fields.show_label = false;
   const auto api = model_api_formats.at(format.Get());
-  if (std::string_view(api.provider) == "openai" && std::string_view(api.protocol) == "responses") {
+  const auto placeholder = std::string_view(api.provider) == "gemini" ? "https://generativelanguage.googleapis.com/v1beta" :
+      std::string_view(api.provider) == "anthropic" ? "https://api.anthropic.com/v1" : "https://provider.example/v1";
+  const auto heading = [color](StringResource label) {
+    return Text(label, TextRole::Label).Style({Font::System(14.0F).WithWeight(FontWeight::SemiBold), color.on_surface});
+  };
+  std::vector<View> connection;
+  if (show_catalog.Get() && !show_connection.Get()) {
+    connection.push_back(Row {
+      Text(url->text, TextRole::Label).LineLimit(1).Overflow(TextOverflow::Ellipsis)
+          .With(Grow(), Tooltip(url->text), Foreground(color.on_surface_variant)),
+      ProvideEnvironment(secondary, Button(::app::strings::ui_model_connection).OnClick([show_connection] {
+        show_connection = true;
+      }).With(Enabled(!busy))),
+    }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)));
+  } else {
+    const auto format_label = ::app::strings::ui_api_format;
+    const auto endpoint_label = ::app::strings::ui_api_base_url;
+    const auto key_label = ::app::strings::ui_api_key;
+    connection = {
+      heading(::app::strings::ui_model_connection_heading),
+      PreviewLabeledField(format_label, Select(model_api_formats, format, [](const ModelApiFormat& item) {
+        return Text(item.label).LineLimit(1).Overflow(TextOverflow::Ellipsis);
+      }).Label(format_label).OnChanged([format, clear_catalog](std::size_t index) {
+        format = index;
+        clear_catalog();
+      }).With(Enabled(!busy)).Key("add-model-api"), color),
+      PreviewLabeledField(endpoint_label, TextField(url).Label(endpoint_label).Placeholder(placeholder).Variant(TextFieldVariant::Outlined)
+          .OnChanged([url, clear_catalog](const TextEditingValue& value) { url = value; clear_catalog(); })
+          .With(Enabled(!busy)).Key("add-model-url"), color),
+      PreviewLabeledField(key_label, TextField(api_key).Label(key_label).Placeholder(::app::strings::ui_optional_paste_a_key_or_enter_env)
+          .Variant(TextFieldVariant::Outlined).Secure()
+          .OnChanged([api_key, clear_catalog](const TextEditingValue& value) { api_key = value; clear_catalog(); })
+          .With(Enabled(!busy)).Key("add-model-key"), color),
+    };
+  }
+  if (!saves_direct_api_keys && !api_key->text.empty() && !api_key->text.starts_with("${")) {
+    connection.push_back(Text(::app::strings::ui_direct_keys_are_available_until_preview_closes, TextRole::Label));
+  }
+  std::vector<View> content {
+    Column(std::move(connection)).With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch)),
+    ProvideEnvironment(DividerStyle{color.outline}, Divider()),
+  };
+  std::vector<View> discovery{Button(fetching.Get() ? ::app::strings::ui_fetching_models : ::app::strings::ui_fetch_models)
+      .OnClick(fetch).With(Enabled(!busy && bool(client) && !TrimModelField(url->text).empty())).Key("fetch-models")};
+  if (catalog.Get()) {
+    discovery.push_back(Button(show_catalog.Get() ? ::app::strings::ui_enter_model_manually : ::app::strings::ui_show_model_catalog)
+        .OnClick([show_catalog] { show_catalog = !show_catalog.Get(); }).With(Enabled(!busy)));
+  }
+  content.push_back(Row {
+    heading(::app::strings::ui_models).With(Grow()),
+    ProvideEnvironment(secondary, Flow(std::move(discovery)).With(Spacing(6.0F))),
+  }.With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center)));
+  if (show_catalog.Get() && catalog.Get()) {
+    const auto query = SearchableModelName(search->text);
+    std::vector<DiscoveredModel> results;
+    for (const auto& item : *catalog.Get()) {
+      if (query.empty() || SearchableModelName(item.id + " " + item.name).find(query) != std::string::npos)
+        results.push_back(item);
+    }
+    content.push_back(TextField(search).Label(::app::strings::ui_search_models).Placeholder(::app::strings::ui_search_models)
+        .Variant(TextFieldVariant::Outlined).OnChanged([search](const TextEditingValue& value) { search = value; }).Key("search-models"));
+    content.push_back(Text(StringVariant::Format(::app::strings::ui_0_models_selected, selected->size()), TextRole::Label));
+    if (results.empty()) {
+      content.push_back(Text(::app::strings::ui_no_catalog_models, TextRole::Label));
+    } else {
+      content.push_back(VirtualList(std::move(results), [selected, busy, color](const DiscoveredModel& item) {
+        const auto pending = selected.Get();
+        const auto entry = pending.find(item.id);
+        const bool checked = entry != pending.end();
+        const auto label = item.name == item.id ? item.id : item.name + separator + item.id;
+        std::vector<View> row{Checkbox(label, checked).OnChanged([selected, item](bool on) {
+          auto next = selected.Get();
+          if (on) next.emplace(item.id, EditLimits(item.limits));
+          else next.erase(item.id);
+          selected = std::move(next);
+        }).With(Enabled(!busy), Tooltip(label)).Key("catalog-model/" + item.id)};
+        if (checked) row.push_back(ModelLimitFields(entry->second, !busy, color, [selected, id = item.id](std::size_t i, TextEditingValue value) {
+          auto next = selected.Get();
+          if (auto entry = next.find(id); entry != next.end()) {
+            entry->second[i] = std::move(value);
+            selected = std::move(next);
+          }
+        }));
+        return Column(std::move(row)).With(Padding(EdgeInsets::Symmetric(4.0F, 3.0F)), Spacing(4.0F),
+            CornerRadius(6.0F), Background(checked ? color.surface_container : Color::Transparent()),
+            CrossAlign(CrossAxisAlignment::Stretch)).Key(item.id);
+      }).EstimatedItemExtent(39.0F).With(Frame{.height = show_connection.Get() ? 185.0F : 231.0F}, ScrollBar()).Key("model-catalog"));
+    }
+  } else {
+    const auto label = ::app::strings::ui_model_id;
+    content.push_back(PreviewLabeledField(label, TextField(model).Label(label).Variant(TextFieldVariant::Outlined)
+        .OnChanged([model](const TextEditingValue& value) { model = value; }).With(Enabled(!busy)).Key("add-model-id"), color));
+    auto disclosure = UseEnvironment<ChipStyle>();
+    disclosure.background = color.surface_container_low;
+    disclosure.border = Border{Color::Transparent()};
+    disclosure.label_style = {Font::System(12.0F).WithWeight(FontWeight::Medium), color.on_surface_variant};
+    disclosure.minimum_height = 28.0F;
+    disclosure.icon_size = 13.0F;
+    content.push_back(Row {ProvideEnvironment(disclosure, Chip(show_limits.Get() ? ::app::images::chevron_down : ::app::images::chevron_right,
+        ::app::strings::ui_model_token_limits).OnClick([show_limits] { show_limits = !show_limits.Get(); })
+            .With(Semantics{.expanded = show_limits.Get()}).Key("advanced-model-limits")), Spacer()});
+    if (show_limits.Get()) {
+      content.push_back(ModelLimitFields(limits.Get(), !busy, color, [limits](std::size_t i, TextEditingValue value) {
+        auto next = limits.Get();
+        next[i] = std::move(value);
+        limits = std::move(next);
+      }).Key("manual-model-limits"));
+    }
+  }
+  if (std::string_view(api.provider) == "gemini") {
+    content.push_back(Flow {
+      Checkbox(::app::strings::ui_image_input, image_input.Get()).OnChanged([image_input](bool on) { image_input = on; }),
+      Checkbox(::app::strings::ui_pdf_input, file_input.Get()).OnChanged([file_input](bool on) { file_input = on; }),
+    }.With(Spacing(12.0F), Enabled(!busy)));
+  }
+  if (std::string_view(api.protocol) == "responses") {
     content.push_back(Checkbox(::app::strings::ui_request_reasoning_summary, reasoning_summary.Get())
-        .OnChanged([reasoning_summary](bool value) { reasoning_summary = value; }));
+        .OnChanged([reasoning_summary](bool on) { reasoning_summary = on; }).With(Enabled(!busy)));
   }
-  if (!error->empty()) {
-    content.push_back(Text(error.Get(), TextRole::Label).Style({Font::System(13.0F), color.error}).Key("add-model-error"));
-  }
-  content.push_back(Row{Spacer(), ProvideEnvironment(secondary,
-      Button(::app::strings::ui_cancel).OnClick([dialog] { dialog.Dismiss(); }).With(Enabled(!busy.Get()))),
-      ProvideEnvironment(save_style, Button(busy.Get() ? ::app::strings::ui_saving : ::app::strings::ui_save_model).OnClick(save)
-          .With(Enabled(!busy.Get() && !url->text.empty() && !model->text.empty())).Key("save-model"))}
-      .With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)));
-  return ProvideEnvironment(fields, Column(std::move(content)).With(Frame{.width = 460.0F},
-      Padding(22.0F), Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch)))
+  if (!error->empty()) content.push_back(Text(error.Get()).With(Foreground(color.error)).Key("add-model-error"));
+  const bool can_save = !busy && !TrimModelField(url->text).empty() &&
+      (show_catalog.Get() ? !selected->empty() : !TrimModelField(model->text).empty());
+  const auto action = saving.Get() ? ::app::strings::ui_saving :
+      show_catalog.Get() ? ::app::strings::ui_save_models : ::app::strings::ui_save_model;
+  auto body = ScrollView(Column(std::move(content)).With(Spacing(12.0F), Padding(EdgeInsets::Symmetric(20.0F, 15.0F)),
+      CrossAlign(CrossAxisAlignment::Stretch))).With(Frame{.max_height = 520.0F}, ScrollBar());
+  auto actions = Row {
+    Spacer(),
+    ProvideEnvironment(secondary, Button(::app::strings::ui_cancel).OnClick([dialog] { dialog.Dismiss(); }).With(Enabled(!saving.Get()))),
+    ProvideEnvironment(primary, Button(action).OnClick(save).With(Enabled(can_save)).Key("save-model")),
+  }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
+  return ProvideEnvironment(fields, PreviewFormDialog(::app::strings::ui_add_model, std::move(body), std::move(actions), color, 512.0F))
       .Key("add-model-dialog");
 }
 
@@ -340,7 +625,8 @@ namespace {
 
 [[huxerui::composable]]
 View RunOptionTrigger(std::string value, StringResource label, std::string key, ViewHandle anchor,
-                      std::function<void()> open, Color ink, bool enabled, bool permission = false) {
+                      std::function<void()> open, Color ink, bool enabled, const ModelBrand* brand = nullptr,
+                      bool permission = false) {
   const auto colors = UseTheme().colors;
   const auto compact = UseViewportClass() == ViewportClass::Compact;
   auto style = UseEnvironment<ChipStyle>();
@@ -352,11 +638,25 @@ View RunOptionTrigger(std::string value, StringResource label, std::string key, 
   style.icon_size = 14.0F;
   style.icon_spacing = 5.0F;
   style.corner_radii = CornerRadii{7.0F};
+  const float max_width = permission ? 170.0F : compact ? 156.0F : 240.0F;
+  const auto semantics = Semantics{.role = SemanticRole::Button, .label = label, .value = value};
+  if (brand) {
+    const Frame icon_size{.width = style.icon_size, .height = style.icon_size};
+    return Row{
+        brand->Icon(ink).With(icon_size, LayoutPriority(1.0F)).Key("run-model-icon"),
+        Text(std::move(value)).Style(style.label_style).LineLimit(1).Overflow(TextOverflow::Ellipsis),
+        Image(::app::images::chevron_down).Tint(ink).With(icon_size, LayoutPriority(1.0F)),
+    }.OnClick(open).On<ViewEvents::KeyDown>([open](const KeyEvent& event) {
+      if (event.key != Key::Enter && event.key != Key::Space && event.key != Key::ArrowDown) return false;
+      open();
+      return true;
+    }).With(anchor, Focusable{}, Enabled(enabled), Frame{.max_width = max_width, .min_height = style.minimum_height},
+        Padding(style.padding), Spacing(style.icon_spacing), CrossAlign(CrossAxisAlignment::Center),
+        CornerRadius(style.corner_radii), Background(style.background), semantics).Key(std::move(key));
+  }
   const auto& icon = permission ? ::app::images::shield : ::app::images::chevron_down;
-  return ProvideEnvironment(style, Chip(icon, value).OnClick(std::move(open))
-      .With(anchor, Enabled(enabled), Frame{.max_width = permission ? 170.0F : compact ? 156.0F : 240.0F},
-          Semantics{.role = SemanticRole::Button, .label = label, .value = std::move(value)})
-      .Key(std::move(key)));
+  return ProvideEnvironment(style, Chip(icon, std::move(value)).OnClick(std::move(open))
+      .With(anchor, Enabled(enabled), Frame{.max_width = max_width}, semantics).Key(std::move(key)));
 }
 
 } // namespace
@@ -364,7 +664,7 @@ View RunOptionTrigger(std::string value, StringResource label, std::string key, 
 [[huxerui::composable]]
 View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserRunOptions> next, kit::AgentId agent,
     std::optional<kit::WorkspaceId> workspace, std::optional<File> workspace_root, std::optional<kit::RunStartBinding> current,
-    std::function<void()> changed, std::optional<View> extra_action, AddModelProfile add_model) {
+    std::function<void()> changed, std::optional<View> extra_action, AddModelProfile add_model, bool show_permissions) {
   const auto model_menu = UseMenu();
   const auto permission_menu = UseMenu();
   const auto dialogs = UseDialog();
@@ -374,12 +674,13 @@ View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserR
   const auto choices = settings->Models(agent);
   const auto effective_model = next->model ? next->model : settings->DefaultModel(agent);
   const auto selected = effective_model ? std::ranges::find(choices, *effective_model, &ModelChoice::ref) : choices.end();
+  const auto* selected_brand = selected == choices.end() ? nullptr : FindModelBrand(selected->model_id);
   auto model = effective_model == DemoModel ? UseString(::app::strings::ui_local_demo_model) :
       selected != choices.end() ? selected->name : effective_model ? UseString(::app::strings::ui_unavailable_model) :
       UseString(::app::strings::ui_select_model);
   const auto effective_profile = next->execution_profile.value_or(AskProfile);
   const bool next_model = current && effective_model != current->model;
-  const bool next_permission = current && effective_profile != current->execution_profile.value_or(AskProfile);
+  const bool next_permission = show_permissions && current && effective_profile != current->execution_profile.value_or(AskProfile);
   const bool full_access = agent == CodeAgent && workspace && workspace_root;
   const auto select_model = [next, changed](kit::ModelProviderRef ref) {
     auto selected = next.Get();
@@ -391,8 +692,10 @@ View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserR
     std::vector<MenuEntry> items;
     for (const auto& choice : choices) {
       auto label = choice.ref == DemoModel ? StringVariant{::app::strings::ui_local_demo_model} : StringVariant{choice.label};
-      items.emplace_back(MenuItem(std::move(label), [select_model, ref = choice.ref] { select_model(ref); })
-          .Checked(effective_model == choice.ref));
+      const auto activate = [select_model, ref = choice.ref] { select_model(ref); };
+      const auto* brand = FindModelBrand(choice.model_id);
+      auto item = brand ? MenuItem(brand->image, std::move(label), activate) : MenuItem(std::move(label), activate);
+      items.emplace_back(std::move(item).Checked(effective_model == choice.ref));
     }
     if (add_model) {
       if (!items.empty()) items.emplace_back(MenuSection{});
@@ -438,10 +741,10 @@ View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserR
       ? colors.on_primary_container : colors.on_surface_variant;
   std::vector<View> controls{
       RunOptionTrigger(std::move(model), ::app::strings::ui_model, "run-model", model_anchor, choose_model,
-          colors.on_surface_variant, !choices.empty() || bool(add_model)),
-      RunOptionTrigger(std::move(permission), ::app::strings::ui_permissions, "run-permissions", permission_anchor, choose_permission,
-          permission_ink, true, true),
+          colors.on_surface_variant, !choices.empty() || bool(add_model), selected_brand),
   };
+  if (show_permissions) controls.push_back(RunOptionTrigger(std::move(permission), ::app::strings::ui_permissions,
+      "run-permissions", permission_anchor, choose_permission, permission_ink, true, nullptr, true));
   if (extra_action) {
     auto style = UseEnvironment<ButtonStyle>();
     style.background = Color::Transparent();

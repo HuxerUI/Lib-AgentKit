@@ -662,6 +662,9 @@ void ApproveAndReviseDesign(const Application& application, const std::filesyste
     control.Tap({.device_kind = PointerDeviceKind::Mouse});
   };
   click("Goal");
+  const auto goal_panel_view = preview.Find(UiSelector::Key("goal-panel"));
+  Wait(preview, [&] { return goal_panel_view.Exists() && goal_panel_view.One().bounds.width >= 304.0F &&
+      composer.Exists() && composer.One().in_viewport; }, "The desktop goal did not open beside the conversation");
   click("Set goal");
   auto objective = preview.Find(UiSelector::Key("goal-objective"));
   objective.Tap();
@@ -669,6 +672,10 @@ void ApproveAndReviseDesign(const Application& application, const std::filesyste
   auto conditions = preview.Find(UiSelector::Key("goal-conditions"));
   conditions.Tap();
   conditions.ReplaceText("Check focus order in the settings screen.");
+  click("Close goal");
+  click("Goal");
+  Wait(preview, [&] { return conditions.Exists() && conditions.One().value == "Check focus order in the settings screen."; },
+      "Reopening the goal panel did not preserve its draft");
   click("Save goal");
   Wait(preview, [&] { return visible("Ready to enable   \xc2\xb7   Version 1") &&
       visible("Check focus order in the settings screen."); }, "the proposed goal lost its completion conditions");
@@ -2289,7 +2296,7 @@ void VerifyComposerIme(const File& root) {
   const auto workspace = root.Child("workspace");
   if (!workspace.CreateDirectories()) throw std::runtime_error("Could not create the IME workspace");
   const auto released = std::make_shared<std::atomic<int>>(0);
-  kit::ModelRegistration model{{{"composer-stream"}, 1}, {"preview", "composer-stream", "script", {}},
+  kit::ModelRegistration model{{{"composer-stream"}, 1}, {"compatible", "Google/GEMINI-2.5-Pro", "script", {}},
       std::make_shared<ComposerModel>(released)};
   const Application application{App, {.application_hooks = {
       MakeRunSettingsTestInstaller(root.Child("sessions.sqlite3"), workspace, {std::move(model)}, {},
@@ -2312,6 +2319,9 @@ void VerifyComposerIme(const File& root) {
     ui.Pump();
   };
   Wait(ui, [&] { return first.Exists(); }, "New conversation composer did not mount");
+  const auto composer_model_icon = ui.Find(UiSelector::Key("run-model-icon"));
+  Wait(ui, [&] { return composer_model_icon.Exists() && composer_model_icon.One().in_viewport; },
+       "The selected model icon was missing from the new conversation composer");
   ui.SetWindowMetrics({.viewport = {520.0F, 650.0F}});
   Wait(ui, [&] { return ui.Find(UiSelector::Key("open-navigation")).Exists(); }, "The compact layout did not mount");
   const auto menu_items = [&](const char* label) {
@@ -2330,20 +2340,37 @@ void VerifyComposerIme(const File& root) {
     Wait(ui, [&] { return !item.Exists(); }, "Escape did not dismiss the setting menu");
     ui.Pump(250ms);
   };
-  check_anchor("run-model", "Local demo model");
+  check_anchor("run-model", "Google/GEMINI-2.5-Pro");
   check_anchor("run-permissions", "Auto Review");
   FocusPreviewEditor(ui, first, "The first composer did not receive focus");
   first.ReplaceText("Stream review");
-  ui.PressKey(Key::Enter);
-  if (first.One().value != "Stream review\n") throw std::runtime_error("Enter did not insert a new line");
+  ui.PressKey(Key::Enter, {.shift = true});
+  if (first.One().value != "Stream review\n") throw std::runtime_error("Shift+Enter did not insert a new line");
   edit({.kind = TextInputCommandKind::UpdateComposition, .text = "nihao"});
   if (send.One().enabled || composer.Exists()) throw std::runtime_error("The first message can send provisional IME text");
+  ui.PressKey(Key::Enter);
+  if (composer.Exists()) throw std::runtime_error("Enter sent provisional IME text");
   edit({.kind = TextInputCommandKind::CommitText, .text = chinese});
   if (first.One().value != "Stream review\n" + chinese) throw std::runtime_error("The first composer lost committed text");
   Wait(ui, [&] { return send.One().enabled; }, "The committed first message cannot be sent");
-  send.Tap();
+  ui.PressKey(Key::Enter);
   Wait(ui, [&] { return composer.Exists() && stop.Exists() && send_mode.Exists() && ShowsText(ui, "The model is streaming"); },
        "The first model delta did not appear");
+  if (!composer_model_icon.Exists() || !composer_model_icon.One().in_viewport)
+    throw std::runtime_error("The selected model icon was missing from the active conversation composer");
+  const auto user_bubble = ui.Find(UiSelector::Key("chat-user-bubble"));
+  const auto user_avatar = ui.Find(UiSelector::Key("chat-user-avatar"));
+  const auto agent_avatar = ui.Find(UiSelector::Key("chat-agent-avatar"));
+  const auto model_avatar = ui.Find(UiSelector::Key("chat-model-avatar"));
+  if (!user_avatar.Exists() || !agent_avatar.Exists() ||
+      ui.Find(UiSelector::AllOf(UiSelector::Type<Text>(), UiSelector::Text("You"))).Exists() ||
+      ui.Find(UiSelector::AllOf(UiSelector::Type<Text>(), UiSelector::Text("Assistant"))).Exists() ||
+      ui.Find(UiSelector::AllOf(UiSelector::Type<Text>(), UiSelector::Text("General assistant"))).Exists())
+    throw std::runtime_error("Chat identities should appear as avatars");
+  if (!model_avatar.Exists()) throw std::runtime_error("The gateway model family did not supply an avatar");
+  if (user_bubble.One().bounds.width >= 180.0F ||
+      user_bubble.One().bounds.x + user_bubble.One().bounds.width >= user_avatar.One().bounds.x)
+    throw std::runtime_error("A short outgoing message did not fit its text beside the right avatar");
   const auto original_send = send.One().bounds;
   const auto options = ui.Find(UiSelector::Key("run-model"));
   const auto original_options = options.One().bounds;
@@ -2407,7 +2434,15 @@ void VerifyComposerIme(const File& root) {
   edit({.kind = TextInputCommandKind::CommitText, .text = chinese});
   if (composer.One().value != prefix + chinese + "B" || !send.One().enabled)
     throw std::runtime_error("The committed Chinese draft is not ready to send");
-  send.Tap();
+  ClickPreviewMouse(ui, options.One().visible_bounds);
+  const auto demo = menu_items("Local demo model");
+  Wait(ui, [&] { return demo.Exists() && !demo.One().offscreen; }, "The model menu did not show the demo model");
+  demo.PerformSemanticAction({SemanticActionKind::Activate, {}});
+  Wait(ui, [&] { return !demo.Exists() && !composer_model_icon.Exists(); },
+       "Selecting the demo model did not dismiss the menu and clear the composer brand");
+  if (!model_avatar.Exists()) throw std::runtime_error("Changing the composer model replaced the reply's original avatar");
+  FocusPreviewEditor(ui, composer, "Model selection did not leave an editable composer");
+  ui.PressKey(Key::Enter);
   Wait(ui, [&] { return ShowsText(ui, prefix + chinese + "B") && composer.One().value == ""; },
        "Sending did not publish or clear the committed Chinese draft");
   const auto title = ui.Find(UiSelector::Key("agent-chat-heading"));
@@ -2421,10 +2456,17 @@ void VerifyComposerIme(const File& root) {
     return title.One().in_viewport && box.One().in_viewport && history.One().in_viewport &&
         std::abs(lane.x - title.One().bounds.x) < 1.0F &&
         std::abs(lane.x - transcript.x) < 1.0F &&
+        std::abs(lane.width - title.One().bounds.width) < 1.0F &&
+        std::abs(lane.width - transcript.width) < 1.0F &&
         std::abs(lane.x + lane.width * 0.5F - surface.x - surface.width * 0.5F) < 1.0F &&
         box.One().visible_bounds.width >= lane.width - 1.0F;
   };
   Wait(ui, aligned, "Conversation title, transcript and composer did not share a centered column");
+  ui.SetWindowMetrics({.viewport = {1700.0F, 900.0F}});
+  Wait(ui, [&] { return aligned() && box.One().bounds.width > 1000.0F; },
+       "The conversation did not expand with the wide window");
+  Wait(ui, [&] { return agent_avatar.All().size() == 2 && model_avatar.All().size() == 1; },
+       "Historical and unidentified model replies did not retain their respective avatars");
   ui.SetWindowMetrics({.viewport = {520.0F, 550.0F}});
   Wait(ui, aligned, "The compact conversation column did not fit the window");
 }
@@ -3412,22 +3454,22 @@ void VerifyPreviewRunSettings(const File& root) {
     approval.Tap();
   };
   ChooseDraftAssistant(preview, "Code");
-  choose("run-model", "Model A  \xc2\xb7  test / script");
+  choose("run-model", "Model A");
   SendNewConversation(preview, "Configuration timing");
   Wait(preview, [&] { return preview.Find(UiSelector::Key("code-scope")).Exists(); }, "Model A run did not wait for file scope");
 
-  choose("run-model", "Model B  \xc2\xb7  test / script");
+  choose("run-model", "Model B");
   choose("run-permissions", "Auto Review");
-  Wait(preview, [&] { return ShowsText(preview, "This run  \xc2\xb7  Model A  \xc2\xb7  test / script  \xc2\xb7  Ask"); },
+  Wait(preview, [&] { return ShowsText(preview, "This run  \xc2\xb7  Model A  \xc2\xb7  Ask"); },
        "Changing future settings changed the active binding");
   enter("Keep the current file scope", "Send");
   Wait(preview, [&] { return ShowsText(preview, "Waiting to apply"); }, "Direct supplement was not accepted by the active run");
   choose("send-mode", "Queue");
   enter("Queued on B", "Queue message");
-  Wait(preview, [&] { return ShowsText(preview, "Model B  \xc2\xb7  test / script  \xc2\xb7  Auto Review"); },
+  Wait(preview, [&] { return ShowsText(preview, "Model B  \xc2\xb7  Auto Review"); },
        "Queued input did not display its original settings");
 
-  choose("run-model", "Model C  \xc2\xb7  test / script");
+  choose("run-model", "Model C");
   grant();
   Wait(preview, [&] { return MessageEditor(preview, "Configuration timing").has_value(); }, "The quote source was not visible");
   auto source = *MessageEditor(preview, "Configuration timing");
@@ -3450,7 +3492,7 @@ void VerifyPreviewRunSettings(const File& root) {
   Wait(preview, [&] { return ShowsText(preview, "Review workspace changes"); }, "Model B patch bypassed the manual boundary");
   CheckText(config, "mode=A\n");
   approve_patch();
-  Wait(preview, [&] { return ShowsText(preview, "Model C  \xc2\xb7  test / script  \xc2\xb7  Full Access\n"
+  Wait(preview, [&] { return ShowsText(preview, "Model C  \xc2\xb7  Full Access\n"
                                              "Full Access expired. Choose permissions again."); },
        "Expired queued configuration did not retain its input and reason");
   CheckText(config, "mode=B\n");
@@ -3520,7 +3562,7 @@ void VerifyPreviewRunSettings(const File& root) {
   }
   preview.Find(UiSelector::Text("Configuration timing")).Tap();
   Wait(preview, [&] { return preview.Find(UiSelector::Value("Draft preserved by session")).Exists(); }, "Session switch lost the existing draft");
-  choose("run-model", "Model B  \xc2\xb7  test / script");
+  choose("run-model", "Model B");
   choose("run-permissions", "Auto Review");
   bool saved = false;
   tasks->Launch([&]() -> Task<void> {
@@ -3538,7 +3580,7 @@ void VerifyPreviewRunSettings(const File& root) {
 
   preview.Find(UiSelector::Key("new-conversation")).Tap();
   ChooseDraftAssistant(preview, "Code");
-  choose("run-model", "Model A  \xc2\xb7  test / script");
+  choose("run-model", "Model A");
   SendNewConversation(preview, "Configuration supplement recovery");
   Wait(preview, [&] { return preview.Find(UiSelector::Key("code-scope")).Exists(); }, "The recovery run did not wait for scope");
   const auto original = MessageEditor(preview, "Configuration supplement recovery");
@@ -6403,7 +6445,7 @@ void VerifyReleaseCompletionRevision(const File& root, bool complete_automatical
     } else if (complete_automatically) {
       TapControl(preview, UiSelector::Text(general_title), "Open the automatically completed goal's conversation");
       TapFormButton(preview, "Goal");
-      Wait(preview, [&] { return ShowsText(preview, "Completed") && ShowsText(preview, "Complete automatically after verification"); },
+      Wait(preview, [&] { return ShowsText(preview, "Completed") && ShowsText(preview, "Complete the goal as soon as its result passes verification."); },
           "The goal did not display automatic completion after restart");
       if (preview.Find(ButtonText("Open completion approval")).Exists())
         throw std::runtime_error("The completed goal exposed a confirmation action");
@@ -7357,7 +7399,7 @@ void VerifyMessageSideChat(const Application& application) {
     throw std::runtime_error("The main composer was not interactive while side chat was open");
   FocusPreviewEditor(preview, question, "The question editor did not accept focus");
   question.ReplaceText("Explain the excerpt");
-  preview.PressKey(Key::Enter);
+  preview.PressKey(Key::Enter, {.shift = true});
   if (question.One().value != "Explain the excerpt\n" || pane.Find(UiSelector::Key("side-chat-composer")).Exists())
     throw std::runtime_error("The side chat question did not keep the main composer's multiline editing behavior");
   question.ReplaceText("Explain the excerpt");
@@ -7376,7 +7418,7 @@ void VerifyMessageSideChat(const Application& application) {
   TapFormButton(preview, "Side chat");
   Wait(preview, [&] { return question.Exists() && question.One().focused && question.One().value == "Explain the excerpt"; },
       "Reopening the original selection did not restore its question draft");
-  pane.Find(UiSelector::Key("chat-send/Send")).Tap();
+  preview.PressKey(Key::Enter);
   const auto answer = "Selected text: " + excerpt;
   Wait(preview, [&] { return MessageEditor(preview, answer).has_value(); }, "The assistant did not receive the exact selected text");
   auto whole = preview.Find(UiSelector::Key("side-chat-return-reply"));
@@ -7566,6 +7608,35 @@ void ResumePresentationConclusion(const File& root) {
   }, "The recovered queue did not deliver the original slide conclusion exactly once");
 }
 
+void VerifyModelCatalog(std::string url) {
+  std::exception_ptr failure;
+  bool finished = false;
+  const Application app{[]() -> View { return Text("GanWork model catalog acceptance"); },
+      {.application_hooks = {[&](ApplicationContext&) {
+        const auto host = UseApplication();
+        auto client = std::make_shared<HttpClient>();
+        UseApplicationTaskScope().Launch([&, host, client]() -> Task<void> {
+          try {
+            auto catalog = LiveTake(co_await agentkit_preview::DiscoverModels(
+                {.base_url = url, .protocol = "chat-completions", .provider = "compatible", .api_key = "catalog-check-key"}, client));
+            const auto rich = std::ranges::find(catalog, "catalog-long", &agentkit_preview::DiscoveredModel::id);
+            const auto basic = std::ranges::find(catalog, "catalog-basic", &agentkit_preview::DiscoveredModel::id);
+            if (catalog.size() != 2 || rich == catalog.end() || basic == catalog.end())
+              throw std::runtime_error("The model catalog did not merge and deduplicate all pages");
+            if (rich->limits.context_window != 65536 || rich->limits.max_output_tokens != 8192 || rich->limits.max_input_tokens)
+              throw std::runtime_error("The model catalog did not preserve the token-limit fields");
+            if (basic->limits.context_window || basic->limits.max_input_tokens || basic->limits.max_output_tokens)
+              throw std::runtime_error("The model catalog assigned a guessed limit");
+            finished = true;
+          } catch (...) { failure = std::current_exception(); }
+          host.Quit();
+        });
+      }}}};
+  static_cast<void>(RunApplication());
+  if (failure) std::rethrow_exception(failure);
+  if (!finished) throw std::runtime_error("The native model catalog test did not finish");
+}
+
 void VerifyLiveSettings(const File& root, const std::string& url, const std::string& model,
                         const std::string& second_url, const std::string& second_model) {
   if (root.Child("sessions.sqlite3").Exists() || root.Child("settings.json").Exists() || !root.CreateDirectories())
@@ -7606,7 +7677,6 @@ void VerifyLiveSettings(const File& root, const std::string& url, const std::str
       throw std::runtime_error(std::string(key) + ": " + error.what());
     }
   };
-  constexpr auto suffix = "  \xc2\xb7  compatible / chat-completions";
   constexpr auto session_title = "Workbench model check";
   {
     const Application application{App, {.application_hooks = {MakePreviewInstaller(database, true)}}};
@@ -7647,8 +7717,8 @@ void VerifyLiveSettings(const File& root, const std::string& url, const std::str
       save.Tap();
       Wait(ui, [&] { return !ui.Find(UiSelector::Key("add-model-dialog")).Exists(); }, "The model was not saved");
     }
-    select(ui, "settings-daily-model", model + suffix);
-    select(ui, "settings-review-model", second_model + suffix);
+    select(ui, "settings-daily-model", model);
+    select(ui, "settings-review-model", second_model);
     ui.Find(UiSelector::Key("settings-section-personalization")).Tap();
     select(ui, "settings-reply-tone", "Concise");
     fill(ui, "settings-instructions", "Use plain language and keep replies under two sentences.");
@@ -7898,6 +7968,19 @@ int main(int argc, char** argv) {
       }
       return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << "\nFixture: " << path.string() << '\n'; return 1; }
+  }
+  if (argc == 3 && std::string_view(argv[1]) == "--model-catalog") {
+    try {
+      VerifyModelCatalog(argv[2]);
+      std::cout << "Native model catalog pagination, deduplication, and optional token limits passed\n";
+      return 0;
+    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+  }
+  if (argc == 3 && std::string_view(argv[1]) == "--native-model-settings") {
+    const File directory(std::filesystem::absolute(std::filesystem::u8path(argv[2])).u8string());
+    const Application application{App, {.window = {.title = "GanWork Model Settings Acceptance", .initial_size = {1080.0F, 760.0F}},
+        .application_hooks = {MakePreviewInstaller(directory.Child("sessions.sqlite3"), true)}}};
+    return RunApplication();
   }
   if (argc == 7 && std::string_view(argv[1]) == "--live-settings") {
     try {

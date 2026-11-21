@@ -7,9 +7,11 @@ namespace agentkit_preview {
 inline huxerui::ButtonStyle PreviewSecondaryButton(huxerui::ButtonStyle style, const huxerui::ColorScheme& colors) {
   style.background = colors.surface_container_high;
   style.label_style = {huxerui::Font::System(13.0F).WithWeight(huxerui::FontWeight::Medium), colors.on_surface};
+  style.disabled_background = colors.surface_container_low;
+  style.disabled_label = colors.on_surface_variant;
   style.minimum_height = 34.0F;
   style.padding = huxerui::EdgeInsets::Symmetric(13.0F, 5.0F);
-  style.corner_radii = huxerui::CornerRadii{8.0F};
+  style.corner_radii = huxerui::CornerRadii{7.0F};
   return style;
 }
 
@@ -24,11 +26,28 @@ inline huxerui::ButtonStyle PreviewPrimaryButton(huxerui::ButtonStyle style, con
 }
 
 inline huxerui::TextFieldStyle PreviewFormFieldStyle(huxerui::TextFieldStyle field, const huxerui::ColorScheme& colors) {
-  field.outlined.background = colors.surface;
-  field.outlined.border = colors.outline;
-  field.outlined.hovered_border = colors.on_surface_variant;
-  field.outlined.focused_border = colors.on_primary_container;
-  field.text_style.foreground = colors.on_surface;
+  using namespace huxerui;
+  field.outlined = {
+      .background = colors.surface,
+      .disabled_background = colors.surface_container_low,
+      .border = colors.outline,
+      .hovered_border = colors.on_surface_variant,
+      .focused_border = colors.primary,
+      .disabled_border = colors.outline,
+      .corner_radii = CornerRadii{7.0F},
+      .minimum_height = 38.0F,
+  };
+  field.filled = field.outlined;
+  field.filled.background = colors.surface_container_low;
+  field.filled.corner_radii = CornerRadii::Top(7.0F);
+  field.text_style = {field.text_style.font.WithSize(14.0F), colors.on_surface};
+  field.placeholder_style.font = field.text_style.font;
+  field.padding = EdgeInsets::Symmetric(11.0F, 7.0F);
+  field.focused_border_width = 1.0F;
+  field.focused_validation_border_width = 1.0F;
+  field.caret_width = 1.0F;
+  field.validation_error = colors.error;
+  field.validation_text_style.foreground = colors.error;
   field.label_style.foreground = colors.on_surface_variant;
   field.floating_label_style.foreground = colors.on_surface_variant;
   field.placeholder_style.foreground = colors.on_surface_variant;
@@ -39,8 +58,33 @@ inline huxerui::TextFieldStyle PreviewFormFieldStyle(huxerui::TextFieldStyle fie
   field.error_label = colors.error;
   field.caret = colors.on_primary_container;
   field.selection = colors.primary_container;
+  field.error_caret = colors.error;
   field.composition = colors.on_primary_container;
   return field;
+}
+
+inline huxerui::View PreviewLabeledField(huxerui::StringVariant label, huxerui::View field, const huxerui::ColorScheme& colors) {
+  using namespace huxerui;
+  return Column {
+    Text(std::move(label), TextRole::Label)
+        .Style({Font::System(12.0F).WithWeight(FontWeight::Medium), colors.on_surface_variant})
+        .With(Semantics{.hidden = true}),
+    std::move(field),
+  }.With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Stretch));
+}
+
+inline huxerui::View PreviewFormDialog(huxerui::StringVariant title, huxerui::View body, huxerui::View actions,
+                                      const huxerui::ColorScheme& colors, float width) {
+  using namespace huxerui;
+  return Column {
+    Text(std::move(title), TextRole::Title).Style({Font::System(20.0F).WithWeight(FontWeight::SemiBold), colors.on_surface})
+        .With(Padding(EdgeInsets::Symmetric(20.0F, 15.0F))),
+    ProvideEnvironment(DividerStyle{colors.outline}, Divider()),
+    std::move(body),
+    ProvideEnvironment(DividerStyle{colors.outline}, Divider()),
+    Column {std::move(actions)}.With(Padding(EdgeInsets::Symmetric(20.0F, 12.0F)),
+        CrossAlign(CrossAxisAlignment::Stretch), Background(colors.surface_container)),
+  }.With(Frame{.width = width}, CrossAlign(CrossAxisAlignment::Stretch));
 }
 
 inline void ShowPreviewDialog(const huxerui::DialogHandle& dialogs, huxerui::DialogFactory content,
@@ -48,9 +92,9 @@ inline void ShowPreviewDialog(const huxerui::DialogHandle& dialogs, huxerui::Dia
   using namespace huxerui;
   dialogs.Show(DialogFactory{[content = std::move(content)](DialogContext dialog) {
     const auto colors = UseTheme().colors;
-    return Column{content(dialog)}.With(CrossAlign(CrossAxisAlignment::Stretch),
-        Background(colors.surface_container_low), CornerRadius(14.0F), Border{colors.outline},
-        Shadow{.color = Color::Rgb(0, 0, 0, 0.32F), .offset = {0.0F, 8.0F}, .blur_radius = 28.0F})
+    return Column {content(dialog)}.With(CrossAlign(CrossAxisAlignment::Stretch),
+        Background(colors.surface_container_low), CornerRadius(12.0F), Border{colors.outline}, ClipChildren{},
+        Shadow{.color = Color::Rgb(0, 0, 0, 0.36F), .offset = {0.0F, 12.0F}, .blur_radius = 36.0F})
         .Key("preview-dialog-surface");
   }}, std::move(options));
 }
@@ -74,8 +118,46 @@ inline huxerui::ThemeSpec PreviewTheme(huxerui::ThemeBrightness brightness) {
   colors.primary_container = dark ? Color::Rgb(49, 42, 38) : Color::Rgb(234, 220, 201);
   colors.on_primary_container = dark ? Color::Rgb(246, 212, 174) : Color::Rgb(98, 59, 28);
   colors.error = dark ? Color::Rgb(255, 180, 189) : Color::Rgb(150, 50, 64);
-  theme.interactions.focus_ring = huxerui::FocusRing{colors.on_primary_container, 2.0F, 2.0F};
+  theme.interactions.focus_ring = huxerui::FocusRing{colors.primary, 1.0F, 2.0F};
   return theme;
+}
+
+inline huxerui::View PreviewControlsTheme(huxerui::View content) {
+  using namespace huxerui;
+  return Scope([content = std::move(content)] {
+    const auto& theme = UseTheme();
+    const auto& colors = theme.colors;
+    ThemeDefinition overrides;
+    overrides.Set(PreviewFormFieldStyle(UseEnvironment<TextFieldStyle>(), colors));
+    auto select = UseEnvironment<SelectStyle>();
+    select.background = colors.surface;
+    select.foreground = colors.on_surface;
+    select.border = Border{colors.outline, 1.0F};
+    select.indicator = colors.on_surface_variant;
+    select.trigger_padding = EdgeInsets::Symmetric(11.0F, 7.0F);
+    select.minimum_height = 38.0F;
+    select.minimum_width = 72.0F;
+    select.corner_radii = CornerRadii{7.0F};
+    select.popup_background = colors.surface_container;
+    select.popup_corner_radii = CornerRadii{8.0F};
+    select.active_item_background = colors.surface_container_high;
+    select.selected_item_background = colors.primary_container;
+    overrides.Set(std::move(select));
+    auto dialog = UseEnvironment<DialogStyle>();
+    dialog.scrim = Color::Rgb(9, 11, 15, theme.brightness == ThemeBrightness::Dark ? 0.56F : 0.40F);
+    dialog.background = colors.surface_container_low;
+    dialog.title_style = {Font::System(20.0F).WithWeight(FontWeight::SemiBold), colors.on_surface};
+    dialog.message_style = {Font::System(14.0F), colors.on_surface_variant};
+    dialog.positive_action_style.foreground = colors.on_primary;
+    dialog.negative_action_style.foreground = colors.on_surface;
+    dialog.positive_action_background = colors.primary;
+    dialog.action_separator_color = colors.outline;
+    dialog.action_separator_thickness = 1.0F;
+    dialog.minimum_action_height = 34.0F;
+    dialog.viewport_margin = 16.0F;
+    overrides.Set(std::move(dialog));
+    return Theme(std::move(overrides), content);
+  });
 }
 
 } // namespace agentkit_preview

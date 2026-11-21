@@ -58,7 +58,7 @@ namespace {
 using namespace std::chrono_literals;
 
 constexpr kit::AgentChatLayoutStyle preview_chat_layout{
-    .content_width = 754.0F, .chat_bubbles = true, .show_run_activity = true};
+    .content_width = 0.0F, .chat_bubbles = true, .show_run_activity = true};
 
 const kit::AgentId selection_agent{"preview.side-chat"};
 constexpr std::string_view selection_label = "Selected passage:\n";
@@ -559,23 +559,8 @@ bool ValidModelProfileName(std::string_view profile) {
 }
 
 #ifndef __EMSCRIPTEN__
-std::string TrimModelField(std::string value) {
-  const auto first = value.find_first_not_of(" \t\r\n");
-  if (first == std::string::npos) return {};
-  return value.substr(first, value.find_last_not_of(" \t\r\n") - first + 1);
-}
-
-std::string ModelKeyEnvironment(std::string_view key) {
-  if (!key.starts_with("${")) return {};
-  const auto name = key.ends_with('}') ? key.substr(2, key.size() - 3) : std::string_view{};
-  if (name.empty() || name.size() > 128 || (name.front() >= '0' && name.front() <= '9') ||
-      !std::ranges::all_of(name, [](char ch) {
-        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_';
-      })) {
-    throw std::invalid_argument("Use ${ENV_NAME} to read the API key from an environment variable.");
-  }
-  return std::string(name);
-}
+using agentkit_preview::ModelKeyEnvironment;
+using agentkit_preview::TrimModelField;
 
 constexpr std::size_t max_model_key_bytes = 4096;
 
@@ -663,6 +648,13 @@ Task<void> LoadModelProfiles(const std::shared_ptr<PreviewService>& service, con
         throw std::invalid_argument("The model API key was protected on Windows");
 #endif
       }
+      const auto limit = [&](const char* key) -> std::optional<std::uint64_t> {
+        const auto value = record.find(key);
+        if (value == record.end() || !value->is_number_unsigned()) return {};
+        const auto tokens = value->get<std::uint64_t>();
+        return tokens ? std::optional{tokens} : std::nullopt;
+      };
+      agentkit_preview::ModelLimits limits{limit("context_window"), limit("max_input_tokens"), limit("max_output_tokens")};
       auto model = MakeProfileModel({.model = record.at("model").get<std::string>(),
           .base_url = record.at("base_url").get<std::string>(), .protocol = record.at("protocol").get<std::string>(),
           .provider = record.at("provider").get<std::string>(), .api_key = std::move(api_key),
@@ -670,6 +662,7 @@ Task<void> LoadModelProfiles(const std::shared_ptr<PreviewService>& service, con
           .reasoning_summary = record.value("reasoning_summary", false)},
           std::move(environment));
       if (std::ranges::find(models, model.ref, &kit::ModelRegistration::ref) == models.end()) {
+        service->run_settings->AddModel(model, {}, limits);
         models.push_back(std::move(model));
       }
     } catch (const std::exception&) {
@@ -703,6 +696,9 @@ kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewServic
   auto record = nlohmann::json{{"model", profile.model}, {"base_url", profile.base_url},
       {"protocol", profile.protocol}, {"provider", profile.provider},
       {"image_input", profile.image_input}, {"file_input", profile.file_input}, {"reasoning_summary", profile.reasoning_summary}};
+  if (profile.limits.context_window) record["context_window"] = *profile.limits.context_window;
+  if (profile.limits.max_input_tokens) record["max_input_tokens"] = *profile.limits.max_input_tokens;
+  if (profile.limits.max_output_tokens) record["max_output_tokens"] = *profile.limits.max_output_tokens;
   const bool direct = !profile.api_key.empty() && environment.empty();
   if (!environment.empty()) record["api_key_reference"] = profile.api_key;
 #ifdef _WIN32
@@ -726,7 +722,7 @@ kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewServic
     if (persist) static_cast<void>(co_await target.DeleteAsync());
     co_return Result::Failure(registered.Error());
   }
-  service->run_settings->AddModel(model);
+  service->run_settings->AddModel(model, {}, profile.limits);
   if (!service->run_settings->DefaultModel(agentkit_preview::CodeAgent)) {
     service->run_settings->SetDefaults(*service->run_settings->DefaultModel(agentkit_preview::GeneralAgent), model.ref);
   }
@@ -1105,6 +1101,10 @@ File DefaultGanWorkDatabase() {
   return database;
 }
 
+std::optional<View> PreviewAttachmentAction(const std::shared_ptr<PreviewService>& service, const kit::AgentId& agent,
+    State<kit::UserRunOptions> next, State<kit::AgentChatDraftSources> sources, kit::ModelCapabilities capabilities,
+    std::function<void()> changed = {});
+
 std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std::optional<File> database, bool read_model_configuration,
                     std::optional<File> startup_workspace = {}, std::optional<kit::ModelRegistration> code_model = {},
                     std::optional<File> test_runner = {}, PreviewStoreAdapter adapt_store = {},
@@ -1114,6 +1114,8 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
   service->run_settings = std::make_shared<agentkit_preview::RunSettings>(std::move(clock));
   auto selection = std::make_shared<agentkit_preview::PreviewSideChats>(agentkit_preview::PreviewSideChats{nullptr, selection_agent});
   context.Provide(service);
+  context.Provide(std::make_shared<kit::AgentChatModelAvatar>([settings = service->run_settings](
+      const kit::ModelProviderRef& model, Color foreground) { return settings->ModelAvatar(model, foreground); }));
   context.Provide(std::make_shared<State<agentkit_preview::PreviewSettings>>(service->settings));
   context.Provide(selection);
   const auto tasks = UseApplicationTaskScope();
@@ -1207,6 +1209,24 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
                                       service->attachments, std::move(reviewer), service->applied_settings.Get(), review_user_comparisons,
                                       service->model_profiles.has_value());
         selection->runtime = service->runtime;
+        selection->composer_controls = [owner = std::weak_ptr{service}, settings = service->run_settings](
+            State<kit::UserRunOptions> next, State<kit::AgentChatDraftSources> sources) -> kit::AgentChatRunControls {
+          return {next, [owner, next, sources](const kit::SessionSummary&, std::optional<kit::RunStartBinding> current) -> View {
+            const auto host = owner.lock();
+            if (!host) return Spacer();
+            auto caps = host->run_settings->Capabilities(next->model, selection_agent);
+            if (current) {
+              const auto running = host->run_settings->Capabilities(current->model, selection_agent);
+              caps.image_input |= running.image_input;
+              caps.file_input |= running.file_input;
+            }
+            auto attachments = PreviewAttachmentAction(host, selection_agent, next, sources, caps);
+            return agentkit_preview::RunSettingsControls(host->run_settings, next, selection_agent, {}, {},
+                std::move(current), {}, std::move(attachments), AddModelAction(host), false);
+          }, [settings](const kit::RunStartBinding& binding) {
+            return UseService<Resources>()->GetString(settings->ModelLabel(binding.model));
+          }};
+        };
         auto started = co_await service->runtime->StartAsync();
         service->startup = started.Succeeded() ? PreviewService::Started::Success(service->runtime)
                                                : PreviewService::Started::Failure(started.Error());
@@ -1556,24 +1576,27 @@ View NavigationNameDialog(DialogContext dialog, StringVariant title, std::string
   const auto name = UseState(TextEditingValue::FromText(std::move(initial)));
   const auto colors = UseTheme().colors;
   const auto buttons = UseEnvironment<ButtonStyle>();
-  const auto fields = agentkit_preview::PreviewFormFieldStyle(UseEnvironment<TextFieldStyle>(), colors);
+  auto fields = UseEnvironment<TextFieldStyle>();
+  fields.show_label = false;
   const auto save = [dialog, name, apply] {
     const auto first = name->text.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return;
     apply(name->text.substr(first, name->text.find_last_not_of(" \t\r\n") - first + 1));
     dialog.Dismiss();
   };
-  return Column{
-      Text(title, TextRole::Title).Style({Font::System(19.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}),
-      ProvideEnvironment(fields, TextField(name).Label(::app::strings::ui_name).Variant(TextFieldVariant::Outlined)
-          .OnChanged([name](const TextEditingValue& value) { name = value; }).OnSubmitted(save).Key("navigation-name")),
-      Row{Spacer(),
-          ProvideEnvironment(agentkit_preview::PreviewSecondaryButton(buttons, colors),
-              Button(::app::strings::ui_cancel).OnClick([dialog] { dialog.Dismiss(); })),
-          ProvideEnvironment(agentkit_preview::PreviewPrimaryButton(buttons, colors),
-              Button(::app::strings::ui_save).OnClick(save).With(Enabled(name->text.find_first_not_of(" \t\r\n") != std::string::npos)))}
-          .With(Spacing(8.0F)),
-  }.With(Frame{.width = 380.0F}, Padding(20.0F), Spacing(14.0F), CrossAlign(CrossAxisAlignment::Stretch));
+  const auto label = ::app::strings::ui_name;
+  auto field = TextField(name).Label(label).Variant(TextFieldVariant::Outlined)
+      .OnChanged([name](const TextEditingValue& value) { name = value; }).OnSubmitted(save).Key("navigation-name");
+  return agentkit_preview::PreviewFormDialog(title, Column {
+    ProvideEnvironment(fields, agentkit_preview::PreviewLabeledField(label, std::move(field), colors)),
+  }.With(Padding(20.0F), CrossAlign(CrossAxisAlignment::Stretch)),
+  Row {
+    Spacer(),
+    ProvideEnvironment(agentkit_preview::PreviewSecondaryButton(buttons, colors),
+        Button(::app::strings::ui_cancel).OnClick([dialog] { dialog.Dismiss(); })),
+    ProvideEnvironment(agentkit_preview::PreviewPrimaryButton(buttons, colors),
+        Button(::app::strings::ui_save).OnClick(save).With(Enabled(name->text.find_first_not_of(" \t\r\n") != std::string::npos))),
+  }.With(Spacing(8.0F)), colors, 380.0F);
 }
 
 void EditGroup(const std::shared_ptr<PreviewService>& service, std::string id,
@@ -1706,7 +1729,7 @@ View PreviewConversation(kit::AgentId agent, std::shared_ptr<kit::Conversation> 
 
 std::optional<View> PreviewAttachmentAction(const std::shared_ptr<PreviewService>& service, const kit::AgentId& agent,
     State<kit::UserRunOptions> next, State<kit::AgentChatDraftSources> sources, kit::ModelCapabilities capabilities,
-    std::function<void()> changed = {}) {
+    std::function<void()> changed) {
   const auto image_model = service->applied_settings->image_model;
   if (image_model && sources->attachments.empty() &&
       service->run_settings->Capabilities(image_model, agent).image_input) {
@@ -1753,8 +1776,8 @@ View DetachedArtifactReview(std::shared_ptr<kit::Conversation> conversation, std
         return Row{Button(::app::strings::ui_close_review).OnClick([window] { window.Close(); }), Spacer()}
             .With(Padding(14.0F));
       });
-  return MaterialTheme(theme, ProvideEnvironment(preview_chat_layout,
-      ProvideEnvironment(agentkit_preview::ChatChrome{std::move(chrome)}, std::move(chat).With(Background(theme.colors.surface)))));
+  return MaterialTheme(theme, agentkit_preview::PreviewControlsTheme(ProvideEnvironment(preview_chat_layout,
+      ProvideEnvironment(agentkit_preview::ChatChrome{std::move(chrome)}, std::move(chat).With(Background(theme.colors.surface))))));
 }
 
 WindowHandle OpenPreviewArtifactReview(const ApplicationHandle& application, std::shared_ptr<kit::Conversation> conversation,
@@ -2555,8 +2578,7 @@ View PreviewShell() {
               row.push_back(Text(::app::strings::ui_action_required, TextRole::Label).With(Foreground(colors.on_surface_variant)));
             row.push_back(std::move(controls));
             auto heading = Row(std::move(row)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
-            return Row{Spacer(), std::move(heading).With(Frame{.width = preview_chat_layout.content_width})
-                          .Key("agent-chat-heading"), Spacer()}
+            return Column{std::move(heading).Key("agent-chat-heading")}
                 .With(Padding(EdgeInsets{.top = 10.0F, .right = gutter, .left = gutter}),
                     CrossAlign(CrossAxisAlignment::Stretch));
           });
@@ -2665,25 +2687,6 @@ View PreviewShell() {
         }, ready.Get()),
     };
     std::vector<View> compose;
-    auto field_style = UseEnvironment<TextFieldStyle>();
-    field_style.show_label = false;
-    field_style.text_style = {Font::System(15.0F), colors.on_surface};
-    field_style.placeholder_style = {Font::System(15.0F), colors.on_surface_variant};
-    field_style.caret = colors.on_primary_container;
-    field_style.standard.border = Color::Transparent();
-    field_style.standard.hovered_border = Color::Transparent();
-    field_style.standard.focused_border = Color::Transparent();
-    field_style.standard.minimum_height = 0.0F;
-    field_style.padding = {};
-    auto message_field = ProvideEnvironment(field_style, Row{
-        TextField(draft).Label(::app::strings::ui_message).LineLimits(TextFieldLineLimits::MultiLine(2, 5))
-            .Placeholder(code ? ::app::strings::ui_describe_the_change : assistant.Get() == 1 ? ::app::strings::ui_describe_your_presentation :
-                assistant.Get() == 3 ? ::app::strings::ui_describe_the_screen_or_interaction : ::app::strings::ui_send_a_message)
-            .Variant(TextFieldVariant::Standard).OnChanged([draft](const TextEditingValue& input) { draft = input; })
-            .On<ViewEvents::FocusChanged>([draft_focused](bool focused) { draft_focused = focused; })
-            .OnSubmitted(create).With(draft_input, Grow()).Key("new-conversation-composer"),
-    }.With(Frame{.min_height = 54.0F},
-           Padding(EdgeInsets{.top = 4.0F, .right = 4.0F, .left = 4.0F})).Key("new-message-input"));
     std::optional<View> controls;
     if (ready.Get()) {
       std::optional<View> draft_action;
@@ -2719,23 +2722,11 @@ View PreviewShell() {
       controls = agentkit_preview::RunSettingsControls(service->run_settings, new_start, new_agent, workspace_id,
           native_workspace, {}, {}, std::move(draft_action), AddModelAction(service));
     }
-    compose.push_back(std::move(message_field));
     const bool can_send = ready.Get() && !creating.Get() && (!draft->text.empty() || !new_sources->attachments.empty()) &&
         !draft->composition && (!code || (service->code_available.Get() && native_workspace));
-    auto send_style = UseEnvironment<IconButtonStyle>();
-    send_style.icon_size = 20.0F;
-    send_style.minimum_interactive_size = 38.0F;
-    send_style.state_layer_size = 38.0F;
-    send_style.corner_radius = 11.0F;
-    send_style.foreground = colors.on_primary;
-    send_style.disabled_foreground = colors.on_surface_variant;
-    const auto send_label = ::app::strings::ui_send;
-    compose.push_back(Row{
-        controls ? View(Column{std::move(*controls)}.With(Grow(), CrossAlign(CrossAxisAlignment::Stretch))) : View(Spacer()),
-        ProvideEnvironment(send_style, IconButton(::app::images::send, send_label).OnClick(create)
-            .With(Enabled(can_send), Background(can_send ? colors.primary : colors.surface_container_high),
-                CornerRadius(11.0F), Tooltip(send_label)).Key("chat-send/Send")),
-    }.With(CrossAlign(CrossAxisAlignment::Center)));
+    const auto placeholder = code ? ::app::strings::ui_describe_the_change : assistant.Get() == 1 ?
+        ::app::strings::ui_describe_your_presentation : assistant.Get() == 3 ?
+        ::app::strings::ui_describe_the_screen_or_interaction : ::app::strings::ui_send_a_message;
     std::vector<View> context{
         Flow(std::move(selectors)).With(Spacing(7.0F), CrossAlign(CrossAxisAlignment::Center)),
     };
@@ -2789,19 +2780,11 @@ View PreviewShell() {
     };
     if (!status.empty()) lane.push_back(Text(status, TextRole::Label)
         .With(Foreground(colors.on_surface_variant)).Key("new-draft-feedback"));
-    if (creating.Get()) lane.push_back(Row{
-        Text(::app::strings::ui_assistant, TextRole::Label),
-        Text(::app::strings::ui_sending_message, TextRole::Label).With(Foreground(colors.on_surface_variant)),
-    }.With(Spacing(8.0F)).Key("chat-sending-message"));
-    lane.push_back(Column(std::move(compose)).With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Stretch),
-        Padding(11.0F), CornerRadius(17.0F), Background(colors.surface_container),
-        Border{draft_focused.Get() ? colors.on_primary_container : colors.outline}).Key("new-draft-composer"));
-    main = Row{
-        Spacer(),
-          Column(std::move(lane)).With(Frame{.width = preview_chat_layout.content_width}, Spacing(10.0F),
-            CrossAlign(CrossAxisAlignment::Stretch)),
-        Spacer(),
-    }.With(Grow(), CrossAlign(CrossAxisAlignment::Stretch), Padding(EdgeInsets{
+    if (creating.Get()) lane.push_back(Text(::app::strings::ui_sending_message, TextRole::Label)
+        .With(Foreground(colors.on_surface_variant)).Key("chat-sending-message"));
+    lane.push_back(agentkit_preview::PreviewDraftComposer(draft, draft_input, draft_focused, placeholder,
+        "new-conversation-composer", std::move(compose), std::move(controls), !creating.Get(), can_send, create).Key("new-draft-composer"));
+    main = Column(std::move(lane)).With(Grow(), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch), Padding(EdgeInsets{
         .top = compact ? 20.0F : 28.0F, .right = page_gutter, .bottom = compact ? 14.0F : 25.0F, .left = page_gutter}))
         .Key(current_draft.view_key);
   }
@@ -2895,7 +2878,7 @@ View PreviewShell() {
 View App() {
   const auto service = UseService<PreviewService>();
   const auto brightness = agentkit_preview::PreviewBrightness(service->settings->appearance, UseSystemThemeBrightness());
-  return MaterialTheme(agentkit_preview::PreviewTheme(brightness), PreviewShell());
+  return MaterialTheme(agentkit_preview::PreviewTheme(brightness), agentkit_preview::PreviewControlsTheme(PreviewShell()));
 }
 
 ApplicationHook MakePreviewInstaller(std::optional<File> database, bool read_model_configuration) {

@@ -376,6 +376,7 @@ struct CreateSessionRequest {
   /// Configuration of the new session.
   SessionOptions options;
   /// No initial Run, direct input, or a collaboration work request.
+  /// A side chat can include new user-staged attachments in its first input. Its source references come from SideChatSeed.
   std::variant<std::monostate, SendInput, WorkRequest> initial;
   /// Origin and selections for an ephemeral side chat, when applicable.
   std::optional<SideChatSeed> side_chat;

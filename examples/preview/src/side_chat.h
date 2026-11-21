@@ -9,6 +9,8 @@ struct PreviewSideChats {
   std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime;
   huxerui::agentkit::AgentId assistant;
   std::vector<std::shared_ptr<Draft>> drafts;
+  std::function<huxerui::agentkit::AgentChatRunControls(huxerui::State<huxerui::agentkit::UserRunOptions>,
+      huxerui::State<huxerui::agentkit::AgentChatDraftSources>)> composer_controls;
 };
 
 huxerui::View PreviewSideChatWorkspace(huxerui::View content, std::shared_ptr<huxerui::agentkit::Conversation> conversation,

@@ -224,8 +224,12 @@ Async<void> RuntimeState::PrepareSelectedContext(const SessionData& session, con
 
 Async<void> RuntimeState::ValidateUserSources(const SessionData& session, PrincipalId user,
                                                 std::vector<SourceSlice> sources, ModelId model) {
-  if (session.origin.kind == SessionOriginKind::SideChat && !sources.empty())
-    co_return Fail<void>(ErrorCode::PermissionDenied, "Side chat uses its original selection and conversation history");
+  if (session.origin.kind == SessionOriginKind::SideChat && std::ranges::any_of(sources, [&](const auto& source) {
+        const auto* message = std::get_if<MessageRef>(&source.source);
+        return !message || message->session != session.summary.id;
+      })) {
+    co_return Fail<void>(ErrorCode::PermissionDenied, "Side chat can only quote its own conversation history");
+  }
   const auto actor = Request(user, Capability::SubmitInput, &session).actor;
   std::vector<SourceSlice> whole;
   for (const auto& slice : sources) {

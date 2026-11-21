@@ -15,7 +15,10 @@ struct PreviewSideChats::Draft {
   std::vector<kit::SourceSlice> slices;
   State<std::shared_ptr<kit::Conversation>> conversation{std::shared_ptr<kit::Conversation>{}};
   State<TextEditingValue> question{TextEditingValue::FromText({})};
+  State<kit::AgentChatDraftSources> sources{kit::AgentChatDraftSources{}};
+  State<kit::UserRunOptions> next{kit::UserRunOptions{}};
   State<bool> pending{false};
+  std::optional<kit::SessionId> created;
   State<std::string> error{std::string{}};
 };
 
@@ -69,39 +72,6 @@ std::optional<kit::AgentChatCitation> LatestReply(const kit::SessionSnapshot& sn
 }
 
 [[huxerui::composable]]
-View FirstQuestion(State<TextEditingValue> question, ViewHandle focus, bool pending, std::function<void()> submit) {
-  const auto colors = UseTheme().colors;
-  const auto focused = UseState(false);
-  auto field = UseEnvironment<TextFieldStyle>();
-  field.show_label = false;
-  field.standard.border = field.standard.hovered_border = field.standard.focused_border = Color::Transparent();
-  field.standard.minimum_height = 0.0F;
-  field.text_style = {Font::System(15.0F), colors.on_surface};
-  field.placeholder_style = {Font::System(15.0F), colors.on_surface_variant};
-  field.padding = {};
-  auto send = UseEnvironment<IconButtonStyle>();
-  send.icon_size = 20.0F;
-  send.minimum_interactive_size = send.state_layer_size = 38.0F;
-  send.corner_radius = 11.0F;
-  send.foreground = colors.on_primary;
-  send.disabled_foreground = colors.on_surface_variant;
-  const bool ready = !pending && !question->text.empty() && !question->composition;
-  return Column{
-      ProvideEnvironment(field, Row{TextField(question).Label(::app::strings::ui_side_chat)
-          .Placeholder(::app::strings::ui_ask_about_this_selection).Variant(TextFieldVariant::Standard)
-          .LineLimits(TextFieldLineLimits::MultiLine(2, 5)).OnChanged([question](const TextEditingValue& value) { question = value; })
-          .On<ViewEvents::FocusChanged>([focused](bool value) { focused = value; }).OnSubmitted(submit)
-          .With(focus, Grow(), Enabled(!pending)).Key("side-chat-question")}
-          .With(Frame{.min_height = 54.0F}, Padding(EdgeInsets{.top = 4.0F, .right = 4.0F, .left = 4.0F}))),
-      Row{Spacer(), ProvideEnvironment(send, IconButton(::app::images::send, ::app::strings::ui_send).OnClick(submit)
-          .With(Enabled(ready), Background(ready ? colors.primary : colors.surface_container_high),
-                CornerRadius(11.0F), Tooltip(::app::strings::ui_send)).Key("chat-send/Send"))}
-          .With(CrossAlign(CrossAxisAlignment::Center)).Key("agent-chat-toolbar"),
-  }.With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Stretch), Padding(11.0F), CornerRadius(17.0F),
-      Background(colors.surface_container), Border{focused.Get() ? colors.on_primary_container : colors.outline}).Key("agent-chat-composer");
-}
-
-[[huxerui::composable]]
 View SideChatPane(std::shared_ptr<const SideChatRequest> request, ViewHandle focus, std::function<void()> close,
                   std::function<void()> restore) {
   const auto service = UseService<PreviewSideChats>();
@@ -112,7 +82,10 @@ View SideChatPane(std::shared_ptr<const SideChatRequest> request, ViewHandle foc
   const auto reply = UseState(std::optional<kit::AgentChatCitation>{});
   const auto selection = UseState(std::shared_ptr<const kit::AgentChatTextSelection>{});
   const auto follow_up_focus = UseViewHandle();
+  const auto first_focused = UseState(false);
   const auto draft = request->draft;
+  auto controls = service && service->composer_controls
+      ? std::optional{service->composer_controls(draft->next, draft->sources)} : std::nullopt;
   const auto conversation = draft->conversation.Get();
   const auto scope = request->access;
   const auto visible = [request, allowed] { return allowed.Get() && request->HasAccess(); };
@@ -175,32 +148,63 @@ View SideChatPane(std::shared_ptr<const SideChatRequest> request, ViewHandle foc
             close();
           });
         };
-        body.push_back(ProvideEnvironment(buttons, Button(::app::strings::ui_bring_back_conclusion).OnClick(bring_back)
-            .Key(selection.Get() ? "side-chat-return-selection" : "side-chat-return-reply")));
+        std::vector<View> actions{Button(::app::strings::ui_bring_back_conclusion).OnClick(bring_back)
+            .Key(selection.Get() ? "side-chat-return-selection" : "side-chat-return-reply")};
+        if (const auto selected = selection.Get()) {
+          actions.push_back(Button(::app::strings::ui_quote).OnClick([selected, draft, tasks, visible, follow_up_focus] {
+            tasks.Launch([selected, draft, visible, follow_up_focus]() -> Task<void> {
+              auto cited = co_await selected->ReadAsync();
+              if (!visible()) co_return;
+              if (!cited.Succeeded()) { draft->error = cited.Error().message; co_return; }
+              auto sources = draft->sources.Get();
+              sources.quote = std::move(cited).Value();
+              draft->sources = std::move(sources);
+              follow_up_focus.RequestFocus(true);
+            });
+          }).Key("side-chat-quote"));
+        }
+        body.push_back(ProvideEnvironment(buttons, Flow(std::move(actions)).With(Spacing(5.0F))));
       }
-      body.push_back(kit::AgentChatComposer(conversation, draft->question, {}, follow_up_focus).Key("side-chat-input"));
+      body.push_back(kit::AgentChatComposer(conversation, draft->question, draft->sources, follow_up_focus,
+          std::move(controls)).Key("side-chat-input"));
     } else {
       body.push_back(Spacer());
       if (draft->pending.Get()) body.push_back(Text(::app::strings::ui_sending_message, TextRole::Label).Key("chat-sending-message"));
-      const auto submit = [background, service, draft, visible] {
-        if (!service || !visible() || draft->pending.Get() || draft->question->text.empty() || draft->question->composition) return;
+      const auto can_send = [draft] {
+        return !draft->pending.Get() && !draft->question->composition &&
+            (!draft->question->text.empty() || !draft->sources->attachments.empty());
+      };
+      const auto submit = [background, service, draft, visible, can_send] {
+        if (!service || !visible() || !can_send()) return;
+        kit::SendInput input{.text = draft->question->text};
+        for (const auto& attachment : draft->sources->attachments) input.staged_attachments.push_back(attachment->id);
+        kit::CreateSessionRequest start{.options = {.agent = service->assistant, .retention = kit::SessionRetention::Ephemeral},
+            .initial = std::move(input), .side_chat = kit::SideChatSeed{draft->source, draft->slices},
+            .user_start = draft->next.Get()};
         draft->pending = true;
         draft->error = "";
-        background.Launch([draft, runtime = service->runtime, assistant = service->assistant, text = draft->question->text]() -> Task<void> {
-          kit::CreateSessionRequest start{.options = {.agent = assistant, .retention = kit::SessionRetention::Ephemeral},
-              .initial = kit::SendInput{.text = text}, .side_chat = kit::SideChatSeed{draft->source, draft->slices}};
-          auto result = co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), std::move(start));
-          if (!result.Succeeded()) { draft->pending = false; draft->error = result.Error().message; co_return; }
-          const auto* created = std::get_if<kit::SessionCreated>(&result.Value().outcome);
-          if (!created) { draft->pending = false; draft->error = "The side chat is waiting for approval"; co_return; }
-          auto opened = co_await runtime->Sessions().OpenAsync(created->session);
+        background.Launch([draft, runtime = service->runtime, start = std::move(start)]() mutable -> Task<void> {
+          if (!draft->created) {
+            auto result = co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), std::move(start));
+            if (!result.Succeeded()) { draft->pending = false; draft->error = result.Error().message; co_return; }
+            const auto* created = std::get_if<kit::SessionCreated>(&result.Value().outcome);
+            if (!created) { draft->pending = false; draft->error = "The side chat is waiting for approval"; co_return; }
+            draft->created = created->session;
+          }
+          auto opened = co_await runtime->Sessions().OpenAsync(*draft->created);
           draft->pending = false;
           if (!opened.Succeeded()) { draft->error = opened.Error().message; co_return; }
           draft->question = TextEditingValue::FromText({});
+          draft->sources = kit::AgentChatDraftSources{};
           draft->conversation = std::move(opened).Value();
         });
       };
-      body.push_back(FirstQuestion(draft->question, focus, draft->pending.Get(), submit));
+      std::optional<View> toolbar;
+      if (controls) toolbar = controls->render({}, {});
+      std::vector<View> extras;
+      if (!draft->sources->attachments.empty()) extras.push_back(kit::AgentChatAttachmentChips(draft->sources));
+      body.push_back(PreviewDraftComposer(draft->question, focus, first_focused, ::app::strings::ui_ask_about_this_selection,
+          "side-chat-question", std::move(extras), std::move(toolbar), !draft->pending.Get(), can_send(), submit));
     }
     if (!draft->error->empty()) body.push_back(Text(draft->error.Get(), TextRole::Label));
   } else {
@@ -311,6 +315,52 @@ View PreviewChat(std::shared_ptr<kit::Conversation> conversation, kit::AgentChat
   return Column{header ? std::move(*header) : View{Spacer().With(Grow(0.0F), Frame{.height = 0.0F, .max_height = 0.0F})},
       kit::AgentChat(conversation, std::move(body)).With(Grow()).Key("preview-chat-body")}
       .With(Grow(), CrossAlign(CrossAxisAlignment::Stretch));
+}
+
+[[huxerui::composable]]
+View PreviewDraftComposer(State<TextEditingValue> draft, ViewHandle focus, State<bool> focused,
+    StringVariant placeholder, const char* input_key, std::vector<View> extras, std::optional<View> controls,
+    bool editing, bool can_send, std::function<void()> submit) {
+  auto content = extras;
+  const auto colors = UseTheme().colors;
+  auto field = UseEnvironment<TextFieldStyle>();
+  field.show_label = false;
+  field.standard.border = field.standard.hovered_border = field.standard.focused_border = Color::Transparent();
+  field.standard.minimum_height = 0.0F;
+  field.text_style = {Font::System(15.0F), colors.on_surface};
+  field.placeholder_style = {Font::System(15.0F), colors.on_surface_variant};
+  field.caret = colors.on_primary_container;
+  field.padding = {};
+  content.push_back(ProvideEnvironment(field, Row {
+    TextField(draft).Label(::app::strings::ui_message).Placeholder(placeholder)
+        .Variant(TextFieldVariant::Standard).LineLimits(TextFieldLineLimits::MultiLine(2, 5))
+        .On<ViewEvents::KeyIntercept>([draft, submit](const KeyEvent& event) {
+          if (event.type != KeyEventType::Down || (event.key != Key::Enter && event.key != Key::NumpadEnter) ||
+              event.modifiers.control || event.modifiers.alt || event.modifiers.meta) return false;
+          if (draft->composition) return true;
+          if (event.modifiers.shift) return false;
+          if (!event.repeat) submit();
+          return true;
+        })
+        .OnChanged([draft](const TextEditingValue& value) { draft = value; })
+        .On<ViewEvents::FocusChanged>([focused](bool value) { focused = value; }).OnSubmitted(submit)
+        .With(focus, Grow(), Enabled(editing)).Key(input_key),
+  }.With(Frame{.min_height = 54.0F}, Padding(EdgeInsets{.top = 4.0F, .right = 4.0F, .left = 4.0F}))).Key("message-input"));
+  auto send = UseEnvironment<IconButtonStyle>();
+  send.icon_size = 20.0F;
+  send.minimum_interactive_size = send.state_layer_size = 38.0F;
+  send.corner_radius = 11.0F;
+  send.foreground = colors.on_primary;
+  send.disabled_foreground = colors.on_surface_variant;
+  content.push_back(Row {
+    controls ? View(Column {*controls}.With(Grow(), CrossAlign(CrossAxisAlignment::Stretch))) : View(Spacer()),
+    ProvideEnvironment(send, IconButton(::app::images::send, ::app::strings::ui_send).OnClick(submit)
+        .With(Enabled(can_send), Background(can_send ? colors.primary : colors.surface_container_high),
+              CornerRadius(11.0F), Tooltip(::app::strings::ui_send)).Key("chat-send/Send")),
+  }.With(CrossAlign(CrossAxisAlignment::Center)).Key("agent-chat-toolbar"));
+  return Column(std::move(content)).With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Stretch), Padding(11.0F),
+      CornerRadius(17.0F), Background(colors.surface_container),
+      Border{focused.Get() ? colors.on_primary_container : colors.outline}, Enabled(editing)).Key("agent-chat-composer");
 }
 
 [[huxerui::composable]]

@@ -147,8 +147,10 @@ Async<std::vector<StoredArtifact>> RuntimeState::ResolveModelAttachments(const S
     std::vector<ArtifactRef> refs, ModelProviderRef model) {
   using Result = AgentResult<std::vector<StoredArtifact>>;
   if (refs.empty()) co_return Result::Success({});
-  if (session.origin.kind == SessionOriginKind::SideChat)
-    co_return Fail<std::vector<StoredArtifact>>(ErrorCode::PermissionDenied, "Side chat only uses its original selection");
+  if (session.origin.kind == SessionOriginKind::SideChat &&
+      std::ranges::any_of(refs, [&](const auto& ref) { return !FindArtifact(session, ref); })) {
+    co_return Fail<std::vector<StoredArtifact>>(ErrorCode::PermissionDenied, "Side chat only accepts its own attachments");
+  }
   if (!options.artifact_store.open)
     co_return Fail<std::vector<StoredArtifact>>(ErrorCode::Unsupported, "Artifact byte stream is unavailable");
   const auto provider = models.find(model.id);
@@ -196,8 +198,6 @@ Async<std::vector<StoredArtifact>> RuntimeState::PrepareInputAttachments(const S
   auto existing = co_await CheckModelAttachments(session, user, input.attachments, model);
   if (!existing.Succeeded()) co_return Result::Failure(existing.Error());
   if (input.staged_attachments.empty()) co_return Result::Success({});
-  if (session.origin.kind == SessionOriginKind::SideChat)
-    co_return Fail<std::vector<StoredArtifact>>(ErrorCode::PermissionDenied, "Side chat only uses its original selection");
   if (!options.artifact_store.resolve_staged_attachment || !options.artifact_store.open)
     co_return Fail<std::vector<StoredArtifact>>(ErrorCode::Unsupported, "The host does not import attachments");
   const auto provider = models.find(model.id);

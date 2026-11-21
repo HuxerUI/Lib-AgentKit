@@ -8,6 +8,8 @@
 #include "runtime_internal.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <ranges>
 #include <set>
@@ -161,9 +163,18 @@ std::optional<AgentChatCitation> LastCompletedReply(const std::vector<Message>& 
 
 [[huxerui::composable]]
 View SelectionField(SourceRef source, std::variant<BlockId, PartId> leaf, std::string text,
-                    State<std::optional<SelectedText>> selection, std::string key, std::optional<ViewHandle> target = {}) {
+                    State<std::optional<SelectedText>> selection, std::string key,
+                    std::optional<ViewHandle> target = {}, bool fit_content = false) {
   const auto local_target = UseViewHandle();
   const auto anchor = target.value_or(local_target);
+  Frame frame;
+  if (fit_content) {
+    const auto style = UseEnvironment<TextFieldStyle>();
+    const auto metrics = UseTextMeasurer().MeasureText(std::string_view{text}, style.text_style,
+        std::numeric_limits<float>::infinity(),
+        {.shaping = {.locale = std::string(UseEnvironment<Locale>().LanguageTag())}, .wrap = TextWrap::NoWrap});
+    frame.max_width = std::ceil(metrics.size.width) + style.padding.left + style.padding.right + style.caret_width;
+  }
   TextEditingValue value{.text = text};
   if (const auto selected = selection.Get(); selected && selected->source.source == source &&
       selected->source.text_range->leaf == leaf) value.selection = selected->selection;
@@ -186,7 +197,7 @@ View SelectionField(SourceRef source, std::variant<BlockId, PartId> leaf, std::s
         selection = SelectedText{.source = {source, {}, SourceTextRange{leaf, *start, *end}},
             .text = state.text.substr(*start, *end - *start), .selection = state.selection,
             .toolbar_anchor = SelectionToolbarAnchor{anchor}};
-      }).With(anchor, Semantics{.read_only = true}).Key(std::move(key));
+      }).With(frame, anchor, Semantics{.read_only = true}).Key(std::move(key));
 }
 
 StringVariant AuthorLabel(MessageAuthor author, std::string_view agent) {
@@ -221,6 +232,15 @@ ButtonStyle ChatActionStyle(ButtonStyle style, const ThemeSpec& theme) {
   return style;
 }
 
+bool SubmitOnEnter(const KeyEvent& event, const TextEditingValue& draft, const std::function<void()>& submit) {
+  if (event.type != KeyEventType::Down || (event.key != Key::Enter && event.key != Key::NumpadEnter) ||
+      event.modifiers.control || event.modifiers.alt || event.modifiers.meta) return false;
+  if (draft.composition) return true;
+  if (event.modifiers.shift) return false;
+  if (!event.repeat) submit();
+  return true;
+}
+
 [[huxerui::composable]]
 View ChatComposerInput(State<TextEditingValue> draft, ViewHandle focus, State<bool> focused,
                        StringVariant placeholder, const char* key, std::function<void()> submit,
@@ -236,7 +256,8 @@ View ChatComposerInput(State<TextEditingValue> draft, ViewHandle focus, State<bo
           .LineLimits(TextFieldLineLimits::MultiLine(dense ? 1 : 2, 5)).Variant(TextFieldVariant::Standard)
           .OnChanged([draft](const TextEditingValue& value) { draft = value; })
           .On<ViewEvents::FocusChanged>([focused](bool value) { focused = value; })
-          .OnSubmitted(std::move(submit)).With(focus, Grow(), Enabled(enabled)).Key(key),
+          .On<ViewEvents::KeyIntercept>([draft, submit](const KeyEvent& event) { return SubmitOnEnter(event, draft.Get(), submit); })
+          .OnSubmitted(submit).With(focus, Grow(), Enabled(enabled)).Key(key),
   }.With(Frame{.min_height = dense ? 38.0F : bubbles ? 54.0F : 59.0F},
          Padding(EdgeInsets{.top = 4.0F, .right = 4.0F, .left = 4.0F})).Key("message-input"));
 }
@@ -393,10 +414,12 @@ View ChatActivityHeader(StringVariant status, std::optional<StringVariant> time 
   std::vector<View> labels{
       Canvas([dot](PaintContext& context, Size size) { context.DrawRect({0, 0, size.width, size.height}, dot); })
           .With(Frame{.width = 6.0F, .height = 6.0F}, CornerRadius(3.0F)),
-      Text(huxerui_agentkit::strings::ui_assistant, TextRole::Label)
-          .Style({Font::System(12.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}),
-      Text(std::move(status), TextRole::Label).Style({Font::System(12.0F), colors.on_surface_variant}).Key("chat-assistant-status"),
   };
+  if (!UseEnvironment<AgentChatLayoutStyle>().chat_bubbles)
+    labels.push_back(Text(huxerui_agentkit::strings::ui_assistant, TextRole::Label)
+        .Style({Font::System(12.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}));
+  labels.push_back(Text(std::move(status), TextRole::Label)
+      .Style({Font::System(12.0F), colors.on_surface_variant}).Key("chat-assistant-status"));
   if (time) labels.push_back(Text(std::move(*time), TextRole::Label)
       .Style({Font::Monospace(11.0F), colors.on_surface_variant}).Key("chat-run-time"));
   if (details) labels.push_back(std::move(*details));
@@ -679,15 +702,15 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
                  const ThemeSpec& theme, const TextFieldStyle& selection_style,
                  Revision access_revision, const std::shared_ptr<const AgentChatLinkHandler>& links,
                  const std::optional<InlineArtifactSummary>& inline_summary,
-                 const decltype(AgentChatOptions::render_block)& render_block, bool bubbles, bool narrow) {
+                 const decltype(AgentChatOptions::render_block)& render_block, std::optional<Image> model_avatar,
+                 bool bubbles, bool narrow) {
   const auto& colors = theme.colors;
   const bool user = message.author == MessageAuthor::User;
   const bool agent_reply = message.author == MessageAuthor::Agent;
   const bool bubble = bubbles && (user || agent_reply);
-  auto author = Text(AuthorLabel(message.author, agent))
-      .Style({Font::System(12.0F).WithWeight(FontWeight::SemiBold), colors.on_surface_variant});
   std::vector<View> content;
-  if (!bubble) content.push_back(author);
+  if (!bubble) content.push_back(Text(AuthorLabel(message.author, agent))
+      .Style({Font::System(12.0F).WithWeight(FontWeight::SemiBold), colors.on_surface_variant}));
   if (steer) {
     auto status = Text(*steer == SteerState::Pending ? huxerui_agentkit::strings::ui_waiting_to_apply :
         *steer == SteerState::Applied ? huxerui_agentkit::strings::ui_applied_to_this_run : huxerui_agentkit::strings::ui_not_applied, TextRole::Label);
@@ -707,7 +730,7 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
             selectable, selection, links).Key(block.id.value));
       } else if (selectable && message.state == MessageState::Complete && !text->text.empty()) {
         content.push_back(ProvideEnvironment(selection_style,
-            SelectionField(message.ref, block.id, text->text, selection, block.id.value)));
+            SelectionField(message.ref, block.id, text->text, selection, block.id.value, {}, bubble && user)));
       } else {
         content.push_back(Text(text->text).Style({Font::System(14.0F), colors.on_surface}).Key(block.id.value));
       }
@@ -737,17 +760,18 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
         ? std::move(body).With(Padding(EdgeInsets::Symmetric(14.0F, 9.0F)),
             CornerRadius(13.0F), Background(colors.primary_container)).Key("chat-user-bubble")
         : std::move(body).With(Padding(EdgeInsets{.top = 2.0F, .bottom = 3.0F})).Key("chat-agent-bubble");
-    auto heading = Row{std::move(author)}.With(MainAlign(user ? MainAxisAlignment::End : MainAxisAlignment::Start));
-    auto thread = Column{std::move(heading), std::move(tile)}.With(
-        Frame{.max_width = user ? 510.0F : 666.0F}, Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch));
-    auto avatar = Image(user ? huxerui_agentkit::images::person : huxerui_agentkit::images::assistant)
-        .Tint(user ? colors.on_surface_variant : colors.on_primary_container)
-        .With(Frame{.width = 26.0F, .height = 26.0F}, CornerRadius(8.0F),
-              Background(user ? colors.surface_container_high : colors.primary_container));
-    auto speaker = Column{std::move(avatar)}.With(Padding(EdgeInsets{.top = user ? 21.0F : 1.0F}));
-    if (user) return Row{Spacer(), std::move(thread), std::move(speaker)}
-        .With(Spacing(7.0F), Padding(EdgeInsets{.left = narrow ? 30.0F : 64.0F}));
-    return Row{std::move(speaker), std::move(thread), Spacer()}
+    View avatar_image = model_avatar
+        ? std::move(*model_avatar).Key("chat-model-avatar")
+        : View{Image(user ? huxerui_agentkit::images::person : huxerui_agentkit::images::assistant)
+              .Tint(user ? colors.on_surface_variant : colors.on_primary_container)};
+    auto avatar = Stack{std::move(avatar_image)}.With(Frame{.width = 26.0F, .height = 26.0F},
+              Padding(model_avatar ? 5.0F : 0.0F), CornerRadius(8.0F),
+              Background(user || model_avatar ? colors.surface_container_high : colors.primary_container),
+              Semantics{.role = SemanticRole::Image, .label = AuthorLabel(message.author, agent)},
+              LayoutPriority(1.0F)).Key(user ? "chat-user-avatar" : "chat-agent-avatar");
+    if (user) return Row{std::move(tile), std::move(avatar)}
+        .With(MainAlign(MainAxisAlignment::End), Spacing(7.0F), Padding(EdgeInsets{.left = narrow ? 30.0F : 64.0F}));
+    return Row{std::move(avatar), std::move(tile).With(Grow())}
         .With(Spacing(7.0F), Padding(EdgeInsets{.right = narrow ? 14.0F : 40.0F}));
   }
   if (!user) return body;
@@ -1057,6 +1081,9 @@ View SideChatContent(std::shared_ptr<const SideChatRequest> request, ViewHandle 
         ProvideEnvironment(style, TextField(question).Label(huxerui_agentkit::strings::ui_question).Placeholder(huxerui_agentkit::strings::ui_ask_about_this_selection)
             .LineLimits(TextFieldLineLimits::MultiLine(2, 4)).Variant(TextFieldVariant::Outlined)
             .OnChanged([question](const TextEditingValue& value) { question = value; })
+            .On<ViewEvents::KeyIntercept>([question, submit](const KeyEvent& event) {
+              return SubmitOnEnter(event, question.Get(), submit);
+            })
             .OnSubmitted(submit).With(question_focus, Enabled(!pending.Get())).Key("side-chat-question")),
     }.With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Stretch)));
     if (!error.Get().empty()) body.push_back(Text(error.Get(), TextRole::Label));
@@ -1406,6 +1433,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
   const auto composer_focused = UseState(false);
   const auto theme = UseTheme();
   const auto layout_style = UseEnvironment<AgentChatLayoutStyle>();
+  const auto avatar_for = layout_style.chat_bubbles ? OptionalChatService<AgentChatModelAvatar>() : nullptr;
   const auto field_style = ChatFieldStyle(UseEnvironment<TextFieldStyle>(), theme);
   const auto action_style = ChatActionStyle(UseEnvironment<ButtonStyle>(), theme);
   const auto viewport_class = UseViewportClass();
@@ -1816,7 +1844,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
       [conversation, open_artifact, selection, selection_enabled, side_chat, current, snapshot, range_anchor, earlier,
        history_loading, history_window, loading = history_loading.Get(), theme, field_style, action_style, restore,
        can_restore = empty_draft && !recovering.Get(),
-       agent_label = options.agent_label, links, selected, draft_sources, selection_focus, focus_cited_draft,
+       agent_label = options.agent_label, avatar_for, links, selected, draft_sources, selection_focus, focus_cited_draft,
        inline_summary = std::move(inline_summary), render_block = options.render_block,
        activity, host_selection = options.selection.has_value(), tool_label = options.tool_label, bubbles = layout_style.chat_bubbles, narrow = compact || side_chat](std::size_t index) -> View {
     if (earlier && index == 0) {
@@ -1831,6 +1859,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
     std::optional<SteerState> steer;
     std::optional<View> recover;
     std::string agent;
+    std::optional<Image> model_avatar;
     if (message.run) {
       const auto run = std::ranges::find(current->runs, *message.run, &RunSnapshot::id);
       if (run != current->runs.end()) {
@@ -1841,7 +1870,10 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
               Button(huxerui_agentkit::strings::ui_restore_draft).OnClick([restore, command = *found->recovery] { restore(command); })
                   .With(Enabled(can_restore)).Key("restore-supplement"));
         }
-        if (agent_label && message.author == MessageAuthor::Agent) agent = agent_label(run->agent);
+        if (message.author == MessageAuthor::Agent) {
+          if (agent_label) agent = agent_label(run->agent);
+          if (avatar_for) model_avatar = (*avatar_for)(run->model, theme.colors.on_surface);
+        }
       }
     }
     std::optional<View> selection_actions;
@@ -1853,7 +1885,8 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
     auto view = MessageView(message, conversation, open_artifact, selection,
         selection_enabled && (!side_chat || message.author == MessageAuthor::Agent), steer, std::move(recover),
         std::move(selection_actions),
-        std::move(agent), theme, field_style, current->access_revision, links, inline_summary, render_block, bubbles, narrow)
+        std::move(agent), theme, field_style, current->access_revision, links, inline_summary, render_block,
+        std::move(model_avatar), bubbles, narrow)
         .Key(message.ref.message.value);
     if (!activity) return std::move(view).With(Padding(EdgeInsets{.top = 2.0F, .bottom = 18.0F}));
     std::vector<View> row;
@@ -2246,12 +2279,11 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
   if (has_notices) composer_panel = std::move(composer_panel).With(LayoutPriority(3.0F));
   content.push_back(std::move(composer_panel));
   const float gutter = compact ? 14.0F : viewport_class == ViewportClass::Medium ? 21.0F : 36.0F;
-  View chat = Row{
-      Spacer(),
-      Column(std::move(content)).With(Frame{.width = layout_style.content_width}, Spacing(8.0F),
-          CrossAlign(CrossAxisAlignment::Stretch)),
-      Spacer(),
-  }.With(Grow(), CrossAlign(CrossAxisAlignment::Stretch),
+  View lane = Column(std::move(content)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
+  if (layout_style.content_width > 0.0F)
+    lane = Row{Spacer(), std::move(lane).With(Frame{.width = layout_style.content_width}), Spacer()}
+        .With(CrossAlign(CrossAxisAlignment::Stretch));
+  View chat = std::move(lane).With(Grow(),
       Padding(side_chat ? EdgeInsets{} : EdgeInsets{.top = layout_style.chat_bubbles ? 10.0F : compact ? 20.0F : 28.0F, .right = gutter,
           .bottom = compact ? 14.0F : 25.0F, .left = gutter}));
   if (layout_style.chat_bubbles && !side_chat) {
@@ -2303,9 +2335,10 @@ View AgentChatMessages(std::shared_ptr<Conversation> conversation, std::optional
 }
 
 View AgentChatComposer(std::shared_ptr<Conversation> conversation, State<TextEditingValue> draft,
-                       std::optional<State<AgentChatDraftSources>> sources, std::optional<ViewHandle> focus) {
-  return ConversationChatView(std::move(conversation), {.draft_sources = std::move(sources), .draft = draft, .composer_focus = std::move(focus)},
-      ChatPart::Composer);
+                       std::optional<State<AgentChatDraftSources>> sources, std::optional<ViewHandle> focus,
+                       std::optional<AgentChatRunControls> run_controls) {
+  return ConversationChatView(std::move(conversation), {.draft_sources = std::move(sources), .draft = draft,
+      .run_controls = std::move(run_controls), .composer_focus = std::move(focus)}, ChatPart::Composer);
 }
 
 } // namespace huxerui::agentkit

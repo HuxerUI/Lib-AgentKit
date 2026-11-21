@@ -229,7 +229,6 @@ Async<Receipt<SessionCreated>> RuntimeState::Create(std::shared_ptr<RuntimeState
   const auto* initial = std::get_if<SendInput>(&request.initial);
   if (side && (bound || fork || request.options.retention != SessionRetention::Ephemeral ||
       request.options.project || request.options.workspace || !initial || !initial->context.empty() || !initial->attachments.empty() ||
-      !initial->staged_attachments.empty() ||
       side->source.value.empty() || side->selected.empty() || side->selected.size() > 64)) {
     co_return Fail<Receipt<SessionCreated>>(ErrorCode::InvalidArgument,
         "Side chat requires a temporary conversation, a question and a source selection");

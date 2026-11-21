@@ -60,6 +60,12 @@ struct AgentChatImageLoader {
   std::function<Task<ImageAsset>(AgentChatImage)> load;
 };
 
+/// @brief Optional application service for model avatars in AgentChat() and AgentChatMessages().
+/// Register with ApplicationContext::Provide(). The callback receives the exact model registration
+/// bound to the reply's Run and a theme foreground color for images that need tinting.
+/// It runs synchronously during rendering. Return an empty result to use the default assistant avatar.
+using AgentChatModelAvatar = std::function<std::optional<Image>(const ModelProviderRef&, Color)>;
+
 /// @brief Display text and exact source slices for a composer quote or side-chat conclusion.
 struct AgentChatCitation {
   /// First source slice in reading order.
@@ -186,7 +192,7 @@ using AgentChatPage = std::variant<std::monostate, InteractionId, AgentChatRevie
 /// @brief Optional layout and activity presentation for AgentChat().
 /// Provide it with ProvideEnvironment() around a conversation or a group of conversations.
 struct AgentChatLayoutStyle {
-  /// Maximum content width in logical pixels.
+  /// Preferred content width in logical pixels. Use zero to fill the available width.
   float content_width = 672.0F;
   /// Uses chat bubbles and the compact composer layout.
   bool chat_bubbles = false;
@@ -279,8 +285,10 @@ View AgentChatMessages(std::shared_ptr<Conversation> conversation,
 /// @param draft Host-owned text, selection and IME composition.
 /// @param sources Optional host-owned quotations, conclusions and staged attachments.
 /// @param focus Optional handle for setting editor focus.
+/// @param run_controls Optional host controls for the next model and execution profile.
 View AgentChatComposer(std::shared_ptr<Conversation> conversation, State<TextEditingValue> draft,
-                       std::optional<State<AgentChatDraftSources>> sources = {}, std::optional<ViewHandle> focus = {});
+                       std::optional<State<AgentChatDraftSources>> sources = {}, std::optional<ViewHandle> focus = {},
+                       std::optional<AgentChatRunControls> run_controls = {});
 
 /// @brief Builds quotation and side-chat actions for a selected artifact source.
 /// @param conversation Open conversation whose permissions apply to the source read.

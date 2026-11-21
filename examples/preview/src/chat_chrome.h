@@ -15,6 +15,11 @@ struct ChatChrome {
   bool operator==(const ChatChrome&) const = default;
 };
 
+huxerui::View PreviewDraftComposer(huxerui::State<huxerui::TextEditingValue> draft, huxerui::ViewHandle focus,
+    huxerui::State<bool> focused, huxerui::StringVariant placeholder, const char* input_key,
+    std::vector<huxerui::View> extras, std::optional<huxerui::View> controls, bool editing, bool can_send,
+    std::function<void()> submit);
+
 huxerui::View PreviewChat(std::shared_ptr<huxerui::agentkit::Conversation> conversation,
     huxerui::agentkit::AgentChatOptions options, std::optional<huxerui::View> actions = {});
 

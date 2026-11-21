@@ -244,6 +244,7 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HU
             examples/preview/src/markdown_images.cpp
             examples/preview/src/release_skill.cpp
             examples/preview/src/report_chart.cpp
+            examples/preview/src/model_catalog.cpp
             examples/preview/src/run_settings.cpp
             examples/preview/src/preview_settings.cpp
             examples/preview/src/release_workflow.cpp

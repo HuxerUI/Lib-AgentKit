@@ -194,7 +194,8 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
   const auto viewport = UseViewportClass();
   const bool compact = viewport == ViewportClass::Compact;
   const bool stack_fields = viewport != ViewportClass::Expanded;
-  auto fields = PreviewFormFieldStyle(UseEnvironment<TextFieldStyle>(), colors);
+  auto fields = UseEnvironment<TextFieldStyle>();
+  fields.show_label = false;
   fields.show_label = false;
   const auto secondary = PreviewSecondaryButton(UseEnvironment<ButtonStyle>(), colors);
   const auto save = [current, draft, file, tasks, error, busy] {
@@ -236,9 +237,18 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
         Row(std::move(catalog_heading)).With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Center)),
     };
     if (choices.empty()) catalog.push_back(Text(::app::strings::ui_no_models_configured).Style({Font::System(13.0F), colors.on_surface_variant}));
+    const auto token_display = [unknown = UseString(::app::strings::ui_model_limit_unknown)](auto value) {
+      return value ? std::to_string(*value) : unknown;
+    };
     for (const auto& model : choices) {
-      catalog.push_back(Text(model.name).Style({Font::System(13.0F), colors.on_surface_variant})
-          .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Tooltip(model.label)));
+      const auto& limits = model.limits;
+      catalog.push_back(Column {
+        Text(model.label).Style({Font::System(13.0F), colors.on_surface})
+            .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Tooltip(model.endpoint + " / " + model.protocol)),
+        Text(StringVariant::Format(::app::strings::ui_model_limit_details, token_display(limits.context_window),
+            token_display(limits.max_input_tokens), token_display(limits.max_output_tokens)), TextRole::Label)
+            .With(Foreground(colors.on_surface_variant)),
+      }.With(Spacing(3.0F), Padding(EdgeInsets{.top = 4.0F, .bottom = 4.0F})).Key(model.ref.id.value));
     }
     content.push_back(SettingsPanel({Column(std::move(catalog)).With(Padding(16.0F), Spacing(9.0F),
         CrossAlign(CrossAxisAlignment::Stretch))}, colors));

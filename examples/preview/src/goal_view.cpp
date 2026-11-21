@@ -1,6 +1,7 @@
 #include <app_resources.h>
 
 #include "goal_view.h"
+#include "preview_theme.h"
 #include "release_workflow.h"
 
 #include <huxerui/huxerui.h>
@@ -32,6 +33,14 @@ struct GoalDraft {
 struct ReviewedGoalEdit {
   kit::Revision revision;
   kit::GoalEditPreview preview;
+};
+
+struct GoalEditorState {
+  State<std::optional<GoalDraft>> draft{std::optional<GoalDraft>{}};
+  State<std::shared_ptr<const ReviewedGoalEdit>> impact{std::shared_ptr<const ReviewedGoalEdit>{}};
+  State<std::string> error{std::string{}};
+  State<bool> busy{false};
+  State<bool> advanced{false};
 };
 
 StringVariant Status(kit::GoalState state) {
@@ -159,19 +168,23 @@ std::string UsageText(const kit::GoalSnapshot& goal) {
 
 [[huxerui::composable]]
 View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<kit::AgentRuntime> runtime,
-    std::optional<kit::RunState> run, bool visible, std::function<void()> close,
-    std::function<void(kit::PendingApproval)> open_completion) {
+    std::optional<kit::RunState> run, std::shared_ptr<GoalEditorState> state, bool docked,
+    std::function<void()> close, std::function<void(kit::PendingApproval)> open_completion) {
   const auto scope = UseTaskScope();
+  const auto commands = UseApplicationTaskScope();
   const auto snapshot = UseState(std::shared_ptr<const std::optional<kit::GoalSnapshot>>{});
-  const auto editor = UseState(std::optional<GoalDraft>{});
-  const auto impact = UseState(std::shared_ptr<const ReviewedGoalEdit>{});
-  const auto error = UseState(std::string{});
-  const auto busy = UseState(false);
+  const auto editor = state->draft;
+  const auto impact = state->impact;
+  const auto error = state->error;
+  const auto busy = state->busy;
+  const auto advanced = state->advanced;
   const bool compact = UseViewportClass() == ViewportClass::Compact;
   const auto colors = UseTheme().colors;
-  auto secondary = UseEnvironment<ButtonStyle>();
-  secondary.background = Color::Transparent();
-  secondary.label_style.foreground = colors.on_surface_variant;
+  const auto button_style = UseEnvironment<ButtonStyle>();
+  const auto primary = PreviewPrimaryButton(button_style, colors);
+  const auto secondary = PreviewSecondaryButton(button_style, colors);
+  auto fields = UseEnvironment<TextFieldStyle>();
+  fields.show_label = false;
   auto destructive = secondary;
   destructive.label_style.foreground = colors.error;
   Lifecycle([scope, conversation, snapshot, error] {
@@ -189,10 +202,10 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
 
   const auto now = snapshot.Get();
   const auto goal = now && *now ? &**now : nullptr;
-  auto update = [scope, conversation, error, busy, editor, impact](kit::GoalCommand command) {
+  auto update = [commands, conversation, error, busy, editor, impact](kit::GoalCommand command) {
     if (busy.Get()) return;
     busy = true;
-    scope.Launch([conversation, error, busy, editor, impact, command = std::move(command)]() mutable -> Task<void> {
+    commands.Launch([conversation, error, busy, editor, impact, command = std::move(command)]() mutable -> Task<void> {
       auto result = co_await conversation->Goals().UpdateAsync(kit::NewCommandId(), std::move(command));
       busy = false;
       if (!result.Succeeded()) { error = result.Error().message; impact = std::shared_ptr<const ReviewedGoalEdit>{}; co_return; }
@@ -202,12 +215,13 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
     });
   };
   std::vector<View> content;
-  if (!error->empty()) content.push_back(Text(error.Get()));
+  std::optional<View> footer;
+  if (!error->empty()) content.push_back(Text(error.Get()).With(Foreground(colors.error)).Key("goal-error"));
   if (!now) {
     if (error->empty()) content.push_back(Text(::app::strings::ui_loading_goal));
   } else if (const auto draft = editor.Get()) {
-    auto field = [&](StringVariant label, TextEditingValue GoalDraft::* member, bool multiline = false) {
-      return TextField((*draft).*member).Label(label)
+    auto field = [&](StringVariant label, TextEditingValue GoalDraft::* member, const char* key, bool multiline = false) {
+      auto input = TextField((*draft).*member).Label(label).Variant(TextFieldVariant::Outlined)
           .LineLimits(multiline ? TextFieldLineLimits::MultiLine(2, 4) : TextFieldLineLimits::SingleLine())
           .OnChanged([editor, impact, member](const TextEditingValue& value) {
             auto changed = editor.Get();
@@ -215,19 +229,23 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
             (*changed).*member = value;
             editor = std::move(changed);
             impact = std::shared_ptr<const ReviewedGoalEdit>{};
-          }).With(Enabled(!busy.Get()));
+          }).With(Enabled(!busy.Get())).Key(key);
+      return PreviewLabeledField(label, std::move(input), colors);
     };
     if (!draft->budget_only) {
-      content.push_back(field(::app::strings::ui_objective, &GoalDraft::objective).Key("goal-objective"));
+      content.push_back(Text(draft->new_goal ? ::app::strings::ui_set_goal : ::app::strings::ui_edit_goal, TextRole::Title)
+          .Style({Font::System(19.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}));
+      content.push_back(field(::app::strings::ui_objective, &GoalDraft::objective, "goal-objective", true));
       const auto* definition = !draft->new_goal && *now ? &(*now)->spec.definition : nullptr;
       if (definition && IsWorkspaceRelease(*definition)) {
-        content.push_back(field(::app::strings::ui_slide_count, &GoalDraft::slides).Key("goal-slide-count"));
+        content.push_back(field(::app::strings::ui_slide_count, &GoalDraft::slides, "goal-slide-count"));
       } else if (!definition || std::holds_alternative<std::nullptr_t>(definition->completion_conditions.value) ||
                  std::holds_alternative<std::string>(definition->completion_conditions.value)) {
-        content.push_back(field(::app::strings::ui_completion_conditions, &GoalDraft::conditions, true).Key("goal-conditions"));
+        content.push_back(field(::app::strings::ui_completion_conditions, &GoalDraft::conditions, "goal-conditions", true));
       } else {
         content.push_back(Text(::app::strings::ui_completion_conditions_are_supplied_by_the_workflow, TextRole::Label));
       }
+      content.push_back(Text(::app::strings::ui_goal_completion, TextRole::Label));
       content.push_back(Checkbox(::app::strings::ui_require_approval_after_verification, draft->require_approval)
           .OnChanged([editor, impact](bool require) {
             auto changed = editor.Get();
@@ -236,17 +254,24 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
             editor = std::move(changed);
             impact = std::shared_ptr<const ReviewedGoalEdit>{};
           }).With(Enabled(!busy.Get())).Key("goal-confirm-completion"));
+      content.push_back(Text(draft->require_approval ? ::app::strings::ui_goal_confirm_description :
+          ::app::strings::ui_goal_automatic_description, TextRole::Label).With(Foreground(colors.on_surface_variant)));
     }
-    if (draft->new_goal || draft->budget_only) {
+    if (draft->new_goal) {
+      content.push_back(ProvideEnvironment(secondary,
+          Button(::app::strings::ui_goal_advanced).OnClick([advanced] { advanced = !advanced.Get(); })
+              .With(Semantics{.expanded = advanced.Get()})).Key("goal-advanced"));
+    }
+    if (draft->budget_only || (draft->new_goal && advanced.Get())) {
       content.push_back(Text(::app::strings::ui_budget, TextRole::Title));
       content.push_back(Text(::app::strings::ui_leave_optional_limits_empty, TextRole::Label));
       content.push_back(Row {
-        field(::app::strings::ui_tokens, &GoalDraft::tokens).With(Grow()),
-        field(::app::strings::ui_model_turns, &GoalDraft::turns).With(Grow()),
+        field(::app::strings::ui_tokens, &GoalDraft::tokens, "goal-budget-tokens").With(Grow()),
+        field(::app::strings::ui_model_turns, &GoalDraft::turns, "goal-budget-turns").With(Grow()),
       }.With(Spacing(10.0F)));
       content.push_back(Row {
-        field(::app::strings::ui_tool_calls, &GoalDraft::tools).With(Grow()),
-        field(::app::strings::ui_minutes, &GoalDraft::minutes).With(Grow()),
+        field(::app::strings::ui_tool_calls, &GoalDraft::tools, "goal-budget-tools").With(Grow()),
+        field(::app::strings::ui_minutes, &GoalDraft::minutes, "goal-budget-minutes").With(Grow()),
       }.With(Spacing(10.0F)));
     }
     if (const auto preview = impact.Get()) {
@@ -260,7 +285,7 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
       if (const auto n = changes.withdrawn_requests.size()) content.push_back(Text(std::to_string(n) + " queued requests will be withdrawn."));
       if (changes.resets_completion_review) content.push_back(Text(::app::strings::ui_evidence_must_be_verified_against_the_new));
     }
-    const auto commit = [scope, conversation, snapshot, editor, busy, error, impact, update] {
+    const auto commit = [commands, conversation, snapshot, editor, busy, error, impact, update] {
       const auto edit = editor.Get();
       const auto current = snapshot.Get();
       if (!edit || busy.Get() || !current) return;
@@ -280,7 +305,7 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
             update(kit::ChangeGoal{ref.id, preview->revision, kit::EditGoal{std::move(definition), preview->preview.token}});
           } else {
             busy = true;
-            scope.Launch([conversation, ref, revision, definition = std::move(definition), busy, impact, error]() mutable -> Task<void> {
+            commands.Launch([conversation, ref, revision, definition = std::move(definition), busy, impact, error]() mutable -> Task<void> {
               auto prepared = co_await conversation->Goals().PreviewEditAsync(ref.id, revision, std::move(definition));
               busy = false;
               if (prepared.Succeeded()) {
@@ -294,17 +319,18 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
         error = invalid.what();
       }
     };
-    const auto action = draft->new_goal ? "Save goal" : draft->budget_only ? "Save budget" :
-        impact.Get() ? "Apply goal change" : "Review goal change";
-    content.push_back(Row {
+    const auto action = draft->new_goal ? ::app::strings::ui_save_goal : draft->budget_only ? ::app::strings::ui_save_goal_budget :
+        impact.Get() ? ::app::strings::ui_apply_goal_change : ::app::strings::ui_review_goal_change;
+    footer = Row {
       ProvideEnvironment(secondary, Button(::app::strings::ui_discard).OnClick([editor, impact, error] {
         editor = std::optional<GoalDraft>{};
         impact = std::shared_ptr<const ReviewedGoalEdit>{};
         error = "";
       }).With(Enabled(!busy.Get()))),
       Spacer(),
-      Button(action).OnClick(commit).With(Enabled(!busy.Get() && (draft->budget_only || !draft->objective.text.empty()))),
-    }.With(Spacing(8.0F)));
+      ProvideEnvironment(primary, Button(action).OnClick(commit)
+          .With(Enabled(!busy.Get() && (draft->budget_only || !draft->objective.text.empty())))),
+    }.With(Spacing(8.0F));
   } else if (!goal || goal->state == kit::GoalState::Completed || goal->state == kit::GoalState::Cancelled) {
     if (goal) {
       content.push_back(Text(goal->spec.definition.objective, TextRole::Title));
@@ -312,11 +338,32 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
       content.push_back(Text(StringVariant::Format(::app::strings::ui_version_0, goal->ref.version), TextRole::Label));
       content.push_back(Text(UsageText(*goal), TextRole::Label));
     }
-    content.push_back(Row{Button(::app::strings::ui_set_goal).OnClick([editor] { editor = GoalDraft{.new_goal = true}; }), Spacer()});
+    if (!goal) {
+      content.push_back(Column {
+        Text(::app::strings::ui_goal_empty_heading, TextRole::Title)
+            .Style({Font::System(18.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}),
+        Text(::app::strings::ui_goal_empty_description).With(Foreground(colors.on_surface_variant)),
+        Row {ProvideEnvironment(primary, Button(::app::strings::ui_set_goal).OnClick([editor, advanced] {
+          advanced = false;
+          editor = GoalDraft{.new_goal = true};
+        })), Spacer()},
+      }.With(Padding(16.0F), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch),
+          Background(colors.surface_container), CornerRadius(10.0F), Border{colors.outline}));
+    } else {
+      content.push_back(Row {ProvideEnvironment(primary, Button(::app::strings::ui_set_goal).OnClick([editor, advanced] {
+        advanced = false;
+        editor = GoalDraft{.new_goal = true};
+      })), Spacer()});
+    }
   } else {
-    content.push_back(Text(goal->spec.definition.objective, TextRole::Title));
-    content.push_back(Text(StringVariant::Format(::app::strings::ui_status_version, UseString(Status(goal->state)), goal->ref.version), TextRole::Label));
-    content.push_back(Text(UsageText(*goal), TextRole::Label));
+    content.push_back(Column {
+      Text(StringVariant::Format(::app::strings::ui_status_version, UseString(Status(goal->state)), goal->ref.version), TextRole::Label)
+          .With(Foreground(colors.on_primary_container)),
+      Text(goal->spec.definition.objective, TextRole::Title)
+          .Style({Font::System(19.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}),
+      Text(UsageText(*goal), TextRole::Label).With(Foreground(colors.on_surface_variant)),
+    }.With(Padding(14.0F), Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch),
+        Background(colors.surface_container), CornerRadius(10.0F), Border{colors.outline}));
     if (const auto slides = ReleaseSlideCount(goal->spec.definition.completion_conditions)) {
       content.push_back(Text(std::to_string(*slides) + " slides", TextRole::Label));
     }
@@ -325,11 +372,16 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
       update(kit::ChangeGoal{ref.id, revision, std::move(change)});
     };
     std::vector<View> actions;
-    if (goal->state == kit::GoalState::Proposed) {
-      actions.push_back(Button(::app::strings::ui_enable).OnClick([start] { start(kit::EnableGoal{}); }).With(Enabled(!busy.Get())));
+    if (goal->completion_review) {
+      actions.push_back(ProvideEnvironment(primary, Button(::app::strings::ui_open_completion_approval).OnClick(
+          [open_completion, approval = goal->completion_review->approval] { open_completion(approval); })));
+    } else if (goal->state == kit::GoalState::Proposed) {
+      actions.push_back(ProvideEnvironment(primary,
+          Button(::app::strings::ui_enable).OnClick([start] { start(kit::EnableGoal{}); }).With(Enabled(!busy.Get()))));
     } else if (goal->state == kit::GoalState::Paused || goal->state == kit::GoalState::Blocked ||
         goal->state == kit::GoalState::BudgetLimited) {
-      actions.push_back(Button(::app::strings::ui_resume).OnClick([start] { start(kit::ResumeGoal{}); }).With(Enabled(!busy.Get())));
+      actions.push_back(ProvideEnvironment(primary,
+          Button(::app::strings::ui_resume).OnClick([start] { start(kit::ResumeGoal{}); }).With(Enabled(!busy.Get()))));
     } else {
       actions.push_back(ProvideEnvironment(secondary,
           Button(::app::strings::ui_pause).OnClick([start] { start(kit::PauseGoal{}); }).With(Enabled(!busy.Get()))));
@@ -341,18 +393,14 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
     actions.push_back(ProvideEnvironment(destructive,
         Button(::app::strings::ui_cancel_goal).OnClick([start] { start(kit::CancelGoal{}); }).With(Enabled(!busy.Get()))));
     content.push_back(Flow(std::move(actions)).With(Spacing(8.0F)));
-    if (goal->completion_review) {
-      content.push_back(Row{Button(::app::strings::ui_open_completion_approval).OnClick(
-          [open_completion, approval = goal->completion_review->approval] { open_completion(approval); }), Spacer()});
-    }
   }
-  if (visible && goal && !editor.Get()) {
+  if (goal && !editor.Get()) {
     const auto& definition = goal->spec.definition;
     if (const auto* conditions = std::get_if<std::string>(&definition.completion_conditions.value); conditions && !conditions->empty()) {
       content.push_back(Column{Text(::app::strings::ui_completion_conditions, TextRole::Label), Text(*conditions)}.With(Spacing(4.0F)));
     }
     content.push_back(Text(definition.completion == kit::GoalCompletionPolicy::RequireConfirmation ?
-        "Approval required after verification" : "Complete automatically after verification", TextRole::Label));
+        ::app::strings::ui_goal_confirm_description : ::app::strings::ui_goal_automatic_description, TextRole::Label));
     if (goal->verification && !goal->verification->reason.empty() && goal->verification->reason != goal->reason)
       content.push_back(Text(goal->verification->reason));
     const auto* sources = goal->verification && !goal->verification->verified.empty() ? &goal->verification->verified :
@@ -377,17 +425,28 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
       content.push_back(Column(std::move(evidence)).With(Spacing(6.0F)).Key("goal-evidence"));
     }
   }
-  auto panel = Column {
+  std::vector<View> sections{
     Row {
+      Column {
+        Text(::app::strings::ui_goal, TextRole::Title)
+            .Style({Font::System(20.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}),
+        Text(RunStatus(run), TextRole::Label).With(Foreground(colors.on_surface_variant)).Key("goal-run-status"),
+      }.With(Grow(), Spacing(3.0F)),
       ProvideEnvironment(secondary, Button(::app::strings::ui_close_goal).OnClick(close)),
-      Spacer(),
-      Text(RunStatus(run), TextRole::Label).Style({Font::System(12.0F), colors.on_surface_variant}).Key("goal-run-status"),
-    }.With(CrossAlign(CrossAxisAlignment::Center)),
-    ScrollView(Column(std::move(content)).With(Spacing(14.0F), CrossAlign(CrossAxisAlignment::Stretch)))
-        .With(Grow(), ScrollBar()),
-  }.With(Frame{.width = 672.0F}, Spacing(18.0F), CrossAlign(CrossAxisAlignment::Stretch));
-  return Row{Spacer(), std::move(panel), Spacer()}
-      .With(Grow(), Padding(compact ? 14.0F : 24.0F), CrossAlign(CrossAxisAlignment::Stretch));
+    }.With(CrossAlign(CrossAxisAlignment::Center), Spacing(8.0F)),
+    ProvideEnvironment(DividerStyle{colors.outline}, Divider()),
+    ScrollView(Column(std::move(content)).With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch)))
+        .With(Grow(), ScrollBar()).Key("goal-panel-scroll"),
+  };
+  if (footer) sections.push_back(std::move(*footer));
+  auto panel = Column(std::move(sections)).With(Spacing(14.0F), CrossAlign(CrossAxisAlignment::Stretch));
+  if (docked) {
+    return ProvideEnvironment(fields,
+        std::move(panel).With(Grow(), Padding(14.0F), Background(colors.surface_container_low))).Key("goal-panel");
+  }
+  return Row {Spacer(), ProvideEnvironment(fields, std::move(panel).With(Frame{.width = 596.0F})), Spacer()}
+      .With(Grow(), Padding(compact ? 14.0F : 24.0F), CrossAlign(CrossAxisAlignment::Stretch),
+          Background(colors.surface)).Key("goal-panel");
 }
 
 } // namespace
@@ -397,11 +456,18 @@ View SessionWorkspace(std::shared_ptr<kit::Conversation> conversation, View chat
                       std::shared_ptr<kit::AgentRuntime> runtime, std::optional<kit::RunState> run,
                       bool show_goal, std::function<void()> close_goal,
                       std::function<void(kit::PendingApproval)> open_completion) {
-  return IndexedPages({
-      std::move(chat),
-      GoalPanel(std::move(conversation), std::move(runtime), run, show_goal, std::move(close_goal),
-          std::move(open_completion)),
-  }, show_goal ? 1U : 0U).With(Grow());
+  const bool docked = show_goal && UseViewportClass() == ViewportClass::Expanded;
+  const auto editor = UseState(std::make_shared<GoalEditorState>());
+  const auto layout = UseState(DockTree::Split(Axis::Horizontal, {
+      DockTree::Tabs({"conversation"}).With(Frame{.min_width = 350.0F}, Grow()),
+      DockTree::Tabs({"goal"}).With(Frame{.width = 364.0F, .min_width = 304.0F, .max_width = 500.0F}, Grow(0.0F)),
+  }));
+  std::vector<DockItem> panes{DockItem("conversation", ::app::strings::ui_back_to_conversation, chat).Closable(false)};
+  if (show_goal) panes.push_back(DockItem("goal", ::app::strings::ui_goal,
+      GoalPanel(conversation, runtime, run, editor.Get(), docked, close_goal, std::move(open_completion))).Closable(false));
+  return DockLayout(std::move(panes), docked ? layout.Get() : DockTree::Tabs({show_goal ? "goal" : "conversation"}))
+      .TabBar([](const DockTabBarContext&) { return View{}; })
+      .OnChanged([layout, docked](const DockTree& tree) { if (docked) layout = tree; }).With(Grow());
 }
 
 } // namespace agentkit_preview

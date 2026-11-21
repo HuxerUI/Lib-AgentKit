@@ -2,6 +2,7 @@
 
 #include <huxerui/agentkit.h>
 #include <huxerui/file.h>
+#include <huxerui/http.h>
 #include <huxerui/presentation.h>
 
 namespace agentkit_preview {
@@ -22,6 +23,12 @@ struct ComposerDraft {
   bool saving_preference = false;
 };
 
+struct ModelLimits {
+  std::optional<std::uint64_t> context_window;
+  std::optional<std::uint64_t> max_input_tokens;
+  std::optional<std::uint64_t> max_output_tokens;
+};
+
 struct ModelChoice {
   huxerui::agentkit::ModelProviderRef ref;
   std::string label;
@@ -29,6 +36,10 @@ struct ModelChoice {
   bool code;
   bool suitable;
   huxerui::agentkit::ModelCapabilities capabilities;
+  std::string endpoint;
+  std::string protocol;
+  ModelLimits limits;
+  std::string model_id;
 };
 
 struct ModelProfileInput {
@@ -40,7 +51,19 @@ struct ModelProfileInput {
   bool image_input = false;
   bool file_input = false;
   bool reasoning_summary = false;
+  ModelLimits limits;
 };
+
+struct DiscoveredModel {
+  std::string id;
+  std::string name;
+  ModelLimits limits;
+};
+
+std::string TrimModelField(std::string value);
+std::string ModelKeyEnvironment(std::string_view key);
+huxerui::agentkit::Async<std::vector<DiscoveredModel>> DiscoverModels(
+    ModelProfileInput endpoint, std::shared_ptr<huxerui::HttpClient> client);
 
 using AddModelProfile = std::function<huxerui::agentkit::Async<huxerui::agentkit::ModelProviderRef>(ModelProfileInput)>;
 
@@ -51,11 +74,13 @@ class RunSettings {
 public:
   explicit RunSettings(std::function<huxerui::agentkit::TimePoint()> clock = {});
 
-  void AddModel(const huxerui::agentkit::ModelRegistration& registration, std::string label = {});
+  void AddModel(const huxerui::agentkit::ModelRegistration& registration, std::string label = {},
+      ModelLimits limits = {});
   void SetDefaults(huxerui::agentkit::ModelProviderRef general, std::optional<huxerui::agentkit::ModelProviderRef> code);
   std::optional<huxerui::agentkit::ModelProviderRef> DefaultModel(const huxerui::agentkit::AgentId& agent) const;
   std::vector<ModelChoice> Models(const huxerui::agentkit::AgentId& agent) const;
   huxerui::StringVariant ModelLabel(const std::optional<huxerui::agentkit::ModelProviderRef>& ref) const;
+  std::optional<huxerui::Image> ModelAvatar(const huxerui::agentkit::ModelProviderRef& ref, huxerui::Color foreground) const;
   huxerui::agentkit::ModelCapabilities Capabilities(const std::optional<huxerui::agentkit::ModelProviderRef>& ref,
       const huxerui::agentkit::AgentId& agent) const;
   std::string Describe(const huxerui::agentkit::RunStartBinding& binding, const huxerui::Resources& resources) const;
@@ -84,6 +109,6 @@ huxerui::View RunSettingsControls(std::shared_ptr<RunSettings> settings,
     huxerui::State<huxerui::agentkit::UserRunOptions> next, huxerui::agentkit::AgentId agent,
     std::optional<huxerui::agentkit::WorkspaceId> workspace, std::optional<huxerui::File> workspace_root,
     std::optional<huxerui::agentkit::RunStartBinding> current = {}, std::function<void()> changed = {},
-    std::optional<huxerui::View> extra_action = {}, AddModelProfile add_model = {});
+    std::optional<huxerui::View> extra_action = {}, AddModelProfile add_model = {}, bool show_permissions = true);
 
 } // namespace agentkit_preview
