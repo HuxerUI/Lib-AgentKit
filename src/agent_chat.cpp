@@ -630,10 +630,22 @@ View ChatRunActivity(RunSnapshot run, std::vector<RunSnapshot> delegates, bool w
       CrossAlign(CrossAxisAlignment::Stretch)).Key("chat-turn/" + run.id.value);
 }
 
+class MarkdownBlockLayout final : public Layout<MarkdownBlockLayout> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext& context, ViewNode& node, Constraints constraints) {
+    auto& body = node.ChildAt(0);
+    // Intrinsic and stretch passes must agree on the width used to measure the same Markdown blocks.
+    const auto fixed = constraints.HasBoundedWidth() ? constraints.TightWidth(constraints.max_width) : constraints;
+    return LayoutResult{}.SetSize(context.Measure(body, fixed)).Place(body, {});
+  }
+};
+
 [[huxerui::composable]]
 View MarkdownMessageBlock(MessageRef message, BlockId block, std::string source, bool complete, bool can_reference,
                           State<std::optional<SelectedText>> selection,
-                          std::shared_ptr<const AgentChatLinkHandler> links) {
+                          std::shared_ptr<const AgentChatLinkHandler> links, bool fill_width) {
   const auto theme = UseTheme();
   const auto parser = UseState(std::make_shared<markdown::MarkdownParseSession>(detail::MarkdownSelectionParseOptions()));
   const auto link_error = UseState(std::string{});
@@ -719,7 +731,8 @@ View MarkdownMessageBlock(MessageRef message, BlockId block, std::string source,
       return images->load({message, block, std::move(destination)});
     };
     content.push_back(detail::SelectableMarkdown(*document, std::move(options), highlight, source_focus, retained, std::move(changed),
-        std::move(activate), std::move(load)).Key("markdown-selection/" + block.value));
+        std::move(activate), std::move(load), "markdown/" + message.message.value + "/" + block.value)
+        .Key("markdown-selection/" + block.value));
     if (!link_error.Get().empty()) content.push_back(Text(link_error.Get(), TextRole::Label)
         .Style({Font::System(12.0F), theme.colors.error}).Key("markdown-link-error"));
   }
@@ -734,7 +747,9 @@ View MarkdownMessageBlock(MessageRef message, BlockId block, std::string source,
         }).Key("markdown-source-toggle");
     content.push_back(Row{ProvideEnvironment(action_style, std::move(mode)), Spacer()});
   }
-  return Column(std::move(content)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch));
+  auto body = Column(std::move(content)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch));
+  if (fill_width) return MarkdownBlockLayout{std::vector<View>{std::move(body)}};
+  return body;
 }
 
 std::string ShortPreview(std::string_view text) {
@@ -864,7 +879,7 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
     if (const auto* text = std::get_if<TextBlock>(&block.body)) {
       if (text->markdown) {
         content.push_back(MarkdownMessageBlock(message.ref, block.id, text->text, message.state == MessageState::Complete,
-            selectable, selection, links).Key(block.id.value));
+            selectable, selection, links, !user).Key(block.id.value));
       } else if (selectable && message.state == MessageState::Complete && !text->text.empty()) {
         content.push_back(SelectableText(message.ref, block.id, text->text, selection, block.id.value, {}, bubble && user));
       } else {
@@ -1579,27 +1594,145 @@ View AgentChatArtifactText(std::shared_ptr<Conversation> conversation, ArtifactR
   }.With(Grow(), Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
-struct ResumeHistoryFollow {
+struct ChatHistoryScroll {
   class Extension;
   State<bool> paused;
+  ScrollController controller;
+  TaskScope tasks;
+  SessionId session;
 };
 
-class ResumeHistoryFollow::Extension final : public NodeExtension {
-public:
-  Extension(ViewNode&, const ResumeHistoryFollow& config) : paused_(config.paused) {}
+struct HistoryRowIndexKey {
+  using Value = std::size_t;
+};
 
-  void Update(ViewNode&, const ResumeHistoryFollow& config) { paused_ = config.paused; }
+class ChatHistoryScroll::Extension final : public NodeExtension {
+public:
+  Extension(ViewNode&, const ChatHistoryScroll& config) : config_(config) {}
+
+  void Update(ViewNode&, const ChatHistoryScroll& config) {
+    if (config_.session != config.session || config_.controller != config.controller) {
+      reading_.reset();
+      width_ = 0.0F;
+      pending_->reset();
+      reflow_ = Reflow::Idle;
+    }
+    config_ = config;
+  }
 
   void OnScrollActivity(ViewNode&, const ScrollActivity& activity) override {
     const bool direct = activity.source == ScrollSource::Drag || activity.source == ScrollSource::Wheel ||
         activity.source == ScrollSource::Scrollbar || activity.source == ScrollSource::Momentum ||
         activity.source == ScrollSource::Accessibility;
-    if (direct && activity.delta > 0.0F && activity.metrics.maximum_offset - activity.metrics.offset <= 24.0F && paused_.Get())
-      paused_ = false;
+    if (!direct) return;
+    pending_->reset();
+    reflow_ = Reflow::Idle;
+    if (activity.delta > 0.0F && activity.metrics.maximum_offset - activity.metrics.offset <= 24.0F && config_.paused.Get())
+      config_.paused = false;
+  }
+
+  PaintInvalidation PrepareGeometry(ViewNode& node, TextMeasurer&) override {
+    const auto viewport = node.PresentationBounds();
+    if (viewport.IsEmpty()) return PaintInvalidation::None;
+    const auto metrics = config_.controller.Metrics();
+    const bool resized = width_ > 0.0F && std::abs(width_ - viewport.width) > 0.25F;
+    width_ = viewport.width;
+    if (resized && at_end_) {
+      MoveTo(metrics, metrics.maximum_offset);
+      return PaintInvalidation::None;
+    }
+    if (reading_ && (resized || reflow_ == Reflow::MountingRow)) {
+      if (const auto position = FindReadingPosition(node, viewport, reading_->position)) {
+        reflow_ = Reflow::Idle;
+        MoveTo(metrics, metrics.offset + position->top - reading_->top);
+        return PaintInvalidation::None;
+      }
+      if (resized) {
+        // Reflow of preceding messages can move the reading row outside the realized range.
+        const auto row_offset = VirtualList::ScrollOffsetForItem(node, reading_->row, ScrollAlignment::Start, metrics.viewport_extent);
+        if (row_offset && MoveTo(metrics, *row_offset)) reflow_ = Reflow::MountingRow;
+      }
+      if (reflow_ == Reflow::MountingRow && *pending_) return PaintInvalidation::None;
+      reflow_ = Reflow::Idle;
+    }
+    if (!*pending_) {
+      at_end_ = metrics.maximum_offset - metrics.offset <= 1.0F;
+      reading_ = at_end_ ? std::nullopt : FindReadingPosition(node, viewport, std::nullopt);
+    }
+    return PaintInvalidation::None;
   }
 
 private:
-  State<bool> paused_;
+  enum class Reflow { Idle, MountingRow };
+
+  struct Reading {
+    detail::ChatReadingPosition position;
+    float top;
+    std::size_t row;
+  };
+
+  static std::optional<Reading> FindReadingPosition(const ViewNode& root, Rect viewport,
+      const std::optional<detail::ChatReadingPosition>& target) {
+    std::optional<Reading> best;
+    float distance = std::numeric_limits<float>::infinity();
+    const float sample = viewport.y + std::min(viewport.height, 12.0F);
+    const auto visit = [&](auto&& self, const ViewNode& node, std::size_t row) -> bool {
+      const auto bounds = node.PresentationBounds();
+      const auto bottom = bounds.y + bounds.height;
+      if (!target && (bottom <= viewport.y || bounds.y > sample + 24.0F)) return false;
+      if (!bounds.IsEmpty()) {
+        if (const auto* position = node.LayoutValue<detail::ChatReadingPositionKey>()) {
+          if (target && *position == *target) {
+            best = Reading{*position, bounds.y - viewport.y, row};
+            return true;
+          }
+          const float gap = std::max({bounds.y - sample, sample - bottom, 0.0F});
+          // Prefer a source-backed paragraph to the enclosing message.
+          const float score = position->owner.starts_with("markdown/") ? gap : gap + 25.0F;
+          if (!target && score < distance) {
+            best = Reading{*position, bounds.y - viewport.y, row};
+            distance = score;
+          }
+        }
+      }
+      for (std::size_t i = 0; i < node.ChildCount(); ++i) {
+        if (self(self, node.ChildAt(i), row)) return true;
+      }
+      return false;
+    };
+    for (std::size_t i = 0; i < root.ChildCount(); ++i) {
+      const auto& child = root.ChildAt(i);
+      if (const auto* row = child.LayoutValue<HistoryRowIndexKey>(); row && visit(visit, child, *row)) break;
+    }
+    return best;
+  }
+
+  bool MoveTo(const ScrollMetrics& metrics, float target) {
+    target = std::clamp(target, 0.0F, metrics.maximum_offset);
+    if (std::abs(metrics.offset - target) <= 0.5F) {
+      pending_->reset();
+      return false;
+    }
+    const bool scheduled = pending_->has_value();
+    *pending_ = std::pair{metrics.offset, target};
+    if (scheduled) return true;
+    config_.tasks.Post([request = std::weak_ptr(pending_), controller = config_.controller] {
+      if (const auto pending = request.lock()) {
+        const auto correction = std::exchange(*pending, std::nullopt);
+        if (correction && std::abs(controller.Offset() - correction->first) <= 0.5F)
+          controller.ScrollTo(correction->second);
+      }
+    });
+    return true;
+  }
+
+  ChatHistoryScroll config_;
+  std::optional<Reading> reading_;
+  std::shared_ptr<std::optional<std::pair<float, float>>> pending_ =
+      std::make_shared<std::optional<std::pair<float, float>>>();
+  float width_ = 0.0F;
+  bool at_end_ = false;
+  Reflow reflow_ = Reflow::Idle;
 };
 
 static View ChatHistoryViewport(View history, ScrollController controller, std::size_t count, State<bool> follow_paused,
@@ -2180,7 +2313,10 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
         bubbles, narrow)
         .Key(message.ref.message.value);
     };
-    if (!activity) return make_message(message).With(Padding(EdgeInsets{.top = 2.0F, .bottom = 18.0F}));
+    const auto reading = detail::ChatReadingPosition{"message/" + message.ref.message.value};
+    if (!activity) return make_message(message).With(Padding(EdgeInsets{.top = 2.0F, .bottom = 18.0F}))
+        .LayoutValue<HistoryRowIndexKey>(index)
+        .LayoutValue<detail::ChatReadingPositionKey>(reading);
     std::vector<View> row;
     const auto add_message = [&](const Message& displayed) {
       auto view = make_message(displayed);
@@ -2234,8 +2370,12 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
                             : std::move(details));
     }
     return Column(std::move(row)).With(Spacing(0.0F), CrossAlign(CrossAxisAlignment::Stretch))
+        .LayoutValue<HistoryRowIndexKey>(index)
+        .LayoutValue<detail::ChatReadingPositionKey>(reading)
         .Key("chat-history-row/" + message.ref.message.value);
-  }).EstimatedItemExtent(76.0F).Controller(history_controller).With(Grow(), ScrollBar(), ResumeHistoryFollow{.paused = follow_paused})
+  }).EstimatedItemExtent(76.0F).Controller(history_controller)
+      .With(Grow(), ScrollBar(), CrossAlign(CrossAxisAlignment::Stretch),
+          ChatHistoryScroll{follow_paused, history_controller, tasks, current->summary.id})
       .Key("agent-chat-history");
   auto history_view = ChatHistoryViewport(std::move(history), history_controller, count, follow_paused, selection,
       part == ChatPart::Messages && layout_style.chat_bubbles && !side_chat, UseEnvironment<IconButtonStyle>(), theme);

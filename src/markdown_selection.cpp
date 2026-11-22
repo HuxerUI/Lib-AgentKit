@@ -139,10 +139,18 @@ struct ParagraphText {
 #endif
   bool image = false;
   TextShapingOptions shaping;
+
+  bool operator==(const ParagraphText&) const = default;
 };
 
 struct ParagraphKey {
-  using Value = std::shared_ptr<const ParagraphText>;
+  struct Value {
+    std::shared_ptr<const ParagraphText> paragraph;
+
+    bool operator==(const Value& other) const {
+      return paragraph == other.paragraph || *paragraph == *other.paragraph;
+    }
+  };
 };
 
 void AppendSourceRange(MarkdownSourceExcerpt& excerpt, std::size_t begin, std::size_t end) {
@@ -195,7 +203,7 @@ View DecorateParagraph(View view, const markdown::MarkdownNode& node, const Attr
   std::shared_ptr<ParagraphText> content;
   if (selectable) {
     content = std::make_shared<ParagraphText>(ParagraphText{text, style, alignment, {source.begin(), source.end()}});
-    view = std::move(view).LayoutValue<ParagraphKey>(content);
+    view = std::move(view).LayoutValue<ParagraphKey>({content});
   }
   if (!load) return view;
   std::vector<MarkdownImage> images;
@@ -208,7 +216,7 @@ View DecorateParagraph(View view, const markdown::MarkdownNode& node, const Attr
     if (content) {
       auto image_content = std::make_shared<ParagraphText>(*content);
       image_content->image = true;
-      decorate = [image_content](View image) { return std::move(image).LayoutValue<ParagraphKey>(image_content); };
+      decorate = [image_content](View image) { return std::move(image).LayoutValue<ParagraphKey>({image_content}); };
     }
     return RenderMarkdownImage(std::move(images.front()), load, std::move(view), std::move(decorate));
   }
@@ -265,16 +273,17 @@ struct SelectionBehavior final : NodeExtension, TextSelectionClient {
     auto collect = [&](auto&& visit, const ViewNode& node, Rect clip) -> void {
       clip = clip.Intersection(InOwner(owner, node, node.Bounds()));
       if (const auto* content = node.LayoutValue<ParagraphKey>()) {
+        const auto& paragraph = content->paragraph;
         const auto bounds = node.ContentBounds();
         const auto index = next.size();
         auto previous = index < paragraphs_.size() ? &paragraphs_[index] : nullptr;
-        const auto layout = previous && previous->width == bounds.width && previous->content->text == (*content)->text &&
-            previous->content->style == (*content)->style && previous->content->alignment == (*content)->alignment &&
-            previous->content->shaping == (*content)->shaping
-            ? previous->layout : measurer.CreateTextLayout((*content)->text, (*content)->style, bounds.width,
-                {.shaping = (*content)->shaping, .align = (*content)->alignment});
+        const auto layout = previous && previous->width == bounds.width && previous->content->text == paragraph->text &&
+            previous->content->style == paragraph->style && previous->content->alignment == paragraph->alignment &&
+            previous->content->shaping == paragraph->shaping
+            ? previous->layout : measurer.CreateTextLayout(paragraph->text, paragraph->style, bounds.width,
+                {.shaping = paragraph->shaping, .align = paragraph->alignment});
         const auto local = InOwner(owner, node, bounds);
-        next.push_back({*content, layout, local, clip.Intersection(local), bounds.width});
+        next.push_back({paragraph, layout, local, clip.Intersection(local), bounds.width});
         return;
       }
       for (std::size_t i = 0; i < node.ChildCount(); ++i) visit(visit, node.ChildAt(i), clip);
@@ -549,29 +558,36 @@ std::optional<MarkdownSourceExcerpt> ReadMarkdownSourceRange(std::string_view so
 View SelectableMarkdown(markdown::MarkdownDocument document, markdown::MarkdownOptions options, Color highlight,
                         ViewHandle focus, std::optional<MarkdownRange> selection,
                         std::function<void(std::optional<MarkdownExcerpt>)> changed,
-                        std::function<void(const markdown::MarkdownLinkActivation&)> activate, MarkdownImageLoad load) {
+                        std::function<void(const markdown::MarkdownLinkActivation&)> activate, MarkdownImageLoad load,
+                        std::string reading_owner) {
   if (options.style) {
-    options.code_block_renderer = [style = *options.style, selectable = static_cast<bool>(changed)](const markdown::MarkdownNode& node) {
+    options.code_block_renderer = [style = *options.style, selectable = static_cast<bool>(changed),
+                                   reading_owner](const markdown::MarkdownNode& node) {
       auto [text, language] = StyledCode(node, style.code_background);
       auto body = Text(text).Style(style.code).With(Padding(style.code_padding)).Key("markdown-code-text");
 #ifdef HUXERUI_MARKDOWN_SOURCE_MAPPING
-      if (selectable) body = std::move(body).LayoutValue<ParagraphKey>(std::make_shared<ParagraphText>(
-          ParagraphText{text, style.code, TextAlign::Leading, node.source_segments}));
+      if (selectable) body = std::move(body).LayoutValue<ParagraphKey>({std::make_shared<ParagraphText>(
+          ParagraphText{text, style.code, TextAlign::Leading, node.source_segments})});
 #else
       static_cast<void>(selectable);
 #endif
-      return ReadOnlyCodePanel(std::move(language), node.text, std::move(body), style);
+      auto panel = ReadOnlyCodePanel(std::move(language), node.text, std::move(body), style);
+#ifdef HUXERUI_MARKDOWN_SOURCE_MAPPING
+      if (!node.source_segments.empty()) return std::move(panel).LayoutValue<ChatReadingPositionKey>(
+          {reading_owner, node.source_segments.front().source_begin});
+#endif
+      return panel;
     };
   }
 #ifdef HUXERUI_MARKDOWN_SOURCE_MAPPING
   if (changed) options.selectable = false;
-  if (changed || load) {
-    options.decorate_text = [selectable = static_cast<bool>(changed), load = std::move(load)](
-        View view, const markdown::MarkdownNode& node, const AttributedText& text, const TextStyle& style, TextAlign alignment,
-        std::span<const markdown::MarkdownSourceSegment> source) {
-      return DecorateParagraph(std::move(view), node, text, style, alignment, source, selectable, load);
-    };
-  }
+  options.decorate_text = [selectable = static_cast<bool>(changed), load = std::move(load), reading_owner = std::move(reading_owner)](
+      View view, const markdown::MarkdownNode& node, const AttributedText& text, const TextStyle& style, TextAlign alignment,
+      std::span<const markdown::MarkdownSourceSegment> source) {
+    auto paragraph = DecorateParagraph(std::move(view), node, text, style, alignment, source, selectable, load);
+    if (source.empty()) return paragraph;
+    return std::move(paragraph).LayoutValue<ChatReadingPositionKey>({reading_owner, source.front().source_begin});
+  };
 #else
   static_cast<void>(highlight);
   static_cast<void>(focus);
@@ -604,7 +620,7 @@ View SelectablePlainText(std::string text, TextStyle style, TextShapingOptions s
       .text = content, .style = style, .alignment = TextAlign::Leading, .shaping = shaping});
   return Column{
       Text(content).Style(std::move(style)).Shaping(std::move(shaping))
-          .LayoutValue<ParagraphKey>(std::move(paragraph)).Key("chat-selectable-text"),
+          .LayoutValue<ParagraphKey>({std::move(paragraph)}).Key("chat-selectable-text"),
   }.With(CrossAlign(CrossAxisAlignment::Stretch), Focusable{}, focus,
       SelectionModifier{std::move(content), highlight, focus, selection, std::move(changed)});
 }

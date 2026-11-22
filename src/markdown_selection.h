@@ -42,10 +42,22 @@ std::optional<MarkdownSourceExcerpt> ReadMarkdownSourceRange(std::string_view so
 
 using MarkdownImageLoad = std::function<Task<ImageAsset>(std::string)>;
 
+struct ChatReadingPosition {
+  std::string owner;
+  std::size_t source_byte = 0;
+
+  bool operator==(const ChatReadingPosition&) const = default;
+};
+
+struct ChatReadingPositionKey {
+  using Value = ChatReadingPosition;
+};
+
 View SelectableMarkdown(markdown::MarkdownDocument document, markdown::MarkdownOptions options, Color highlight,
                         ViewHandle focus, std::optional<MarkdownRange> selection,
                         std::function<void(std::optional<MarkdownExcerpt>)> changed,
-                        std::function<void(const markdown::MarkdownLinkActivation&)> activate, MarkdownImageLoad load);
+                        std::function<void(const markdown::MarkdownLinkActivation&)> activate, MarkdownImageLoad load,
+                        std::string reading_owner);
 
 View SelectablePlainText(std::string text, TextStyle style, TextShapingOptions shaping, Color highlight,
                          ViewHandle focus, std::optional<MarkdownRange> selection,

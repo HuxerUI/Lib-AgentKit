@@ -3014,6 +3014,46 @@ void VerifyLongConversation(const File& root) {
     auto last_row = history.Find(UiSelector::Key(newest.value));
     Wait(ui, [&] { return last_row.Exists() && last_row.One().in_viewport && !ui.Find(ButtonText("Jump to latest")).Exists(); },
         "A reader at the end did not follow the growing output");
+
+    std::string markdown = "Read through the following sections.\n\n";
+    for (int index = 1; index <= 24; ++index) {
+      markdown += "## Reading checkpoint " + std::to_string(index) + "\n\n";
+      markdown += "This paragraph wraps when one of the workbench panes is resized. "
+          "The viewport should keep the reader on the same heading.\n\n";
+      markdown += "```text\nfirst sample\nsecond sample\n```\n\n";
+    }
+    const auto long_reply = append(std::move(markdown));
+    Wait(ui, [&] { return *long_reply; }, "The model did not produce the Markdown reflow fixture");
+    if (!fixture->error.empty()) throw std::runtime_error(fixture->error);
+    const auto checkpoint_label = UiSelector::Text("Reading checkpoint 15");
+    const auto checkpoint = history.ScrollUntil(checkpoint_label, {.step = {0.0F, -220.0F}, .maximum_steps = 50});
+    const auto relative_y = [&] { return checkpoint.One().bounds.y - history.One().bounds.y; };
+    history.ScrollBy({0.0F, relative_y() - 5.0F});
+    Wait(ui, [&] { return checkpoint.Exists() && checkpoint.One().in_viewport && std::abs(relative_y() - 5.0F) < 2.0F; },
+        "The reader could not reach the middle of the long reply");
+    const auto origin_y = relative_y();
+    const auto handles = ui.FindSemantics(UiSemanticSelector::Role(SemanticRole::Separator)).All();
+    const auto splitter = std::ranges::find_if(handles, [](const auto& handle) {
+      return !handle.offscreen && handle.bounds.height > 400.0F && handle.bounds.x < 300.0F;
+    });
+    if (splitter == handles.end()) throw std::runtime_error("The navigation divider did not mount");
+    const Point grip{splitter->bounds.x + splitter->bounds.width * 0.5F, splitter->bounds.y + 280.0F};
+    ui.Drag(grip, {grip.x + 90.0F, grip.y}, {.pointer = {.device_kind = PointerDeviceKind::Mouse}});
+    Wait(ui, [&] { return checkpoint.Exists() && checkpoint.One().in_viewport && std::abs(relative_y() - origin_y) < 2.0F; },
+        "Resizing navigation lost the Markdown reading position");
+    TapFormButton(ui, "Goal");
+    Wait(ui, [&] { return ui.Find(UiSelector::Key("goal-panel")).Exists() && checkpoint.Exists() &&
+        checkpoint.One().in_viewport && std::abs(relative_y() - origin_y) < 2.0F; },
+        "Opening the right panel lost the Markdown reading position");
+    const auto dock_handles = ui.FindSemantics(UiSemanticSelector::Role(SemanticRole::Separator)).All();
+    const auto dock_splitter = std::ranges::find_if(dock_handles, [](const auto& handle) {
+      return !handle.offscreen && handle.bounds.height > 400.0F && handle.bounds.x > 500.0F;
+    });
+    if (dock_splitter == dock_handles.end()) throw std::runtime_error("The goal divider did not mount");
+    const Point dock_grip{dock_splitter->bounds.x + dock_splitter->bounds.width * 0.5F, dock_splitter->bounds.y + 280.0F};
+    ui.Drag(dock_grip, {dock_grip.x - 65.0F, dock_grip.y}, {.pointer = {.device_kind = PointerDeviceKind::Mouse}});
+    Wait(ui, [&] { return checkpoint.Exists() && checkpoint.One().in_viewport && std::abs(relative_y() - origin_y) < 2.0F; },
+        "Resizing the right panel lost the Markdown reading position");
   } catch (...) {
     static_cast<void>(root.Child("timeline.snapshot").WriteString(ui.CaptureSnapshot().ToString()));
     throw;
