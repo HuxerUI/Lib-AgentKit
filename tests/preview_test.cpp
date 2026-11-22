@@ -52,6 +52,8 @@ huxerui::WindowHandle OpenPreviewArtifactReview(const huxerui::ApplicationHandle
     agentkit_preview::PresentationReviewPages initial_pages,
     std::optional<huxerui::State<huxerui::agentkit::AgentChatDraftSources>> draft_sources = {});
 huxerui::ApplicationHook MakePreviewInstaller(std::optional<huxerui::File> database, bool read_model_configuration);
+huxerui::ApplicationHook MakeModelEditingTestInstaller(huxerui::File database, std::function<huxerui::Task<void>(
+    huxerui::agentkit::AgentResult<std::shared_ptr<huxerui::agentkit::AgentRuntime>>, agentkit_preview::EditModelProfile)> drive);
 using ConfiguredPreviewDriver = std::function<huxerui::Task<void>(
     huxerui::agentkit::AgentResult<std::shared_ptr<huxerui::agentkit::AgentRuntime>>,
     std::optional<huxerui::agentkit::WorkspaceId>, huxerui::agentkit::ProjectId)>;
@@ -6820,6 +6822,53 @@ void VerifyWorkspaceTools(const File& root) {
   Wait(ui, [&] { return !ui.Find(UiSelector::Key("agent-chat-stop")).Exists(); }, "The layout check did not finish");
 }
 
+void VerifyLiveWorkspaceRead(const File& root) {
+  const auto workspace = root.Child("workspace");
+  if (workspace.Exists() || root.Child("sessions.sqlite3").Exists() || !root.Child("models").Exists() ||
+      !workspace.CreateDirectories())
+    throw std::runtime_error("Use a fresh live workspace fixture with saved model profiles");
+  const auto readme = workspace.Child("README.md");
+  const auto token = "workspace-read-" + kit::NewCommandId().value;
+  const auto text = "Verification token: " + token + "\n";
+  WriteFixture(readme, text);
+  std::exception_ptr failure;
+  bool finished = false;
+  const Application application{[]() -> View { return Spacer(); },
+      {.window = {.title = "GanWork Workspace Read Acceptance", .activatable = false},
+      .quit_on_last_window_closed = false,
+      .application_hooks = {MakeConfiguredPreviewTestInstaller(root.Child("sessions.sqlite3"), workspace,
+          File(AGENTKIT_PREVIEW_CTEST), [&](auto started, auto workspace_id, auto project) -> Task<void> {
+            const auto app = UseApplication();
+            try {
+              auto runtime = LiveTake(std::move(started));
+              if (!workspace_id) throw std::runtime_error("The fixture workspace is unavailable");
+              auto session = co_await LiveConversation(runtime, project, *workspace_id, agentkit_preview::CodeAgent,
+                  "Workspace read acceptance", "Use read_files to read README.md in this workspace. "
+                  "Report the exact verification token from the file. This is a read-only task.");
+              auto watching = co_await LiveObserve(session);
+              co_await LiveRunCompleted(session, 160s);
+              const auto snapshot = session->Snapshot();
+              if (std::ranges::none_of(snapshot->tools, [](const auto& tool) {
+                    return tool.tool.id == agentkit_preview::ReadWorkspaceFiles && tool.state == kit::ToolCallState::Succeeded;
+                  })) throw std::runtime_error("The live model did not complete read_files");
+              if (std::ranges::none_of(snapshot->messages, [&](const auto& message) {
+                    return message.author == kit::MessageAuthor::Agent && std::ranges::any_of(message.blocks, [&](const auto& block) {
+                      const auto* reply = std::get_if<kit::TextBlock>(&block.body);
+                      return reply && reply->text.find(token) != std::string::npos;
+                    });
+                  })) throw std::runtime_error("The live model did not report the actual file content");
+              CheckText(readme, text);
+              LiveTake(co_await runtime->CloseAsync());
+              finished = true;
+              std::cout << "The live model called read_files and reported the file's verification token.\n";
+            } catch (...) { failure = std::current_exception(); }
+            app.Quit();
+          })}}};
+  RunApplication();
+  if (failure) std::rethrow_exception(failure);
+  if (!finished) throw std::runtime_error("The live workspace read did not finish");
+}
+
 void VerifyLiveWorkspaceTools(const File& root) {
   const auto workspace = root.Child("workspace");
   const auto config = workspace.Child("config.txt");
@@ -8190,8 +8239,19 @@ void VerifyLiveSettings(const File& root, const std::string& url, const std::str
   const auto file = root.Child("settings.json").ReadString();
   if (!file.Succeeded()) throw std::runtime_error("Could not read the saved settings");
   const auto saved = nlohmann::json::parse(file.Value());
-  if (!saved.at("daily_model").at("id").get<std::string>().ends_with(model) ||
-      !saved.at("review_model").at("id").get<std::string>().ends_with(second_model) ||
+  const auto profiles = root.Child("models").ListChildren();
+  if (!profiles.Succeeded()) throw std::runtime_error("Could not read the configured models");
+  const auto has_model = [&](const char* role, const std::string& expected) {
+    const auto& configured = saved.at(role);
+    return std::ranges::any_of(profiles.Value(), [&](const File& file) {
+      const auto raw = file.ReadString();
+      if (!raw.Succeeded()) return false;
+      const auto record = nlohmann::json::parse(raw.Value());
+      return record.at("model") == expected && record.at("profile_id") == configured.at("id") &&
+          record.at("revision") == configured.at("version");
+    });
+  };
+  if (!has_model("daily_model", model) || !has_model("review_model", second_model) ||
       saved.at("appearance") != 1 || saved.at("tone") != 1 ||
       saved.at("instructions") != "Use plain language and keep replies under two sentences.") {
     throw std::runtime_error("The settings retained a different theme, tone, or model role");
@@ -8316,11 +8376,139 @@ void VerifyLiveSettings(const File& root, const std::string& url, const std::str
   }
 }
 
+void VerifyModelEditing(const File& root, const std::string& server) {
+  const auto database = root.Child("sessions.sqlite3");
+  const auto original = server + "/original/v1";
+  const auto updated = server + "/updated/v1";
+  constexpr auto model = "editable-chat";
+  const auto field = [](UiTest& ui, const char* key, const std::string& value) {
+    auto input = ui.Find(UiSelector::Key(key));
+    Wait(ui, [&] { return input.Exists() && input.One().in_viewport; }, key);
+    input.Tap();
+    input.ReplaceText(value);
+  };
+  const auto open_settings = [](UiTest& ui) {
+    const auto settings = ui.Find(UiSelector::Key("open-settings"));
+    Wait(ui, [&] { return settings.Exists(); }, "The settings shortcut did not mount");
+    settings.Tap();
+  };
+  const auto edit = [](UiTest& ui) {
+    const auto button = ui.Find(ButtonText("Edit model"));
+    Wait(ui, [&] { return button.Count() == 1 && button.One().in_viewport; }, "The model list did not show one editable profile");
+    button.Tap();
+  };
+  const auto read_profiles = [&] {
+    const auto profiles = root.Child("models").ListChildren();
+    if (!profiles.Succeeded()) throw std::runtime_error("Could not read the model revision fixture");
+    std::map<kit::Revision, nlohmann::json> records;
+    for (const auto& file : profiles.Value()) {
+      if (!file.Name().ends_with(".json")) continue;
+      const auto raw = file.ReadString();
+      if (!raw.Succeeded() || raw.Value().find("revision-fixture-key") != std::string::npos)
+        throw std::runtime_error("Model credentials were not protected on disk");
+      const auto record = nlohmann::json::parse(raw.Value());
+      records.emplace(record.at("revision").get<kit::Revision>(), record);
+    }
+    return records;
+  };
+  {
+    const Application application{App, {.application_hooks = {MakePreviewInstaller(database, true)}}};
+    UiTest ui(application, {.viewport = {1440.0F, 960.0F}});
+    open_settings(ui);
+    ui.Find(UiSelector::Key("settings-add-model")).Tap();
+    field(ui, "add-model-url", original);
+    field(ui, "add-model-id", model);
+    field(ui, "add-model-key", "revision-fixture-key-original");
+    ui.Find(UiSelector::Key("save-model")).Tap();
+    Wait(ui, [&] { return !ui.Find(UiSelector::Key("add-model-dialog")).Exists(); }, "The original model was not saved");
+    edit(ui);
+    const auto key = ui.FindSemantics(UiSemanticSelector::Label("API Key"));
+    if (ui.Find(UiSelector::Key("edit-model-url")).One().value != original || !key.One().secure || !key.One().value.empty())
+      throw std::runtime_error("The edit dialog did not prefill the endpoint and protect the saved key");
+  }
+  const kit::ModelProviderRef first{{read_profiles().at(1).at("profile_id").get<std::string>()}, 1};
+  kit::SessionId session_id;
+  const auto run_native = [&](bool editing) {
+    std::exception_ptr failure;
+    bool finished = false;
+    auto drive = [&](auto started, agentkit_preview::EditModelProfile save) -> Task<void> {
+      const auto app = UseApplication();
+      try {
+        const auto runtime = LiveTake(std::move(started));
+        if (editing) {
+          auto created = LiveTake(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
+              .options = {.agent = agentkit_preview::GeneralAgent, .title = "Initial revision request"},
+              .initial = kit::SendInput{.text = "Initial revision request"}}));
+          session_id = std::get<kit::SessionCreated>(created.outcome).session;
+        }
+        const auto session = LiveTake(co_await runtime->Sessions().OpenAsync(session_id));
+        auto observing = co_await LiveObserve(session);
+        if (editing) {
+          const auto deadline = std::chrono::steady_clock::now() + 15s;
+          while (!root.Child("original-started").Exists() && std::chrono::steady_clock::now() < deadline) {
+            const auto snapshot = session->Snapshot();
+            if (!snapshot->runs.empty() && snapshot->runs.back().failure)
+              throw std::runtime_error(snapshot->runs.back().failure->message);
+            co_await Delay(10ms);
+          }
+          if (!root.Child("original-started").Exists()) throw std::runtime_error("The first Run did not open the original connection");
+          const auto revision = LiveTake(co_await save(first, updated, "revision-fixture-key-updated", {65536, 49152, 8192}));
+          if (revision != kit::ModelProviderRef{first.id, 2} || !session->Snapshot()->summary.active_run)
+            throw std::runtime_error("Editing did not retain the active Run and stable model identity");
+          WriteFixture(root.Child("release-original"), "ready");
+          co_await LiveRunCompleted(session);
+          if (session->Snapshot()->runs.front().model != first)
+            throw std::runtime_error("The first Run changed model revisions");
+        }
+        LiveTake(co_await session->SendAsync(kit::NewCommandId(), {.text = "Use the current model"}));
+        co_await LiveRunCompleted(session);
+        if (session->Snapshot()->runs.back().model != kit::ModelProviderRef{first.id, editing ? 2U : 3U})
+          throw std::runtime_error("A new Run did not select the latest model revision");
+        LiveTake(co_await runtime->CloseAsync());
+        finished = true;
+      } catch (...) { failure = std::current_exception(); }
+      app.Quit();
+    };
+    const Application application{[]() -> View { return Spacer(); },
+        {.window = {.title = "GanWork Model Editing Acceptance", .activatable = false}, .quit_on_last_window_closed = false,
+         .application_hooks = {MakeModelEditingTestInstaller(database, drive)}}};
+    static_cast<void>(RunApplication());
+    if (failure) std::rethrow_exception(failure);
+    if (!finished) throw std::runtime_error("Model editing acceptance did not finish");
+  };
+  run_native(true);
+  const auto revisions = read_profiles();
+  if (revisions.size() != 2 || revisions.at(1).at("profile_id") != revisions.at(2).at("profile_id") ||
+      revisions.at(1).at("base_url") != original || revisions.at(2).at("base_url") != updated ||
+      revisions.at(2).at("context_window") != 65536 || revisions.at(2).at("max_input_tokens") != 49152 ||
+      revisions.at(2).at("max_output_tokens") != 8192 ||
+      revisions.at(1).at("protected_api_key") == revisions.at(2).at("protected_api_key")) {
+    throw std::runtime_error("The model edit did not persist both revisions and the updated settings");
+  }
+  {
+    const Application application{App, {.application_hooks = {MakePreviewInstaller(database, true)}}};
+    UiTest ui(application, {.viewport = {1440.0F, 960.0F}});
+    open_settings(ui);
+    edit(ui);
+    if (ui.Find(UiSelector::Key("edit-model-url")).One().value != updated ||
+        ui.Find(UiSelector::Key("model-limit-0")).One().value != "65536")
+      throw std::runtime_error("The endpoint or context size was not restored after restart");
+    field(ui, "model-limit-0", "98304");
+    ui.Find(UiSelector::Key("update-model")).Tap();
+    Wait(ui, [&] { return !ui.Find(UiSelector::Key("edit-model-dialog")).Exists(); }, "The context-only edit did not save");
+    if (read_profiles().at(3).at("context_window") != 98304)
+      throw std::runtime_error("Editing only the context size did not create the new revision");
+  }
+  run_native(false);
+}
+
 void VerifyLocalization(const File& root) {
   if (!root.CreateDirectories()) throw std::runtime_error("Could not create the localization fixture");
   const auto package = Resources::OpenPackage(File(AGENTKIT_TEST_RESOURCE_PACKAGE));
   if (!package.GetVectorImage(::app::images::goal).HasValue() ||
-      !package.GetVectorImage(huxerui_agentkit::images::arrow_down).HasValue()) {
+      !package.GetVectorImage(huxerui_agentkit::images::arrow_down).HasValue() ||
+      !package.GetVectorImage(::app::images::arrow_left).HasValue() ||
+      !package.GetVectorImage(huxerui_agentkit::images::arrow_left).HasValue()) {
     throw std::runtime_error("A Preview or library icon was not in the resource package");
   }
   const auto verify = [&](float viewport_width, const char* language, const char* new_conversation, const char* send, const char* settings,
@@ -8390,6 +8578,13 @@ void VerifyLocalization(const File& root) {
 } // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 4 && std::string_view(argv[1]) == "--model-editing") {
+    try {
+      const auto root = std::filesystem::absolute(std::filesystem::u8path(argv[2]));
+      VerifyModelEditing(File(root.u8string()), argv[3]);
+      return 0;
+    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--localization") {
     const auto root = File((std::filesystem::temp_directory_path() /
         ("agentkit-localization-" + kit::NewCommandId().value)).u8string());
@@ -8430,6 +8625,13 @@ int main(int argc, char** argv) {
     try {
       if (argc == 3) VerifyLiveWorkspaceTools(File(path.u8string()));
       else VerifyWorkspaceTools(File(path.u8string()));
+      return 0;
+    } catch (const std::exception& error) { std::cerr << error.what() << "\nFixture: " << path.string() << '\n'; return 1; }
+  }
+  if (argc == 3 && std::string_view(argv[1]) == "--workspace-read") {
+    const auto path = std::filesystem::absolute(std::filesystem::u8path(argv[2]));
+    try {
+      VerifyLiveWorkspaceRead(File(path.u8string()));
       return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << "\nFixture: " << path.string() << '\n'; return 1; }
   }

@@ -312,6 +312,10 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HU
     if (Python3_Interpreter_FOUND)
         add_test(NAME huxerui_agentkit_markdown_images_tests COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/markdown_image_server.py" $<TARGET_FILE:huxerui_agentkit_preview_tests>)
+        if (WIN32)
+            add_test(NAME huxerui_agentkit_model_editing_tests COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/model_editing_server.py" $<TARGET_FILE:huxerui_agentkit_preview_tests>)
+        endif ()
     endif ()
     add_test(NAME huxerui_agentkit_domain_review_tests COMMAND huxerui_agentkit_preview_tests --domain-review-windows)
     add_test(NAME huxerui_agentkit_code_revert_tests COMMAND huxerui_agentkit_preview_tests --code-revert)

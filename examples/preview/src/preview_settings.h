@@ -26,6 +26,6 @@ std::string WithReplyPreferences(std::string instructions, const PreviewSettings
 huxerui::ThemeBrightness PreviewBrightness(PreviewAppearance appearance, huxerui::ThemeBrightness system);
 
 huxerui::View PreviewSettingsPage(huxerui::State<PreviewSettings> current, huxerui::State<PreviewSettings> applied,
-    std::shared_ptr<RunSettings> models, huxerui::File file, AddModelProfile add_model, std::function<void()> close);
+    std::shared_ptr<RunSettings> models, huxerui::File file, AddModelProfile add_model, EditModelProfile edit_model, std::function<void()> close);
 
 } // namespace agentkit_preview

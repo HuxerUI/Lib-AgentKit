@@ -63,6 +63,9 @@ struct ChatCompletionsOptions {
   bool allow_persist_resume_state = false;
   /// Output mode available to schema-bound model turns.
   ChatOutputFormat output_format = ChatOutputFormat::Text;
+  /// Exchange tool requests and results as JSON in chat messages for endpoints without native function calling.
+  /// The adapter buffers each tool turn and supports one call per turn in this mode.
+  bool tools_via_json = false;
 };
 
 /// @brief Creates the Chat Completions adapter on the application thread.

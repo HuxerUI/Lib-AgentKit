@@ -171,7 +171,7 @@ kit::Async<kit::ToolReviewResult> ReviewChartWithModel(const kit::ModelRegistrat
 
 } // namespace
 
-void RunSettings::AddModel(const kit::ModelRegistration& registration, std::string label, ModelLimits limits) {
+void RunSettings::AddModel(const kit::ModelRegistration& registration, std::string label, ModelLimits limits, bool editable) {
   if (std::ranges::find(models_, registration.ref, &ModelChoice::ref) != models_.end()) return;
   const auto& endpoint = registration.endpoint;
   auto name = label.empty() ? endpoint.model : std::move(label);
@@ -186,7 +186,10 @@ void RunSettings::AddModel(const kit::ModelRegistration& registration, std::stri
   }
   const auto caps = registration.provider->Capabilities();
   models_.push_back({registration.ref, name, std::move(name), registration.ref != DemoModel,
-      caps.text_stream && caps.structured_output, caps, std::move(location), endpoint.protocol, limits, endpoint.model});
+      caps.text_stream && caps.structured_output, caps, std::move(location), endpoint, limits, editable});
+  auto& version = model_versions_[registration.ref.id];
+  version = std::max(version, registration.ref.version);
+  model_revision_ = model_revision_.Get() + 1;
 }
 
 void RunSettings::SetDefaults(kit::ModelProviderRef general, std::optional<kit::ModelProviderRef> code) {
@@ -195,13 +198,23 @@ void RunSettings::SetDefaults(kit::ModelProviderRef general, std::optional<kit::
 }
 
 std::optional<kit::ModelProviderRef> RunSettings::DefaultModel(const kit::AgentId& agent) const {
-  return agent == CodeAgent ? code_ : std::optional{general_};
+  return CurrentModel(agent == CodeAgent ? code_ : std::optional{general_});
+}
+
+std::optional<kit::ModelProviderRef> RunSettings::CurrentModel(std::optional<kit::ModelProviderRef> model) const {
+  static_cast<void>(model_revision_.Get());
+  if (model) {
+    const auto version = model_versions_.find(model->id);
+    if (version != model_versions_.end()) model->version = version->second;
+  }
+  return model;
 }
 
 std::vector<ModelChoice> RunSettings::Models(const kit::AgentId& agent) const {
+  static_cast<void>(model_revision_.Get());
   std::vector<ModelChoice> result;
   std::ranges::copy_if(models_, std::back_inserter(result), [&](const ModelChoice& choice) {
-    return choice.suitable && (agent != CodeAgent || choice.code);
+    return choice.ref.version == model_versions_.at(choice.ref.id) && choice.suitable && (agent != CodeAgent || choice.code);
   });
   for (auto& choice : result) {
     if (std::ranges::count(result, choice.name, &ModelChoice::name) > 1) choice.label += separator + choice.endpoint;
@@ -213,14 +226,16 @@ StringVariant RunSettings::ModelLabel(const std::optional<kit::ModelProviderRef>
   if (ref == DemoModel) return ::app::strings::ui_local_demo_model;
   const auto found = ref ? std::ranges::find(models_, *ref, &ModelChoice::ref) : models_.end();
   if (found == models_.end()) return ::app::strings::ui_unavailable_model;
-  return std::ranges::count(models_, found->name, &ModelChoice::name) > 1
+  return std::ranges::any_of(models_, [&](const auto& other) {
+    return other.ref.id != found->ref.id && other.name == found->name && other.ref.version == model_versions_.at(other.ref.id);
+  })
       ? found->name + separator + found->endpoint : found->name;
 }
 
 std::optional<Image> RunSettings::ModelAvatar(const kit::ModelProviderRef& ref, Color foreground) const {
   const auto found = std::ranges::find(models_, ref, &ModelChoice::ref);
   if (found == models_.end()) return {};
-  const auto* brand = FindModelBrand(found->model_id);
+  const auto* brand = FindModelBrand(found->connection.model);
   if (!brand) return {};
   return brand->Icon(foreground);
 }
@@ -604,12 +619,87 @@ View AddModelDialog(DialogContext dialog, AddModelProfile add_model, std::functi
       .Key("add-model-dialog");
 }
 
+[[huxerui::composable]]
+View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile edit_model) {
+  const auto endpoint = UseState(TextEditingValue::FromText(current.connection.base_url.value_or(std::string{})));
+  const auto key = UseState(TextEditingValue::FromText({}));
+  const auto clear_key = UseState(false);
+  const auto limits = UseState(EditLimits(current.limits));
+  const auto saving = UseState(false);
+  const auto error = UseState(std::string{});
+  const auto tasks = UseApplicationTaskScope();
+  const auto color = UseTheme().colors;
+  const auto buttons = UseEnvironment<ButtonStyle>();
+  auto fields = UseEnvironment<TextFieldStyle>();
+  fields.show_label = false;
+  const auto invalid_limits = UseString(::app::strings::ui_model_token_limit_invalid);
+  const auto save = [dialog, current, edit_model, endpoint, key, clear_key, limits, saving, error, tasks, invalid_limits] {
+    if (saving.Get() || TrimModelField(endpoint->text).empty()) return;
+    ModelLimits updated_limits;
+    try { updated_limits = ReadLimits(limits.Get()); }
+    catch (const std::invalid_argument&) { error = invalid_limits; return; }
+    auto text = TrimModelField(key->text);
+    std::optional<std::string> updated_key;
+    if (clear_key.Get()) updated_key = std::string{};
+    else if (!text.empty()) updated_key = std::move(text);
+    saving = true;
+    error = "";
+    tasks.Launch([dialog, edit_model, ref = current.ref, url = endpoint->text, updated_key = std::move(updated_key),
+                  updated_limits, key, saving, error]() mutable -> Task<void> {
+      auto result = co_await edit_model(std::move(ref), std::move(url), std::move(updated_key), updated_limits);
+      saving = false;
+      if (!result.Succeeded()) { error = result.Error().message; co_return; }
+      key = TextEditingValue::FromText({});
+      dialog.Dismiss();
+    });
+  };
+  const auto endpoint_label = ::app::strings::ui_api_base_url;
+  const auto key_label = ::app::strings::ui_api_key;
+  const bool ready = !saving.Get();
+  std::vector<View> content{
+      Text(current.label).Style({Font::System(15.0F).WithWeight(FontWeight::SemiBold), color.on_surface}),
+      PreviewLabeledField(endpoint_label, TextField(endpoint).Label(endpoint_label).Variant(TextFieldVariant::Outlined)
+          .OnChanged([endpoint](const TextEditingValue& value) { endpoint = value; })
+          .With(Enabled(ready)).Key("edit-model-url"), color),
+      PreviewLabeledField(key_label, TextField(key).Label(key_label).Placeholder(::app::strings::ui_keep_saved_model_key)
+          .Variant(TextFieldVariant::Outlined).Secure().OnChanged([key](const TextEditingValue& value) { key = value; })
+          .With(Enabled(ready && !clear_key.Get())).Key("edit-model-key"), color),
+      Checkbox(::app::strings::ui_clear_saved_model_key, clear_key.Get())
+          .OnChanged([clear_key](bool checked) { clear_key = checked; }).With(Enabled(ready && key->text.empty())),
+      ModelLimitFields(limits.Get(), ready, color, [limits](std::size_t i, TextEditingValue value) {
+        auto next = limits.Get();
+        next[i] = std::move(value);
+        limits = std::move(next);
+      }),
+  };
+  if (!saves_direct_api_keys && !key->text.empty() && !key->text.starts_with("${"))
+    content.push_back(Text(::app::strings::ui_direct_keys_are_available_until_preview_closes, TextRole::Label));
+  if (!error->empty()) content.push_back(Text(error.Get()).With(Foreground(color.error)).Key("edit-model-error"));
+  auto body = ScrollView(Column(std::move(content)).With(Spacing(12.0F), Padding(EdgeInsets::Symmetric(20.0F, 15.0F)),
+      CrossAlign(CrossAxisAlignment::Stretch))).With(Frame{.max_height = 520.0F}, ScrollBar());
+  auto actions = Row{
+      Spacer(),
+      ProvideEnvironment(PreviewSecondaryButton(buttons, color), Button(::app::strings::ui_cancel)
+          .OnClick([dialog] { dialog.Dismiss(); }).With(Enabled(ready))),
+      ProvideEnvironment(PreviewPrimaryButton(buttons, color), Button(ready ? ::app::strings::ui_save_model : ::app::strings::ui_saving)
+          .OnClick(save).With(Enabled(ready && !TrimModelField(endpoint->text).empty())).Key("update-model")),
+  }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
+  return ProvideEnvironment(fields, PreviewFormDialog(::app::strings::ui_edit_model, std::move(body), std::move(actions), color, 512.0F))
+      .Key("edit-model-dialog");
+}
+
 } // namespace
 
 void ShowAddModel(const huxerui::DialogHandle& dialog, AddModelProfile add_model,
     std::function<void(kit::ModelProviderRef)> added) {
   ShowPreviewDialog(dialog, DialogFactory{[add_model = std::move(add_model), added = std::move(added)](DialogContext context) {
     return AddModelDialog(std::move(context), add_model, added);
+  }});
+}
+
+void ShowEditModel(const DialogHandle& dialog, ModelChoice current, EditModelProfile edit_model) {
+  ShowPreviewDialog(dialog, DialogFactory{[current = std::move(current), edit_model = std::move(edit_model)](DialogContext context) {
+    return EditModelDialog(std::move(context), current, edit_model);
   }});
 }
 
@@ -664,9 +754,18 @@ View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserR
   const auto permission_anchor = UseViewHandle();
   const auto colors = UseTheme().colors;
   const auto choices = settings->Models(agent);
-  const auto effective_model = next->model ? next->model : settings->DefaultModel(agent);
+  const auto chosen_model = settings->CurrentModel(next->model);
+  Lifecycle([next, chosen_model, changed] {
+    if (next->model == chosen_model) return;
+    auto value = next.Get();
+    if (!value.model || !chosen_model || value.model->id != chosen_model->id) return;
+    value.model = chosen_model;
+    next = std::move(value);
+    if (changed) changed();
+  }, chosen_model, next->model);
+  const auto effective_model = chosen_model ? chosen_model : settings->DefaultModel(agent);
   const auto selected = effective_model ? std::ranges::find(choices, *effective_model, &ModelChoice::ref) : choices.end();
-  const auto* selected_brand = selected == choices.end() ? nullptr : FindModelBrand(selected->model_id);
+  const auto* selected_brand = selected == choices.end() ? nullptr : FindModelBrand(selected->connection.model);
   auto model = effective_model == DemoModel ? UseString(::app::strings::ui_local_demo_model) :
       selected != choices.end() ? selected->name : effective_model ? UseString(::app::strings::ui_unavailable_model) :
       UseString(::app::strings::ui_select_model);
@@ -686,7 +785,7 @@ View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserR
     for (const auto& choice : choices) {
       auto label = choice.ref == DemoModel ? StringVariant{::app::strings::ui_local_demo_model} : StringVariant{choice.label};
       const auto activate = [select_model, ref = choice.ref] { select_model(ref); };
-      const auto* brand = FindModelBrand(choice.model_id);
+      const auto* brand = FindModelBrand(choice.connection.model);
       auto item = brand ? MenuItem(brand->image, std::move(label), activate) : MenuItem(std::move(label), activate);
       items.emplace_back(std::move(item).Checked(effective_model == choice.ref));
     }

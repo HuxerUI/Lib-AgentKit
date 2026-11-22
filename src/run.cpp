@@ -149,7 +149,7 @@ Async<void> PrepareModelRequest(RuntimeState& state, const SessionData& session,
 }
 
 Async<Round> ReadRound(RuntimeState& state, SessionData& session, RunExecution& run,
-                       ModelRegistration& model, ModelTurnRequest request, Revision authorized_at) {
+                       const ModelRegistration& model, ModelTurnRequest request, Revision authorized_at) {
   const auto reset_model = std::unique_ptr<bool, void(*)(bool*)>(&run.view.model_active, [](bool* value) { *value = false; });
   if (authorized_at != state.access_revision) co_return Fail<Round>(ErrorCode::Conflict, "Model input access changed before submission");
   if (run.stop.stop_requested()) co_return Fail<Round>(ErrorCode::AlreadyClosed, "Run closed");
@@ -568,7 +568,7 @@ Async<ModelReply> RuntimeState::RunHostModel(RunId id, ModelInput input) {
   auto& run = runs.at(id);
   auto& session = sessions.at(run.view.session);
   const auto& agent = agents.at(run.view.agent.id);
-  auto& model = models.at(run.view.model.id);
+  const auto& model = *ResolveModel(run.view.model);
   const auto caps = model.provider->Capabilities();
   std::ranges::sort(input.allowed_tools);
   input.allowed_tools.erase(std::ranges::unique(input.allowed_tools).begin(), input.allowed_tools.end());
@@ -723,7 +723,7 @@ Task<void> RuntimeState::Drive(RunId id) {
   auto& run = runs.at(id);
   auto& session = sessions.at(run.view.session);
   const auto& agent = agents.at(run.view.agent.id);
-  auto& model = models.at(run.view.model.id);
+  const auto& model = *ResolveModel(run.view.model);
   auto fail = [&](AgentError error) {
     const auto reason = error.code == ErrorCode::BudgetExceeded ? RunEndReason::Budget :
         error.code == ErrorCode::ProtocolError || error.code == ErrorCode::ProviderFailure ? RunEndReason::Interrupted :

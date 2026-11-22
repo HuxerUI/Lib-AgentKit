@@ -311,17 +311,30 @@ AgentResult<void> RegisterVersion(Registry& registry, Key key, Value value, Vers
 } // namespace
 
 AgentResult<void> AgentRuntime::RegisterModel(ModelRegistration model) {
-  const bool started = state_->stage == RuntimeState::Stage::Started;
-  if (!started && state_->stage != RuntimeState::Stage::Registering)
+  if (state_->stage != RuntimeState::Stage::Started && state_->stage != RuntimeState::Stage::Registering)
     return Fail<void>(ErrorCode::InvalidState, "Registration closed");
   if (model.ref.id.value.empty() || !model.ref.version || !model.provider || model.endpoint.provider.empty() ||
       model.endpoint.model.empty() || model.endpoint.protocol.empty()) {
     return Fail<void>(ErrorCode::InvalidArgument, "Invalid model registration");
   }
-  auto id = model.ref.id;
-  if (started && state_->models.contains(id)) return Fail<void>(ErrorCode::Conflict, "This model is already registered");
-  return RegisterVersion(state_->models, std::move(id), std::move(model),
-                         [](const ModelRegistration& item) { return item.ref.version; });
+  auto& versions = state_->models[model.ref.id];
+  const auto version = model.ref.version;
+  if (!versions.empty() && versions.rbegin()->first >= version)
+    return Fail<void>(ErrorCode::Conflict, "Registration version must increase");
+  versions.emplace(version, std::move(model));
+  return AgentResult<void>::Success();
+}
+
+const ModelRegistration* RuntimeState::ResolveModel(const ModelProviderRef& ref) const {
+  const auto model = models.find(ref.id);
+  if (model == models.end()) return nullptr;
+  const auto version = model->second.find(ref.version);
+  return version == model->second.end() ? nullptr : &version->second;
+}
+
+const ModelRegistration* RuntimeState::LatestModel(const ModelId& id) const {
+  const auto model = models.find(id);
+  return model == models.end() ? nullptr : &model->second.rbegin()->second;
 }
 
 AgentResult<void> AgentRuntime::RegisterTool(ToolDefinition tool) {
@@ -366,12 +379,12 @@ AgentResult<void> AgentRuntime::RegisterAgent(AgentRegistration agent) {
 
 AgentResult<void> AgentRuntime::ValidateRegistration() const {
   for (const auto& [id, agent] : state_->agents) {
-    const auto model = state_->models.find(agent.model);
-    if (model == state_->models.end()) return Fail<void>(ErrorCode::NotFound, "Unregistered model for agent " + id.value);
+    const auto* model = state_->LatestModel(agent.model);
+    if (!model) return Fail<void>(ErrorCode::NotFound, "Unregistered model for agent " + id.value);
     auto required = agent.requires_model;
     required.tool_calls |= (!agent.tools.empty() || !agent.tool_catalogs.empty() || !agent.delegates.empty()) &&
         !state_->workflows.contains(id);
-    if (!detail::Supports(model->second.provider->Capabilities(), required)) {
+    if (!detail::Supports(model->provider->Capabilities(), required)) {
       return Fail<void>(ErrorCode::Unsupported, "Model lacks required capabilities for agent " + id.value);
     }
     for (const auto& tool : agent.tools) {

@@ -531,7 +531,11 @@ public:
 
   RuntimeOptions options;
   enum class Stage { Registering, Starting, Started, Closed } stage = Stage::Registering;
-  std::map<ModelId, ModelRegistration> models;
+  std::map<ModelId, std::map<Revision, ModelRegistration>> models;
+  const ModelRegistration* ResolveModel(const ModelProviderRef& ref) const;
+
+  const ModelRegistration* LatestModel(const ModelId& id) const;
+
   std::map<ToolId, std::shared_ptr<const ToolDefinition>> tools;
   std::map<ToolCatalogId, RegisteredToolCatalog> tool_catalogs;
   bool ReservedToolId(const ToolId& id) const;

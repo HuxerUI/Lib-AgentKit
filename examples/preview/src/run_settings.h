@@ -27,6 +27,8 @@ struct ModelLimits {
   std::optional<std::uint64_t> context_window;
   std::optional<std::uint64_t> max_input_tokens;
   std::optional<std::uint64_t> max_output_tokens;
+
+  bool operator==(const ModelLimits&) const = default;
 };
 
 struct ModelChoice {
@@ -37,9 +39,9 @@ struct ModelChoice {
   bool suitable;
   huxerui::agentkit::ModelCapabilities capabilities;
   std::string endpoint;
-  std::string protocol;
+  huxerui::agentkit::ModelEndpoint connection;
   ModelLimits limits;
-  std::string model_id;
+  bool editable = false;
 };
 
 struct ModelProfileInput {
@@ -67,15 +69,22 @@ huxerui::agentkit::Async<std::vector<DiscoveredModel>> DiscoverModels(
 
 using AddModelProfile = std::function<huxerui::agentkit::Async<huxerui::agentkit::ModelProviderRef>(ModelProfileInput)>;
 
+using EditModelProfile = std::function<huxerui::agentkit::Async<huxerui::agentkit::ModelProviderRef>(
+    huxerui::agentkit::ModelProviderRef, std::string endpoint, std::optional<std::string> new_key, ModelLimits)>;
+
 void ShowAddModel(const huxerui::DialogHandle& dialog, AddModelProfile add_model,
     std::function<void(huxerui::agentkit::ModelProviderRef)> added);
+
+void ShowEditModel(const huxerui::DialogHandle& dialog, ModelChoice current, EditModelProfile edit_model);
 
 class RunSettings {
 public:
   void AddModel(const huxerui::agentkit::ModelRegistration& registration, std::string label = {},
-      ModelLimits limits = {});
+      ModelLimits limits = {}, bool editable = false);
   void SetDefaults(huxerui::agentkit::ModelProviderRef general, std::optional<huxerui::agentkit::ModelProviderRef> code);
   std::optional<huxerui::agentkit::ModelProviderRef> DefaultModel(const huxerui::agentkit::AgentId& agent) const;
+  std::optional<huxerui::agentkit::ModelProviderRef> CurrentModel(
+      std::optional<huxerui::agentkit::ModelProviderRef> model) const;
   std::vector<ModelChoice> Models(const huxerui::agentkit::AgentId& agent) const;
   huxerui::StringVariant ModelLabel(const std::optional<huxerui::agentkit::ModelProviderRef>& ref) const;
   std::optional<huxerui::Image> ModelAvatar(const huxerui::agentkit::ModelProviderRef& ref, huxerui::Color foreground) const;
@@ -91,6 +100,8 @@ public:
 
 private:
   std::vector<ModelChoice> models_;
+  std::map<huxerui::agentkit::ModelId, huxerui::agentkit::Revision> model_versions_;
+  huxerui::State<std::size_t> model_revision_{std::size_t{0}};
   huxerui::agentkit::ModelProviderRef general_ = DemoModel;
   std::optional<huxerui::agentkit::ModelProviderRef> code_;
   std::map<huxerui::agentkit::ExecutionProfileId, huxerui::agentkit::WorkspaceId, std::less<>> full_access_;

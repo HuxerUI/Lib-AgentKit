@@ -91,25 +91,24 @@ Async<RunStartBinding> RuntimeState::ResolveStart(const SessionData& session, co
        !agent.delegates.empty() || !agent.capabilities.empty() || workflows.contains(agent.ref.id))) {
     co_return Fail<RunStartBinding>(ErrorCode::PermissionDenied, "Side chat requires a selection-only assistant");
   }
-  const auto model = models.find(start.model ? start.model->id : agent.model);
   if ((start.model && (!start.model->version || start.model->id.value.empty())) ||
       (start.execution_profile && (!start.execution_profile->version || start.execution_profile->id.value.empty()))) {
     co_return Fail<RunStartBinding>(ErrorCode::InvalidArgument, "Model and execution profile require valid revisions");
   }
-  if (model == models.end()) co_return Fail<RunStartBinding>(ErrorCode::NotFound, "Model unavailable");
-  if (start.model && model->second.ref != *start.model) {
-    co_return Fail<RunStartBinding>(ErrorCode::Conflict, "Model registration changed");
-  }
+  const auto* latest = LatestModel(start.model ? start.model->id : agent.model);
+  if (!latest) co_return Fail<RunStartBinding>(ErrorCode::NotFound, "Model unavailable");
+  const auto* model = start.model ? ResolveModel(*start.model) : latest;
+  if (!model) co_return Fail<RunStartBinding>(ErrorCode::Conflict, "Model registration changed");
   auto required = agent.requires_model;
   required.tool_calls |= (!agent.tools.empty() || !agent.tool_catalogs.empty() || !agent.delegates.empty()) &&
       !workflows.contains(agent.ref.id);
-  if (!Supports(model->second.provider->Capabilities(), required)) {
+  if (!Supports(model->provider->Capabilities(), required)) {
     co_return Fail<RunStartBinding>(ErrorCode::Unsupported, "Model lacks capabilities required by the agent");
   }
-  RunStartBinding binding{model->second.ref, start.execution_profile};
+  RunStartBinding binding{model->ref, start.execution_profile};
   auto request = Request(user, Capability::UseRunConfiguration, &session);
   request.run_configuration = binding;
-  request.recipient_model = model->first;
+  request.recipient_model = model->ref.id;
   auto access = co_await Require(std::move(request));
   if (!access.Succeeded()) co_return AgentResult<RunStartBinding>::Failure(access.Error());
   co_return AgentResult<RunStartBinding>::Success(std::move(binding));

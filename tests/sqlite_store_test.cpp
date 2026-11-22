@@ -857,6 +857,11 @@ huxerui::Task<void> ResumeApproval(huxerui::File file, std::shared_ptr<EffectPro
   auto model = std::make_shared<CountingModel>();
   model->write = true;
   auto runtime = RegisterRuntime(std::move(storage), model, probe, scenario == ApprovalRestart::StoredContinuation);
+  const auto replacement = std::make_shared<CountingModel>();
+  const kit::ModelProviderRef newer{{"test.model"}, 2};
+  if (scenario == ApprovalRestart::StoredContinuation) {
+    Take(runtime->RegisterModel({.ref = newer, .endpoint = {"test", "replacement", "script", {}}, .provider = replacement}));
+  }
   Take(co_await runtime->StartAsync());
   auto session = Take(co_await runtime->Sessions().OpenAsync(saved.session.session));
   auto restarted = session->Snapshot();
@@ -900,8 +905,14 @@ huxerui::Task<void> ResumeApproval(huxerui::File file, std::shared_ptr<EffectPro
   if (scenario == ApprovalRestart::StoredContinuation) {
     const auto& continuation = model->received_state;
     Check(continuation && continuation->prefix_items == 2 && continuation->state.provider == finished->runs.front().model &&
-        continuation->state.format_version == 1 && continuation->state.opaque == private_model_state,
+        continuation->state.format_version == 1 && continuation->state.opaque == private_model_state &&
+        finished->runs.front().model.version == 1 && replacement->starts == 0,
         "authorized private continuation restored original bytes, model revision and input boundary");
+    Take(co_await session->SendAsync(kit::NewCommandId(), {.text = "Use the current model"}));
+    co_await Eventually([&] { return session->Snapshot()->runs.size() == 2 && !session->Snapshot()->summary.active_run; },
+        "the new Run did not finish");
+    Check(session->Snapshot()->runs.back().model == newer && replacement->starts == 1 && model->starts == 1,
+        "the new Run did not use the latest registration after restoring the original revision");
   }
   if (scenario == ApprovalRestart::Revoked) {
     Check(tool.state == kit::ToolCallState::Denied && probe->executions == 0 &&

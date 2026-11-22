@@ -153,10 +153,10 @@ Async<std::vector<StoredArtifact>> RuntimeState::ResolveModelAttachments(const S
   }
   if (!options.artifact_store.open)
     co_return Fail<std::vector<StoredArtifact>>(ErrorCode::Unsupported, "Artifact byte stream is unavailable");
-  const auto provider = models.find(model.id);
-  if (provider == models.end() || provider->second.ref != model)
+  const auto* provider = ResolveModel(model);
+  if (!provider)
     co_return Fail<std::vector<StoredArtifact>>(ErrorCode::Conflict, "The attachment recipient model changed");
-  const auto caps = provider->second.provider->Capabilities();
+  const auto caps = provider->provider->Capabilities();
   const auto epoch = access_revision;
   auto read = CollaborationAccess(actor, Capability::ReadContext, session);
   for (const auto& ref : refs) read.sources.push_back({ref});
@@ -200,10 +200,10 @@ Async<std::vector<StoredArtifact>> RuntimeState::PrepareInputAttachments(const S
   if (input.staged_attachments.empty()) co_return Result::Success({});
   if (!options.artifact_store.resolve_staged_attachment || !options.artifact_store.open)
     co_return Fail<std::vector<StoredArtifact>>(ErrorCode::Unsupported, "The host does not import attachments");
-  const auto provider = models.find(model.id);
-  if (provider == models.end() || provider->second.ref != model)
+  const auto* provider = ResolveModel(model);
+  if (!provider)
     co_return Fail<std::vector<StoredArtifact>>(ErrorCode::Conflict, "The attachment recipient model changed");
-  const auto caps = provider->second.provider->Capabilities();
+  const auto caps = provider->provider->Capabilities();
   if (!caps.image_input && !caps.file_input)
     co_return Fail<std::vector<StoredArtifact>>(ErrorCode::Unsupported, "The selected model does not accept attachments");
   const auto epoch = access_revision;

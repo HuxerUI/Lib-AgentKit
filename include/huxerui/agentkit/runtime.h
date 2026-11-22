@@ -434,8 +434,9 @@ public:
   static AgentResult<std::shared_ptr<AgentRuntime>> Create(RuntimeOptions options);
 
   /// @brief Registers a versioned model configuration and provider.
-  /// After StartAsync(), call on the application thread to add a new model ID for future Run selections.
-  /// Existing registrations and Run bindings retain their original versions.
+  /// Add a model ID or publish a higher revision on the application thread, including after StartAsync().
+  /// Default selections use the highest revision. Explicit selections, queued inputs and started Runs retain their exact revisions.
+  /// Register the original revisions at startup to restore Runs that still use them.
   /// @param model Exact model identity, descriptor and provider.
   AgentResult<void> RegisterModel(ModelRegistration model);
 

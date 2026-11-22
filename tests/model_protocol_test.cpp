@@ -208,6 +208,59 @@ Task<void> ToolProtocol(TaskScope tasks) {
   Check(std::get<kit::ModelTextDelta>(continued.front()).utf8 == "Done", "tool loop produced final response");
 }
 
+Task<void> JsonToolCalls(TaskScope tasks) {
+  Script server;
+  server.reply = [&](const HttpRequest&, const Json& body) {
+    Check(!body.contains("tools") && body["response_format"]["type"] == "json_object",
+        "JSON mode must not rely on native tool calling");
+    const auto& messages = body.at("messages");
+    Check(messages[0]["content"].get<std::string>().find("read_files") != std::string::npos,
+        "The authorized functions must be described in the prompt");
+    std::string content;
+    if (server.requests == 1) {
+      content = "```json\n{\"tool\":\"read_files\",\"arguments\":{\"paths\":[\"README.md\"]}}";
+    } else if (server.requests == 2) {
+      const auto call = Json::parse(messages[2]["content"].get<std::string>()).at("tool_requests").at(0);
+      const auto result = Json::parse(messages[3]["content"].get<std::string>()).at("tool_result");
+      Check(messages[3]["role"] == "user" && call["tool"] == "read_files" &&
+          call["id"] == result["id"] && result["data"]["contents"] == "Fixture README",
+          "JSON tool requests and results must round-trip with the same call identity");
+      content = R"({"answer":"Read Fixture README"})";
+    } else {
+      content = R"({"tool":"unoffered","arguments":{}})";
+    }
+    const auto mid = content.size() / 2;
+    return Frame(Choice({{"content", content.substr(0, mid)}})) + Frame(Choice({{"content", content.substr(mid)}})) +
+        Frame(Choice(Json::object(), "stop")) + "data: ";
+  };
+  auto options = Options(kit::ChatCompletionsDialect::Compatible);
+  options.tools_via_json = true;
+  auto model = Take(kit::detail::MakeChatCompletionsModel(std::move(options), tasks, server.Open()));
+  auto request = Request();
+  request.tools = {{{{"read_files"}, 1, {}}, "read_files", "Read files", {kit::detail::FromWireJson({{"type", "object"}})}}};
+  auto stream = Take(co_await model.provider->StartTurnAsync(request));
+  auto events = co_await Collect(*stream);
+  const auto& started = std::get<kit::ModelToolStarted>(events.front());
+  const auto& arguments = std::get<kit::ModelToolArguments>(events[1]);
+  Check(events.size() == 4 && started.name == "read_files" && arguments.provider_call_id == started.provider_call_id &&
+      Json::parse(arguments.bytes)["paths"] == Json::array({"README.md"}) &&
+      std::get<kit::ModelToolFinished>(events[2]).provider_call_id == started.provider_call_id &&
+      std::get<kit::ModelFinished>(events.back()).reason == kit::ModelFinishReason::ToolCalls,
+      "Fenced JSON must produce a complete tool call without transcript text");
+  request.turn = {"fixture-next-turn"};
+  request.items.emplace_back(kit::ModelToolCall{started.provider_call_id, started.name,
+      kit::detail::FromWireJson(Json::parse(arguments.bytes))});
+  request.items.emplace_back(kit::ModelToolResult{started.provider_call_id, kit::ToolCallId{"local-read"},
+      kit::detail::FromWireJson({{"contents", "Fixture README"}}), {}});
+  auto next = Take(co_await model.provider->StartTurnAsync(request));
+  auto answer = co_await Collect(*next);
+  Check(answer.size() == 2 && std::get<kit::ModelTextDelta>(answer.front()).utf8 == "Read Fixture README" &&
+      std::get<kit::ModelFinished>(answer.back()).reason == kit::ModelFinishReason::Completed,
+      "The transcript must receive the answer without the JSON envelope");
+  auto rejected = Take(co_await model.provider->StartTurnAsync(std::move(request)));
+  ErrorIs(co_await rejected->ReadAsync(), kit::ErrorCode::ProtocolError);
+}
+
 Task<void> PrivateState(TaskScope tasks) {
   Script server;
   server.reply = [&](const HttpRequest&, const Json& body) {
@@ -1701,6 +1754,7 @@ int main(int argc, char** argv) {
         scope.Launch([&, scope]() -> Task<void> {
           try {
             co_await ToolProtocol(scope);
+            co_await JsonToolCalls(scope);
             co_await PrivateState(scope);
             co_await StructuredOutput(scope, kit::ChatOutputFormat::JsonSchema);
             co_await StructuredOutput(scope, kit::ChatOutputFormat::JsonObject);

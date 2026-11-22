@@ -57,7 +57,9 @@ View ModelRoleField(StringVariant label, std::vector<ModelChoice> choices, Strin
   const auto selected = draft.Get().*role;
   std::vector<std::pair<std::optional<kit::ModelProviderRef>, StringVariant>> options{{std::nullopt, std::move(fallback)}};
   for (auto& item : choices) options.emplace_back(std::move(item.ref), std::move(item.label));
-  auto found = std::ranges::find(options, selected, &decltype(options)::value_type::first);
+  auto found = std::ranges::find_if(options, [&](const auto& option) {
+    return selected ? option.first && option.first->id == selected->id : !option.first;
+  });
   if (found == options.end()) {
     options.emplace_back(selected, ::app::strings::ui_saved_model_unavailable);
     found = std::prev(options.end());
@@ -182,12 +184,11 @@ ThemeBrightness PreviewBrightness(PreviewAppearance appearance, ThemeBrightness 
 
 [[huxerui::composable]]
 View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> applied,
-    std::shared_ptr<RunSettings> models, File file, AddModelProfile add_model, std::function<void()> close) {
+    std::shared_ptr<RunSettings> models, File file, AddModelProfile add_model, EditModelProfile edit_model, std::function<void()> close) {
   const auto draft = UseState(current.Get());
   const auto instructions = UseState(TextEditingValue::FromText(current->instructions));
   const auto busy = UseState(false);
   const auto error = UseState(std::string{});
-  const auto refresh_models = UseState(std::size_t{0});
   const auto section = UseState(SettingsSection::Models);
   const auto dialog = UseDialog();
   const auto tasks = UseTaskScope();
@@ -232,8 +233,8 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
       action_style.indication = theme.interactions.indication;
       action_style.indication->ripple.reset();
       content.push_back(Row{std::move(title).With(Grow()), ProvideEnvironment(action_style,
-          Chip(::app::images::add, ::app::strings::ui_add_model).OnClick([dialog, add_model, refresh_models] {
-            ShowAddModel(dialog, add_model, [refresh_models](kit::ModelProviderRef) { refresh_models = refresh_models.Get() + 1; });
+          Chip(::app::images::add, ::app::strings::ui_add_model).OnClick([dialog, add_model] {
+            ShowAddModel(dialog, add_model, {});
           }).Key("settings-add-model"))}.With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center)));
     } else {
       content.push_back(std::move(title));
@@ -241,7 +242,6 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
   }
   switch (section.Get()) {
   case SettingsSection::Models: {
-    static_cast<void>(refresh_models.Get());
     auto choices = models->Models(GeneralAgent);
     std::erase_if(choices, [](const auto& item) { return item.ref == DemoModel; });
     auto vision = choices;
@@ -256,12 +256,15 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
       const auto& limits = model.limits;
       auto details = Column {
         Text(model.label).Style({Font::System(13.0F), colors.on_surface})
-            .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Tooltip(model.endpoint + " / " + model.protocol)),
+            .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Tooltip(model.endpoint + " / " + model.connection.protocol)),
         Text(StringVariant::Format(::app::strings::ui_model_limit_details, token_display(limits.context_window),
             token_display(limits.max_input_tokens), token_display(limits.max_output_tokens)), TextRole::Label)
             .With(Foreground(colors.on_surface_variant)),
       }.With(Spacing(3.0F), Grow());
-      catalog.push_back(Row{std::move(details)}.With(Padding(EdgeInsets::Symmetric(16.0F, 10.0F)),
+      std::vector<View> row{std::move(details)};
+      if (edit_model && model.editable) row.push_back(ProvideEnvironment(secondary, Button(::app::strings::ui_edit_model)
+          .OnClick([dialog, model, edit_model] { ShowEditModel(dialog, model, edit_model); }).Key("settings-edit-model/" + model.ref.id.value)));
+      catalog.push_back(Row(std::move(row)).With(Padding(EdgeInsets::Symmetric(16.0F, 10.0F)),
           Spacing(12.0F), CrossAlign(CrossAxisAlignment::Center)).Key(model.ref.id.value));
     }
     content.push_back(SettingsPanel(std::move(catalog), colors).Key("settings-model-list"));

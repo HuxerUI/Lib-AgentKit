@@ -949,9 +949,8 @@ StoredSession RuntimeState::Capture(const SessionData& session) const {
   image.data.consuming = false;
   for (const auto& id : session.runs) {
     const auto& run = runs.at(id);
-    auto model = models.find(run.view.model.id);
-    const bool keep_resume = model != models.end() && model->second.ref == run.view.model &&
-                             model->second.allow_persist_resume_state;
+    const auto* model = ResolveModel(run.view.model);
+    const bool keep_resume = model && model->allow_persist_resume_state;
     std::map<ToolCallId, ToolPlanState> tool_plans;
     for (const auto& [call, attempt] : run.tool_attempts) {
       if (attempt.plan.prepared || attempt.plan.source_revision) tool_plans.emplace(call, attempt.plan);
@@ -976,10 +975,9 @@ bool RuntimeState::CanRestore(const StoredRun& run, const SessionData& session) 
       session.summary.lifecycle != SessionLifecycle::Open ||
       (run.delegate ? !session.summary.active_run : session.summary.active_run != run.view.id)) return false;
   auto agent = agents.find(run.view.agent.id);
-  auto model = models.find(run.view.model.id);
-  if (agent == agents.end() || agent->second.ref != run.view.agent || model == models.end() ||
-      model->second.ref != run.view.model || run.continuation_missing ||
-      (run.continuation && (!model->second.allow_persist_resume_state ||
+  const auto* model = ResolveModel(run.view.model);
+  if (agent == agents.end() || agent->second.ref != run.view.agent || !model || run.continuation_missing ||
+      (run.continuation && (!model->allow_persist_resume_state ||
           run.continuation->prefix_items > run.items.size() || run.continuation->state.provider != run.view.model))) {
     return false;
   }

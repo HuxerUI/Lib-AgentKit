@@ -258,7 +258,7 @@ Async<std::vector<DelegateOutcome>> RuntimeState::Delegate(RunId id, CommandId c
       tighten(agent.budget.deadline);
       tighten(request.budget.deadline);
       std::vector<ModelItem> items{ModelContent{ModelContent::Role::User, request.input.text}};
-      RunSnapshot view{.id = child_id, .session = session.summary.id, .agent = agent.ref, .model = models.at(agent.model).ref,
+      RunSnapshot view{.id = child_id, .session = session.summary.id, .agent = agent.ref, .model = LatestModel(agent.model)->ref,
           .trigger = RunTrigger::Delegation, .parent = id, .goal = parent.view.goal, .state = RunState::WaitingForDependency, .usage = {}};
       auto& child = runs.emplace(child_id, RunExecution{.view = std::move(view), .principal = parent.principal, .input = std::move(request.input),
           .items = std::move(items), .model_boundary = true, .deadline = deadline,

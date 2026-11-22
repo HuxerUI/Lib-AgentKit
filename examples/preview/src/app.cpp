@@ -34,8 +34,10 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <map>
 #include <set>
+#include <variant>
 #include <nlohmann/json.hpp>
 
 #ifdef _WIN32
@@ -288,6 +290,8 @@ struct PreviewService {
 #endif
   std::shared_ptr<agentkit_preview::RunSettings> run_settings;
   std::optional<File> model_profiles;
+  std::map<kit::ModelProviderRef, std::variant<File, agentkit_preview::ModelProfileInput>> model_revisions;
+  bool saving_models = false;
   std::optional<File> settings_file;
   State<agentkit_preview::PreviewSettings> settings{agentkit_preview::PreviewSettings{}};
   State<agentkit_preview::PreviewSettings> applied_settings{agentkit_preview::PreviewSettings{}};
@@ -459,8 +463,10 @@ struct PreviewModelOptions {
   bool reasoning_summary = false;
 };
 
-std::optional<kit::ModelRegistration> ConfiguredModel(PreviewModelOptions options, std::string_view slot) {
-  const auto identity_for = [slot, image = options.image_input, file = options.file_input](std::string base) {
+std::optional<kit::ModelRegistration> ConfiguredModel(PreviewModelOptions options, std::string_view slot,
+    std::optional<kit::ModelProviderRef> revision = {}) {
+  const auto identity_for = [slot, revision, image = options.image_input, file = options.file_input](std::string base) {
+    if (revision) return *revision;
     if (image || file) base += "/media/" + std::to_string(image) + "/" + std::to_string(file);
     if (!slot.empty()) base = "preview.profile/" + std::string(slot) + "/" + base;
     return kit::ModelProviderRef{{std::move(base)}, 1};
@@ -556,12 +562,14 @@ std::optional<kit::ModelRegistration> ConfiguredModel(PreviewModelOptions option
   auto dialect = dialects.find(provider);
   if (dialect == dialects.end()) throw std::invalid_argument("Unknown AgentKit Chat Completions provider");
   const auto identity = identity_for("preview.chat/" + provider + "/" + std::to_string(url.size()) + "/" + url + model);
+  const bool tools_via_json = (provider == "compatible" || provider == "gemini") && model == "gemini-4-hydrogen";
   kit::ChatCompletionsOptions chat{
       .ref = identity, .model = std::move(model), .base_url = std::move(url), .dialect = dialect->second,
       .bearer_token = std::move(credential),
       .request_usage = provider == "openai",
       .developer_role = provider == "openai",
-      .output_format = kit::ChatOutputFormat::JsonObject};
+      .output_format = kit::ChatOutputFormat::JsonObject,
+      .tools_via_json = tools_via_json};
   if (provider == "deepseek" || provider == "glm") chat.thinking = false;
   return connect(kit::MakeChatCompletionsModel(std::move(chat)));
 }
@@ -613,7 +621,8 @@ std::string UnprotectModelKey(const nlohmann::json& value) {
 }
 #endif
 
-kit::ModelRegistration MakeProfileModel(const agentkit_preview::ModelProfileInput& profile, std::string environment) {
+kit::ModelRegistration MakeProfileModel(const agentkit_preview::ModelProfileInput& profile, std::string environment,
+    std::optional<kit::ModelProviderRef> revision = {}) {
   const std::string_view url = profile.base_url;
   const auto scheme = url.starts_with("https://") ? 8 : url.starts_with("http://") ? 7 : 0;
   const auto authority = url.substr(scheme, url.find('/', scheme) - scheme);
@@ -628,8 +637,32 @@ kit::ModelRegistration MakeProfileModel(const agentkit_preview::ModelProfileInpu
   auto model = ConfiguredModel({.model = profile.model, .base_url = profile.base_url, .provider = profile.provider,
       .protocol = profile.protocol, .api_key = environment.empty() ? profile.api_key : std::string{},
       .image_input = profile.image_input, .file_input = profile.file_input,
-      .credential_environment = std::move(environment), .reasoning_summary = profile.reasoning_summary}, {});
+      .credential_environment = std::move(environment), .reasoning_summary = profile.reasoning_summary}, {}, std::move(revision));
   return std::move(model).value();
+}
+
+agentkit_preview::ModelProfileInput ReadModelProfile(const nlohmann::json& record) {
+  auto key = record.value("api_key_reference", std::string{});
+  if (!key.empty() && ModelKeyEnvironment(key).empty()) throw std::invalid_argument("Invalid model API key reference");
+  if (const auto encrypted = record.find("protected_api_key"); encrypted != record.end()) {
+#ifdef _WIN32
+    if (!key.empty()) throw std::invalid_argument("Conflicting model API keys");
+    key = UnprotectModelKey(*encrypted);
+#else
+    throw std::invalid_argument("The model API key was protected on Windows");
+#endif
+  }
+  const auto limit = [&](const char* name) -> std::optional<std::uint64_t> {
+    const auto value = record.find(name);
+    if (value == record.end() || !value->is_number_unsigned()) return {};
+    const auto tokens = value->get<std::uint64_t>();
+    return tokens ? std::optional{tokens} : std::nullopt;
+  };
+  return {.model = record.at("model").get<std::string>(), .base_url = record.at("base_url").get<std::string>(),
+      .protocol = record.at("protocol").get<std::string>(), .provider = record.at("provider").get<std::string>(),
+      .api_key = std::move(key), .image_input = record.value("image_input", false), .file_input = record.value("file_input", false),
+      .reasoning_summary = record.value("reasoning_summary", false),
+      .limits = {limit("context_window"), limit("max_input_tokens"), limit("max_output_tokens")}};
 }
 
 Task<void> LoadModelProfiles(const std::shared_ptr<PreviewService>& service, const File& directory,
@@ -650,33 +683,17 @@ Task<void> LoadModelProfiles(const std::shared_ptr<PreviewService>& service, con
       auto raw = co_await file.ReadStringAsync();
       if (!raw.Succeeded()) throw std::runtime_error("Could not read model profile");
       const auto record = nlohmann::json::parse(raw.Value());
-      const auto reference = record.value("api_key_reference", std::string{});
-      auto environment = ModelKeyEnvironment(reference);
-      if (!reference.empty() && environment.empty()) throw std::invalid_argument("Invalid model API key reference");
-      std::string api_key;
-      if (const auto encrypted = record.find("protected_api_key"); encrypted != record.end()) {
-#ifdef _WIN32
-        if (!environment.empty()) throw std::invalid_argument("Conflicting model API keys");
-        api_key = UnprotectModelKey(*encrypted);
-#else
-        throw std::invalid_argument("The model API key was protected on Windows");
-#endif
+      auto profile = ReadModelProfile(record);
+      std::optional<kit::ModelProviderRef> revision;
+      if (record.contains("profile_id")) {
+        if (!record.at("revision").is_number_unsigned()) throw std::invalid_argument("Invalid model profile revision");
+        revision = kit::ModelProviderRef{{record.at("profile_id").get<std::string>()}, record.at("revision").get<kit::Revision>()};
+        if (revision->id.value.empty() || !revision->version) throw std::invalid_argument("Invalid model profile revision");
       }
-      const auto limit = [&](const char* key) -> std::optional<std::uint64_t> {
-        const auto value = record.find(key);
-        if (value == record.end() || !value->is_number_unsigned()) return {};
-        const auto tokens = value->get<std::uint64_t>();
-        return tokens ? std::optional{tokens} : std::nullopt;
-      };
-      agentkit_preview::ModelLimits limits{limit("context_window"), limit("max_input_tokens"), limit("max_output_tokens")};
-      auto model = MakeProfileModel({.model = record.at("model").get<std::string>(),
-          .base_url = record.at("base_url").get<std::string>(), .protocol = record.at("protocol").get<std::string>(),
-          .provider = record.at("provider").get<std::string>(), .api_key = std::move(api_key),
-          .image_input = record.value("image_input", false), .file_input = record.value("file_input", false),
-          .reasoning_summary = record.value("reasoning_summary", false)},
-          std::move(environment));
+      auto model = MakeProfileModel(profile, ModelKeyEnvironment(profile.api_key), std::move(revision));
       if (std::ranges::find(models, model.ref, &kit::ModelRegistration::ref) == models.end()) {
-        service->run_settings->AddModel(model, {}, limits);
+        service->model_revisions.emplace(model.ref, file);
+        service->run_settings->AddModel(model, {}, profile.limits, true);
         models.push_back(std::move(model));
       }
     } catch (const std::exception&) {
@@ -686,8 +703,18 @@ Task<void> LoadModelProfiles(const std::shared_ptr<PreviewService>& service, con
 }
 
 kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewService> service,
-                                                   agentkit_preview::ModelProfileInput profile) {
+    agentkit_preview::ModelProfileInput profile, std::optional<kit::ModelProviderRef> previous = {}) {
   using Result = kit::AgentResult<kit::ModelProviderRef>;
+  const auto resources = UseService<Resources>();
+  if (service->saving_models) co_return Result::Failure({.code = kit::ErrorCode::Busy,
+      .message = resources->GetString(::app::strings::ui_model_save_in_progress)});
+  service->saving_models = true;
+  const auto saving = std::unique_ptr<bool, void(*)(bool*)>{&service->saving_models, [](bool* flag) { *flag = false; }};
+  if (previous && (service->run_settings->CurrentModel(previous) != previous || !service->model_revisions.contains(*previous))) {
+    co_return Result::Failure({.code = kit::ErrorCode::Conflict, .message = resources->GetString(::app::strings::ui_model_edit_stale)});
+  }
+  if (previous && previous->version == std::numeric_limits<kit::Revision>::max())
+    co_return Result::Failure({.code = kit::ErrorCode::Conflict, .message = resources->GetString(::app::strings::ui_model_edit_revision_limit)});
   profile.model = TrimModelField(std::move(profile.model));
   profile.base_url = TrimModelField(std::move(profile.base_url));
   while (profile.base_url.ends_with('/')) profile.base_url.pop_back();
@@ -696,18 +723,27 @@ kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewServic
   std::string environment;
   try {
     environment = ModelKeyEnvironment(profile.api_key);
-    model = MakeProfileModel(profile, environment);
+    const kit::ModelProviderRef revision = previous ? kit::ModelProviderRef{previous->id, previous->version + 1}
+        : kit::ModelProviderRef{{"preview.model/" + kit::NewCommandId().value}, 1};
+    model = MakeProfileModel(profile, environment, revision);
   } catch (const std::invalid_argument& error) {
     co_return Result::Failure({.code = kit::ErrorCode::InvalidArgument, .message = error.what()});
   }
   const auto existing = service->run_settings->Models(agentkit_preview::GeneralAgent);
-  if (std::ranges::find(existing, model.ref, &agentkit_preview::ModelChoice::ref) != existing.end()) {
+  if (std::ranges::any_of(existing, [&](const auto& choice) {
+        const auto& endpoint = choice.connection;
+        return choice.ref.id != model.ref.id && endpoint.provider == model.endpoint.provider &&
+            endpoint.model == model.endpoint.model && endpoint.protocol == model.endpoint.protocol &&
+            endpoint.base_url == model.endpoint.base_url && choice.capabilities.image_input == profile.image_input &&
+            choice.capabilities.file_input == profile.file_input;
+      })) {
     co_return Result::Failure({.code = kit::ErrorCode::Conflict, .message = "This model and endpoint are already registered."});
   }
   const auto name = kit::NewCommandId().value;
   const auto target = service->model_profiles->Child(name + ".json");
   const auto pending = service->model_profiles->Child(name + ".pending");
-  auto record = nlohmann::json{{"model", profile.model}, {"base_url", profile.base_url},
+  auto record = nlohmann::json{{"profile_id", model.ref.id.value}, {"revision", model.ref.version},
+      {"model", profile.model}, {"base_url", profile.base_url},
       {"protocol", profile.protocol}, {"provider", profile.provider},
       {"image_input", profile.image_input}, {"file_input", profile.file_input}, {"reasoning_summary", profile.reasoning_summary}};
   if (profile.limits.context_window) record["context_window"] = *profile.limits.context_window;
@@ -736,12 +772,53 @@ kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewServic
     if (persist) static_cast<void>(co_await target.DeleteAsync());
     co_return Result::Failure(registered.Error());
   }
-  service->run_settings->AddModel(model, {}, profile.limits);
+  service->run_settings->AddModel(model, {}, profile.limits, true);
+  if (persist) service->model_revisions.emplace(model.ref, target);
+  else service->model_revisions.emplace(model.ref, std::move(profile));
+  if (previous) {
+    for (auto& [id, composer] : service->composers) {
+      auto next = composer.next.Get();
+      if (!next.model || next.model->id != model.ref.id) continue;
+      next.model = model.ref;
+      composer.next = std::move(next);
+    }
+  }
   if (!service->run_settings->DefaultModel(agentkit_preview::CodeAgent)) {
     service->run_settings->SetDefaults(*service->run_settings->DefaultModel(agentkit_preview::GeneralAgent), model.ref);
   }
   service->code_available = true;
   co_return Result::Success(std::move(model.ref));
+}
+
+kit::Async<kit::ModelProviderRef> UpdateModelProfile(std::shared_ptr<PreviewService> service,
+    kit::ModelProviderRef previous, std::string endpoint, std::optional<std::string> new_key, agentkit_preview::ModelLimits limits) {
+  using Result = kit::AgentResult<kit::ModelProviderRef>;
+  const auto resources = UseService<Resources>();
+  const auto found = service->model_revisions.find(previous);
+  if (found == service->model_revisions.end()) co_return Result::Failure({.code = kit::ErrorCode::NotFound,
+      .message = resources->GetString(::app::strings::ui_saved_model_unavailable)});
+  agentkit_preview::ModelProfileInput profile;
+  if (const auto* file = std::get_if<File>(&found->second)) {
+    const auto read_failure = [&] {
+      return Result::Failure({.code = kit::ErrorCode::PersistenceFailure,
+          .message = resources->GetString(::app::strings::ui_model_profile_read_failed)});
+    };
+    auto raw = co_await file->ReadStringAsync();
+    if (!raw.Succeeded()) co_return read_failure();
+    try { profile = ReadModelProfile(nlohmann::json::parse(raw.Value())); }
+    catch (const std::exception&) { co_return read_failure(); }
+  } else {
+    profile = std::get<agentkit_preview::ModelProfileInput>(found->second);
+  }
+  endpoint = TrimModelField(std::move(endpoint));
+  while (endpoint.ends_with('/')) endpoint.pop_back();
+  if (new_key) *new_key = TrimModelField(std::move(*new_key));
+  if (service->run_settings->CurrentModel(previous) == previous && endpoint == profile.base_url &&
+      (!new_key || *new_key == profile.api_key) && limits == profile.limits) co_return Result::Success(std::move(previous));
+  profile.base_url = std::move(endpoint);
+  if (new_key) profile.api_key = std::move(*new_key);
+  profile.limits = std::move(limits);
+  co_return co_await SaveModelProfile(std::move(service), std::move(profile), std::move(previous));
 }
 
 std::optional<kit::ModelRegistration> ConfiguredEnvironmentModel(std::string_view slot = {}) {
@@ -866,6 +943,16 @@ agentkit_preview::AddModelProfile AddModelAction(const std::shared_ptr<PreviewSe
   return {};
 }
 
+agentkit_preview::EditModelProfile EditModelAction(const std::shared_ptr<PreviewService>& service) {
+#ifndef __EMSCRIPTEN__
+  if (service->model_profiles) return [service](kit::ModelProviderRef ref, std::string endpoint,
+      std::optional<std::string> key, agentkit_preview::ModelLimits limits) {
+    return UpdateModelProfile(service, std::move(ref), std::move(endpoint), std::move(key), std::move(limits));
+  };
+#endif
+  return {};
+}
+
 std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<kit::SessionStore> store,
                                               std::vector<kit::ModelRegistration> configured,
                                               agentkit_preview::PresentationFiles files,
@@ -882,8 +969,10 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
   const auto evidence = files.staging.Parent()->Child("workspace-evidence");
   const bool code_available = !configured.empty() || code_model.has_value();
   const bool release_available = code_available && test_runner.has_value();
+  std::ranges::stable_sort(configured, {}, [](const auto& model) { return model.ref.version; });
   const auto model_for = [&configured](const kit::ModelProviderRef& ref) {
-    return std::ranges::find(configured, ref, &kit::ModelRegistration::ref);
+    const auto found = std::find_if(configured.rbegin(), configured.rend(), [&](const auto& model) { return model.ref.id == ref.id; });
+    return found == configured.rend() ? configured.end() : std::prev(found.base());
   };
   const auto daily = preferences.daily_model ? model_for(*preferences.daily_model) : configured.begin();
   const auto general = daily != configured.end() ? daily->ref : agentkit_preview::DemoModel;
@@ -1804,7 +1893,7 @@ View PreviewConversation(kit::AgentId agent, std::shared_ptr<kit::Conversation> 
 std::optional<View> PreviewAttachmentAction(const std::shared_ptr<PreviewService>& service, const kit::AgentId& agent,
     State<kit::UserRunOptions> next, State<kit::AgentChatDraftSources> sources, kit::ModelCapabilities capabilities,
     std::function<void()> changed) {
-  const auto image_model = service->applied_settings->image_model;
+  const auto image_model = service->run_settings->CurrentModel(service->applied_settings->image_model);
   if (image_model && sources->attachments.empty() &&
       service->run_settings->Capabilities(image_model, agent).image_input) {
     auto images = agentkit_preview::AttachmentPicker(service->attachments, sources, {.image_input = true},
@@ -2172,6 +2261,7 @@ View PreviewShell() {
     }
     const auto draft_start = entry.start.Get();
     auto start = draft_start;
+    start.model = service->run_settings->CurrentModel(start.model);
     if (code && !start.model) start.model = service->run_settings->DefaultModel(new_agent);
     entry.creating = true;
     entry.error = "";
@@ -2970,7 +3060,7 @@ View PreviewShell() {
   if (compact && focus_draft.Get() && drawer_style.motion) drawer_style.motion->close = SnapSpec{};
   View settings = settings_available && showing_settings.Get()
       ? agentkit_preview::PreviewSettingsPage(service->settings, service->applied_settings, service->run_settings,
-          *service->settings_file, AddModelAction(service), [showing_settings] { showing_settings = false; })
+          *service->settings_file, AddModelAction(service), EditModelAction(service), [showing_settings] { showing_settings = false; })
       : View(Spacer());
   auto pages = IndexedPages({Column(std::move(content)).With(CrossAlign(CrossAxisAlignment::Stretch)),
       std::move(settings)}, showing_settings.Get() ? 1U : 0U).Key("workbench-main");
@@ -3009,6 +3099,17 @@ ApplicationHook MakePreviewInstaller(std::optional<File> database, bool read_mod
 #if defined(AGENTKIT_PREVIEW_TEST)
 using ConfiguredPreviewDriver = std::function<Task<void>(
     kit::AgentResult<std::shared_ptr<kit::AgentRuntime>>, std::optional<kit::WorkspaceId>, kit::ProjectId)>;
+
+ApplicationHook MakeModelEditingTestInstaller(File database, std::function<Task<void>(
+    kit::AgentResult<std::shared_ptr<kit::AgentRuntime>>, agentkit_preview::EditModelProfile)> drive) {
+  return [database = std::move(database), drive = std::move(drive)](ApplicationContext& context) {
+    auto service = InstallPreview(context, database, true);
+    UseApplicationTaskScope().Launch([service, drive]() -> Task<void> {
+      auto started = co_await WaitForRuntime(service);
+      co_await drive(std::move(started), EditModelAction(service));
+    });
+  };
+}
 
 ApplicationHook MakeRunSettingsTestInstaller(File database, File workspace, std::vector<kit::ModelRegistration> models,
                                             ConfiguredPreviewDriver drive,
