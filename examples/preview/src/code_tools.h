@@ -27,7 +27,7 @@ inline constexpr std::string_view WorkspaceAnswerStage = "workspace-answer";
 
 huxerui::agentkit::Async<bool> AllowsWorkspaceTools(huxerui::agentkit::RunContext run,
     const huxerui::agentkit::AgentId& agent, std::weak_ptr<huxerui::agentkit::AgentRuntime> runtime,
-    const CodeWorkspaces& workspaces, const RunSettings& settings);
+    const RunSettings& settings);
 
 huxerui::agentkit::Async<huxerui::agentkit::RunCompletion> AnswerWithWorkspaceTools(
     huxerui::agentkit::RunContext run, bool tests_configured, bool restore);

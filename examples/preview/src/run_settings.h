@@ -112,7 +112,7 @@ huxerui::agentkit::ToolReviewer ChartExportReviewer(huxerui::File export_folder,
 huxerui::View RunSettingsControls(std::shared_ptr<RunSettings> settings,
     huxerui::State<huxerui::agentkit::UserRunOptions> next, huxerui::agentkit::AgentId agent,
     std::optional<huxerui::agentkit::WorkspaceId> workspace, std::optional<huxerui::File> workspace_root,
-    std::optional<huxerui::agentkit::RunStartBinding> current = {}, std::function<void()> changed = {},
+    std::function<void()> changed = {},
     std::optional<huxerui::View> extra_action = {}, AddModelProfile add_model = {}, bool show_permissions = true);
 
 } // namespace agentkit_preview

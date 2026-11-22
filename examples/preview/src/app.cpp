@@ -11,6 +11,7 @@
 #include "goal_view.h"
 #include "general_workflow.h"
 #include "link_navigation.h"
+#include "local_files.h"
 #include "markdown_images.h"
 #include "presentation_tools.h"
 #include "presentation_view.h"
@@ -58,6 +59,12 @@ namespace kit = huxerui::agentkit;
 
 namespace {
 using namespace std::chrono_literals;
+
+#ifdef __EMSCRIPTEN__
+constexpr bool local_file_tools_available = false;
+#else
+constexpr bool local_file_tools_available = true;
+#endif
 
 constexpr kit::AgentChatLayoutStyle preview_chat_layout{
     .content_width = 0.0F, .chat_bubbles = true, .show_run_activity = true};
@@ -289,6 +296,7 @@ struct PreviewService {
   std::optional<File> exports;
 #endif
   std::shared_ptr<agentkit_preview::RunSettings> run_settings;
+  std::shared_ptr<agentkit_preview::LocalFileAccess> local_files;
   std::optional<File> model_profiles;
   std::map<kit::ModelProviderRef, std::variant<File, agentkit_preview::ModelProfileInput>> model_revisions;
   bool saving_models = false;
@@ -961,6 +969,7 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
                                               std::optional<kit::ModelRegistration> code_model,
                                               std::optional<File> test_runner,
                                               File test_logs, std::shared_ptr<agentkit_preview::RunSettings> settings,
+                                              std::shared_ptr<agentkit_preview::LocalFileAccess> local_files,
                                               std::shared_ptr<agentkit_preview::AttachmentImports> attachments,
                                               std::optional<kit::AgentResult<kit::ModelRegistration>> review_model,
                                               const agentkit_preview::PreviewSettings& preferences,
@@ -987,7 +996,7 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
   auto runtime = kit::AgentRuntime::Create({
       .tasks = tasks,
       .principal = [] { return kit::AgentResult<kit::PrincipalId>::Success(preview_user); },
-      .access = [settings, workspaces, review_user_comparisons](kit::PolicyRequest request) -> kit::Async<kit::PolicyDecision> {
+      .access = [settings, workspaces, local_files, review_user_comparisons](kit::PolicyRequest request) -> kit::Async<kit::PolicyDecision> {
         if (review_user_comparisons && request.capability == kit::Capability::CreateComparison &&
             request.operation != kit::JsonValue{}) {
           co_return kit::AgentResult<kit::PolicyDecision>::Success({kit::AccessDecision::RequireConfirmation, {}});
@@ -997,6 +1006,8 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
           co_return kit::AgentResult<kit::PolicyDecision>::Success({kit::AccessDecision::RequireConfirmation, {}});
         }
         const auto tool = request.tool ? request.tool->id : kit::ToolId{};
+        if (agentkit_preview::IsLocalFileTool(tool))
+          co_return kit::AgentResult<kit::PolicyDecision>::Success(local_files->Decide(request));
         const auto workspace = request.workspace ? workspaces->Find(*request.workspace) : std::nullopt;
         const bool workspace_available = workspace && workspace->NativeFolder();
         if (agentkit_preview::IsWorkspaceTool(tool) && !workspace_available &&
@@ -1016,9 +1027,11 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
       .tool_reviewer = agentkit_preview::ChartExportReviewer(files.exports, std::move(review_model)),
       .tool_resources = [presentations = agentkit_preview::PresentationResources(files, runtime_ref),
                         code = agentkit_preview::CodeResources(workspaces),
+                        local = agentkit_preview::LocalFileResources(workspaces),
                         design = agentkit_preview::DesignChangeResources(runtime_ref),
                         charts = agentkit_preview::ReportChartResources(files.exports)](
                             kit::ToolInvocation invocation) -> kit::Async<std::vector<kit::ResourceAccess>> {
+        if (agentkit_preview::IsLocalFileTool(invocation.tool.id)) co_return co_await local(std::move(invocation));
         if (agentkit_preview::HasDesignTargets(invocation.prepared_targets))
           co_return co_await design(std::move(invocation));
         if (invocation.reverts || (invocation.candidate_artifact && agentkit_preview::HasCodeTargets(invocation.prepared_targets)) ||
@@ -1080,7 +1093,7 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
       kit::RunContext, kit::RunInput, std::optional<kit::RunCheckpoint>)>;
   const auto register_specialist = [&](kit::AgentDefinition definition, std::string deliverable, SpecialistWorkflow workflow) {
     auto start = [agent = definition.ref.id, deliverable = std::move(deliverable), workflow = std::move(workflow),
-                  runtime_ref, workspaces, settings, workspace_tests](
+                  runtime_ref, settings, workspace_tests](
                      kit::RunContext run, kit::RunInput input,
                      std::optional<kit::RunCheckpoint> checkpoint) -> kit::Async<kit::RunCompletion> {
       using Result = kit::AgentResult<kit::RunCompletion>;
@@ -1089,7 +1102,7 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
       const bool user_request = input.trigger == kit::RunTrigger::UserInput || input.trigger == kit::RunTrigger::Retry ||
           input.trigger == kit::RunTrigger::Regenerate;
       if (!checkpoint && user_request && !input.artifact_action) {
-        auto allowed = co_await agentkit_preview::AllowsWorkspaceTools(run, agent, *runtime_ref, *workspaces, *settings);
+        auto allowed = co_await agentkit_preview::AllowsWorkspaceTools(run, agent, *runtime_ref, *settings);
         if (!allowed.Succeeded()) co_return Result::Failure(allowed.Error());
         if (allowed.Value()) {
           auto route = co_await run.CompleteAsync({
@@ -1119,6 +1132,9 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
       .instructions = instructions(std::string(selection_instructions)), .model = selected, .requires_model = {.text_stream = true},
       .budget = {.tokens = 6000, .model_turns = 2, .context_bytes = 128 << 10, .deadline = std::chrono::seconds(90)}}}));
   Require(agentkit_preview::RegisterCodeTools(registered, evidence, workspaces));
+#ifndef __EMSCRIPTEN__
+  Require(agentkit_preview::RegisterLocalFileTools(registered, std::move(local_files)));
+#endif
   if (code || can_add_models) {
     auto code_provider = code ? code->id : selected;
     if (code_model) {
@@ -1145,7 +1161,7 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
     const bool tests_configured = test_runner.has_value();
     register_workspace_agent({
         .definition = {.ref = {agentkit_preview::CodeAgent, 1}, .display_name = "Code assistant",
-            .instructions = instructions("Work within the current workspace and respect its approvals."),
+            .instructions = instructions("Use the linked project directory when specified. Respect the approvals for local paths."),
             .model = std::move(code_provider), .tools = std::move(tools), .context = {agentkit_preview::CodeEditorContext},
             .collaboration_targets = std::move(targets),
             .capabilities = {kit::Capability::ReadGoal, kit::Capability::ReadProject, kit::Capability::ManageTask,
@@ -1271,6 +1287,8 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
   context.Provide(selection);
   const auto tasks = UseApplicationTaskScope();
   auto file = database ? *database : DefaultGanWorkDatabase();
+  service->local_files = std::make_shared<agentkit_preview::LocalFileAccess>(
+      database ? *file.Parent() : UseApplication().Directories().temporary_directory);
   std::optional<File> temporary;
 #ifdef __EMSCRIPTEN__
   temporary = UseApplication().Directories().temporary_directory;
@@ -1302,6 +1320,17 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
         const auto data = file.Parent().value();
         auto models = std::move(additional_models);
         std::optional<kit::AgentResult<kit::ModelRegistration>> reviewer;
+#ifndef __EMSCRIPTEN__
+        service->settings_file = data.Child("settings.json");
+        auto preferences = co_await agentkit_preview::ReadPreviewSettings(*service->settings_file);
+        if (preferences.Succeeded()) {
+          service->settings = preferences.Value();
+          service->local_files->Apply(preferences.Value().file_access);
+          service->applied_settings = std::move(preferences).Value();
+        } else {
+          service->model_configuration_error = preferences.Error().message;
+        }
+#endif
         if (read_model_configuration) {
 #ifdef __EMSCRIPTEN__
           auto configured = ConfiguredBrowserModels();
@@ -1310,14 +1339,6 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
           service->model_configuration_error = std::move(configured.error);
 #else
           models = ConfiguredModels();
-          service->settings_file = data.Child("settings.json");
-          auto preferences = co_await agentkit_preview::ReadPreviewSettings(*service->settings_file);
-          if (preferences.Succeeded()) {
-            service->settings = preferences.Value();
-            service->applied_settings = std::move(preferences).Value();
-          } else {
-            service->model_configuration_error = preferences.Error().message;
-          }
           auto profiles = data.Child("models");
           co_await LoadModelProfiles(service, profiles, models);
           service->model_profiles = std::move(profiles);
@@ -1356,7 +1377,7 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
         service->attachments = std::make_shared<agentkit_preview::AttachmentImports>(data.Child("attachments"));
         service->runtime = MakeRuntime(tasks, std::move(persisted), std::move(models), std::move(files),
                                       service->workspaces, service->worktrees, std::move(code_model),
-                                      std::move(test_runner), data.Child("test-logs"), service->run_settings,
+                                      std::move(test_runner), data.Child("test-logs"), service->run_settings, service->local_files,
                                       service->attachments, std::move(reviewer), service->applied_settings.Get(), review_user_comparisons,
                                       service->model_profiles.has_value());
         selection->runtime = service->runtime;
@@ -1373,7 +1394,7 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
             }
             auto attachments = PreviewAttachmentAction(host, selection_agent, next, sources, caps);
             return agentkit_preview::RunSettingsControls(host->run_settings, next, selection_agent, {}, {},
-                std::move(current), {}, std::move(attachments), AddModelAction(host), false);
+                {}, std::move(attachments), AddModelAction(host), false);
           }, [settings](const kit::RunStartBinding& binding) {
             return UseService<Resources>()->GetString(settings->ModelLabel(binding.model));
           }};
@@ -2065,6 +2086,7 @@ View PreviewShell() {
   const auto picker = UseService<FilePicker>();
   const auto dialogs = UseDialog();
   const auto tasks = UseTaskScope();
+  Lifecycle([access = service->local_files, picker] { access->SetDirectoryPicker(picker); }, picker);
   const auto sessions = UseState(std::shared_ptr<const kit::SessionPage>{});
   const auto loading_sessions = UseState(false);
   const auto pending_page = UseState(std::shared_ptr<const kit::PendingInteractionPage>{});
@@ -2256,8 +2278,11 @@ View PreviewShell() {
         (entry.text->text.empty() && entry.sources->attachments.empty())) return;
     const auto code = new_agent == agentkit_preview::CodeAgent;
     if (code) {
-      const auto workspace = workspace_id ? service->workspaces->Find(*workspace_id) : std::nullopt;
-      if (!service->code_available.Get() || !workspace || !workspace->NativeFolder()) return;
+      if (!service->code_available.Get()) return;
+      if (!local_file_tools_available) {
+        const auto workspace = workspace_id ? service->workspaces->Find(*workspace_id) : std::nullopt;
+        if (!workspace || !workspace->NativeFolder()) return;
+      }
     }
     const auto draft_start = entry.start.Get();
     auto start = draft_start;
@@ -2317,9 +2342,6 @@ View PreviewShell() {
     if (group) drafts.Get()->try_emplace(scope).first->second.group = std::move(group);
     folder = std::move(scope);
     show_draft();
-  };
-  const auto begin_draft = [start_draft, workspace_id](std::optional<std::string> group) {
-    start_draft(workspace_id, std::move(group));
   };
   const auto use_workspace = [start_draft, workspace_expansion](std::optional<kit::WorkspaceId> id) {
     if (id) {
@@ -2620,7 +2642,7 @@ View PreviewShell() {
   std::vector<View> sidebar_items;
   if (!custom_preview_chrome) sidebar_items.push_back(PreviewWordmark(colors));
   sidebar_items.push_back(NavigationAction(::app::strings::ui_new_conversation, NavigationSymbol::New,
-      [begin_draft] { begin_draft(std::nullopt); }, true,
+      [start_draft] { start_draft(std::nullopt, {}); }, true,
       !selected->conversation && !showing_pending.Get() && !showing_settings.Get()).Key("new-conversation"));
   sidebar_items.push_back(Column{
       NavigationAction(::app::strings::ui_open_folder, NavigationSymbol::Folder, pick_workspace, can_open_folder && !choosing_folder.Get())
@@ -2699,7 +2721,7 @@ View PreviewShell() {
                 if (auto picker = PreviewAttachmentAction(service, summary.agent.id, next, sources, caps, save_preference))
                   actions.push_back(std::move(*picker));
                 auto controls = agentkit_preview::RunSettingsControls(service->run_settings, next, summary.agent.id, summary.workspace,
-                    folder ? folder->NativeFolder() : std::nullopt, std::move(current),
+                    folder ? folder->NativeFolder() : std::nullopt,
                     std::move(save_preference), Flow(std::move(actions)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center)),
                     AddModelAction(service));
                 if (error.Get().empty()) return controls;
@@ -2720,6 +2742,7 @@ View PreviewShell() {
         if (tool.id == ReadCodeFiles || tool.id == ReadWorkspaceFiles) return resources->GetString(::app::strings::ui_activity_read_files);
         if (tool.id == ListWorkspaceFiles) return resources->GetString(::app::strings::ui_activity_list_files);
         if (tool.id == SearchWorkspaceFiles) return resources->GetString(::app::strings::ui_activity_search_files);
+        if (const auto label = LocalFileToolLabel(tool.id)) return resources->GetString(*label);
         if (IsCodePatchTool(tool.id)) return resources->GetString(::app::strings::ui_activity_apply_changes);
         if (tool.id == RunCodeTests || tool.id == RunWorkspaceTests) return resources->GetString(::app::strings::ui_activity_workspace_tests);
         return {};
@@ -2856,8 +2879,8 @@ View PreviewShell() {
     std::string status = draft_error->empty() ? error.Get() : draft_error.Get();
     if (code && status.empty()) {
       if (!service->code_available.Get()) status = UseString(::app::strings::ui_add_a_model_to_use_the_code);
-      else if (!workspace) status = UseString(::app::strings::ui_open_a_local_folder_to_start);
-      else if (!native_workspace) status = UseString(::app::strings::ui_code_changes_and_tests_require_a_desktop);
+      else if (!local_file_tools_available && !workspace) status = UseString(::app::strings::ui_open_a_local_folder_to_start);
+      else if (!local_file_tools_available && !native_workspace) status = UseString(::app::strings::ui_code_changes_and_tests_require_a_desktop);
     }
     const std::array assistants{::app::strings::ui_general, ::app::strings::ui_ppt, ::app::strings::ui_code, ::app::strings::ui_design};
     const auto chosen_group = draft_group.Get();
@@ -2935,11 +2958,12 @@ View PreviewShell() {
         else draft_action = std::move(*picker);
       }
       controls = agentkit_preview::RunSettingsControls(service->run_settings, new_start, new_agent, workspace_id,
-          native_workspace, {}, {}, std::move(draft_action), AddModelAction(service));
+          native_workspace, {}, std::move(draft_action), AddModelAction(service));
     }
     const auto send_available = [ready, draft, new_sources, code, service, native_workspace] {
+      const bool code_ready = service->code_available.Get() && (local_file_tools_available || native_workspace.has_value());
       return ready.Get() && !draft->composition && (!draft->text.empty() || !new_sources->attachments.empty()) &&
-          (!code || (service->code_available.Get() && native_workspace));
+          (!code || code_ready);
     };
     const auto placeholder = code ? ::app::strings::ui_describe_the_change : assistant.Get() == 1 ?
         ::app::strings::ui_describe_your_presentation : assistant.Get() == 3 ?
@@ -3060,7 +3084,11 @@ View PreviewShell() {
   if (compact && focus_draft.Get() && drawer_style.motion) drawer_style.motion->close = SnapSpec{};
   View settings = settings_available && showing_settings.Get()
       ? agentkit_preview::PreviewSettingsPage(service->settings, service->applied_settings, service->run_settings,
-          *service->settings_file, AddModelAction(service), EditModelAction(service), [showing_settings] { showing_settings = false; })
+          *service->settings_file, AddModelAction(service), EditModelAction(service), [showing_settings] { showing_settings = false; },
+          [service](agentkit_preview::LocalFilePermissions permissions) -> kit::Async<void> {
+            service->local_files->Apply(std::move(permissions));
+            co_return co_await service->runtime->RefreshAccessAsync();
+          })
       : View(Spacer());
   auto pages = IndexedPages({Column(std::move(content)).With(CrossAlign(CrossAxisAlignment::Stretch)),
       std::move(settings)}, showing_settings.Get() ? 1U : 0U).Key("workbench-main");

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "run_settings.h"
+#include "local_files.h"
 
 #include <huxerui/theme.h>
 
@@ -16,6 +17,7 @@ struct PreviewSettings {
   std::optional<huxerui::agentkit::ModelProviderRef> daily_model;
   std::optional<huxerui::agentkit::ModelProviderRef> image_model;
   std::optional<huxerui::agentkit::ModelProviderRef> review_model;
+  LocalFilePermissions file_access;
 
   bool operator==(const PreviewSettings&) const = default;
 };
@@ -26,6 +28,7 @@ std::string WithReplyPreferences(std::string instructions, const PreviewSettings
 huxerui::ThemeBrightness PreviewBrightness(PreviewAppearance appearance, huxerui::ThemeBrightness system);
 
 huxerui::View PreviewSettingsPage(huxerui::State<PreviewSettings> current, huxerui::State<PreviewSettings> applied,
-    std::shared_ptr<RunSettings> models, huxerui::File file, AddModelProfile add_model, EditModelProfile edit_model, std::function<void()> close);
+    std::shared_ptr<RunSettings> models, huxerui::File file, AddModelProfile add_model, EditModelProfile edit_model,
+    std::function<void()> close, std::function<huxerui::agentkit::Async<void>(LocalFilePermissions)> apply_file_access);
 
 } // namespace agentkit_preview

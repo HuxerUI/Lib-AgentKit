@@ -276,7 +276,7 @@ kit::Async<kit::RunCompletion> RunCode(
   if (checkpoint && checkpoint->stage == WorkspaceAnswerStage && checkpoint->schema_version == 1)
     co_return co_await AnswerWithWorkspaceTools(context, checkpoint->state == JsonValue{true}, true);
   if (!checkpoint && !input.work_request && !input.artifact_action && input.trigger != kit::RunTrigger::ForkComparison) {
-    auto allowed = co_await AllowsWorkspaceTools(context, CodeAgent, runtime, *workspaces, *settings);
+    auto allowed = co_await AllowsWorkspaceTools(context, CodeAgent, runtime, *settings);
     if (!allowed.Succeeded()) co_return Completion::Failure(allowed.Error());
     if (allowed.Value()) co_return co_await AnswerWithWorkspaceTools(context, tests_configured, false);
   }

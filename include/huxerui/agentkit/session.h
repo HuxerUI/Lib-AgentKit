@@ -1664,6 +1664,7 @@ public:
   Async<CommandReceipt> CancelAsync(CommandId command, RunId run);
 
   /// @brief Starts a new attempt from an eligible terminal root Run under current authorization.
+  /// The retry uses the original model registration and requires that revision to remain available.
   /// Calls that may have written require reconciliation. A known applied write prevents replay as a retry.
   /// @param command Stable ID for the new attempt.
   /// @param source Eligible terminal root Run in this conversation.

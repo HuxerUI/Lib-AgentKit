@@ -915,7 +915,9 @@ Async<Receipt<RunAccepted>> RuntimeState::Restart(std::shared_ptr<RuntimeState> 
   if (original->second.artifact_action)
     co_return Fail<Receipt<RunAccepted>>(ErrorCode::Unsupported, "Reopen the artifact and submit its action again");
   const auto version = session.summary.binding_revision;
-  auto binding = co_await self->ResolveStart(session, user, {});
+  UserRunOptions start;
+  if (!regenerate) start.model = original->second.view.model;
+  auto binding = co_await self->ResolveStart(session, user, std::move(start));
   if (!binding.Succeeded()) co_return AgentResult<Receipt<RunAccepted>>::Failure(binding.Error());
   auto input = original->second.input;
   if (!regenerate) {

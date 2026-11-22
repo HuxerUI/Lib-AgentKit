@@ -22,7 +22,7 @@ constexpr std::size_t instruction_limit = 4096;
 const std::array appearance_labels{::app::strings::ui_dark, ::app::strings::ui_light, ::app::strings::ui_follow_system};
 const std::array tone_labels{::app::strings::ui_default, ::app::strings::ui_concise, ::app::strings::ui_friendly, ::app::strings::ui_formal};
 
-enum class SettingsSection { Models, Personalization, Appearance, Storage };
+enum class SettingsSection { Models, Personalization, Appearance, Permissions, Storage };
 
 struct SettingsCategory {
   SettingsSection section;
@@ -34,6 +34,7 @@ const std::array categories{
     SettingsCategory{SettingsSection::Models, ::app::strings::ui_models, "settings-section-models"},
     SettingsCategory{SettingsSection::Personalization, ::app::strings::ui_personalization, "settings-section-personalization"},
     SettingsCategory{SettingsSection::Appearance, ::app::strings::ui_appearance, "settings-section-appearance"},
+    SettingsCategory{SettingsSection::Permissions, ::app::strings::ui_permissions, "settings-section-permissions"},
     SettingsCategory{SettingsSection::Storage, ::app::strings::ui_storage, "settings-section-storage"},
 };
 
@@ -136,9 +137,17 @@ kit::Async<PreviewSettings> ReadPreviewSettings(File file) {
     if (appearance >= appearance_labels.size() || tone >= tone_labels.size() || instructions.size() > instruction_limit) {
       throw std::invalid_argument("Invalid Preview settings");
     }
+    LocalFilePermissions file_access;
+    if (const auto access = doc.find("file_access"); access != doc.end()) {
+      file_access.full_access = access->at("full_access").get<bool>();
+      file_access.directories = access->at("directories").get<std::vector<std::string>>();
+      file_access.revision = access->at("revision").get<std::string>();
+      if (file_access.revision.empty() || file_access.directories.size() > 64)
+        throw std::invalid_argument("Invalid file access settings");
+    }
     co_return Result::Success({.appearance = static_cast<PreviewAppearance>(appearance), .tone = static_cast<ReplyTone>(tone),
         .instructions = std::move(instructions), .daily_model = ReadModel(doc, "daily_model"),
-        .image_model = ReadModel(doc, "image_model"), .review_model = ReadModel(doc, "review_model")});
+        .image_model = ReadModel(doc, "image_model"), .review_model = ReadModel(doc, "review_model"), .file_access = std::move(file_access)});
   } catch (const std::exception&) {
     co_return Result::Failure({.code = kit::ErrorCode::InvalidArgument, .message = "The saved Preview settings are invalid."});
   }
@@ -153,7 +162,9 @@ kit::Async<void> SavePreviewSettings(File file, PreviewSettings settings) {
   auto contents = Json{{"appearance", static_cast<std::size_t>(settings.appearance)},
       {"tone", static_cast<std::size_t>(settings.tone)}, {"instructions", std::move(settings.instructions)},
       {"daily_model", ModelRecord(settings.daily_model)}, {"image_model", ModelRecord(settings.image_model)},
-      {"review_model", ModelRecord(settings.review_model)}}.dump();
+      {"review_model", ModelRecord(settings.review_model)}, {"file_access", {
+        {"full_access", settings.file_access.full_access}, {"directories", std::move(settings.file_access.directories)},
+        {"revision", std::move(settings.file_access.revision)}}}}.dump();
   if (!co_await temporary.WriteStringAsync(std::move(contents)) || !co_await temporary.MoveToAsync(file, true)) {
     static_cast<void>(co_await temporary.DeleteAsync());
     co_return Result::Failure({.code = kit::ErrorCode::PersistenceFailure, .message = "Could not save Preview settings."});
@@ -184,13 +195,15 @@ ThemeBrightness PreviewBrightness(PreviewAppearance appearance, ThemeBrightness 
 
 [[huxerui::composable]]
 View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> applied,
-    std::shared_ptr<RunSettings> models, File file, AddModelProfile add_model, EditModelProfile edit_model, std::function<void()> close) {
+    std::shared_ptr<RunSettings> models, File file, AddModelProfile add_model, EditModelProfile edit_model, std::function<void()> close,
+    std::function<kit::Async<void>(LocalFilePermissions)> apply_file_access) {
   const auto draft = UseState(current.Get());
   const auto instructions = UseState(TextEditingValue::FromText(current->instructions));
   const auto busy = UseState(false);
   const auto error = UseState(std::string{});
   const auto section = UseState(SettingsSection::Models);
   const auto dialog = UseDialog();
+  const auto picker = UseService<FilePicker>();
   const auto tasks = UseTaskScope();
   const auto theme = UseTheme();
   const auto& colors = theme.colors;
@@ -200,15 +213,25 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
   auto fields = UseEnvironment<TextFieldStyle>();
   fields.show_label = false;
   const auto secondary = PreviewSecondaryButton(UseEnvironment<ButtonStyle>(), colors);
-  const auto save = [current, draft, file, tasks, error, busy] {
+  const auto save = [current, draft, file, tasks, error, busy, apply_file_access] {
     if (busy.Get()) return;
     busy = true;
     error = "";
-    tasks.Launch([current, file, value = draft.Get(), busy, error]() -> Task<void> {
+    tasks.Launch([current, draft, file, value = draft.Get(), busy, error, apply_file_access]() mutable -> Task<void> {
+      const bool access_changed = value.file_access != current->file_access;
+      if (access_changed) value.file_access.revision = kit::NewCommandId().value;
       auto saved = co_await SavePreviewSettings(file, value);
+      if (saved.Succeeded()) {
+        if (access_changed) {
+          auto updated = co_await apply_file_access(value.file_access);
+          if (!updated.Succeeded()) error = updated.Error().message;
+          auto current_draft = draft.Get();
+          current_draft.file_access.revision = value.file_access.revision;
+          draft = std::move(current_draft);
+        }
+        current = std::move(value);
+      } else error = saved.Error().message;
       busy = false;
-      if (saved.Succeeded()) current = std::move(value);
-      else error = saved.Error().message;
     });
   };
   const auto pending_restart = current->daily_model != applied->daily_model || current->image_model != applied->image_model ||
@@ -316,6 +339,62 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
               }).Key("settings-theme"), stack_fields, colors),
     }, colors));
     break;
+  case SettingsSection::Permissions: {
+    const auto revise = [draft](bool full_access) {
+      auto value = draft.Get();
+      value.file_access.full_access = full_access;
+      draft = std::move(value);
+    };
+    auto access = Checkbox(::app::strings::ui_local_full_access, draft->file_access.full_access)
+        .OnChanged([dialog, revise](bool enabled) {
+          if (!enabled) { revise(false); return; }
+          ShowPreviewDialog(dialog, DialogFactory{[revise](DialogContext dialog) {
+            const auto color = UseTheme().colors;
+            const auto style = UseEnvironment<ButtonStyle>();
+            return PreviewFormDialog(::app::strings::ui_local_full_access,
+                Text(::app::strings::ui_local_full_access_confirmation).With(Padding(EdgeInsets::Symmetric(20.0F, 14.0F))),
+                Row{Spacer(), ProvideEnvironment(PreviewSecondaryButton(style, color),
+                    Button(::app::strings::ui_cancel).OnClick([dialog] { dialog.Dismiss(); })),
+                    ProvideEnvironment(PreviewPrimaryButton(style, color),
+                    Button(::app::strings::ui_allow_full_access).OnClick([dialog, revise] { revise(true); dialog.Dismiss(); }))}
+                    .With(Spacing(8.0F)), color, 510.0F);
+          }});
+        }).With(Enabled(!busy.Get())).Key("settings-local-full-access");
+    const auto add_directory = [draft, busy, error, tasks, picker] {
+      if (busy.Get() || draft->file_access.directories.size() >= 64) return;
+      busy = true;
+      tasks.Launch([draft, busy, error, picker]() -> Task<void> {
+        const auto picked = co_await picker->OpenDirectoryAsync(true);
+        busy = false;
+        if (!picked) co_return;
+        const auto file = picked->AsFile();
+        if (!file) co_return;
+        auto directory = LocalDirectory(*file);
+        if (!directory.Succeeded()) { error = directory.Error().message; co_return; }
+        auto value = draft.Get();
+        if (std::ranges::find(value.file_access.directories, directory.Value()) == value.file_access.directories.end())
+          value.file_access.directories.push_back(std::move(directory).Value());
+        draft = std::move(value);
+      });
+    };
+    std::vector<View> rows{SettingsRow(::app::strings::ui_local_full_access, ::app::strings::ui_local_full_access_help,
+        std::move(access), stack_fields, colors)};
+    rows.push_back(SettingsRow(::app::strings::ui_authorized_directories, ::app::strings::ui_authorized_directories_help,
+        Row{ProvideEnvironment(secondary, Button(::app::strings::ui_add_directory).OnClick(add_directory)
+            .With(Enabled(!busy.Get() && draft->file_access.directories.size() < 64)).Key("settings-add-authorized-directory"))},
+        stack_fields, colors));
+    for (const auto& directory : draft->file_access.directories) {
+      rows.push_back(Row{Text(directory).LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow(), Tooltip(directory)),
+          ProvideEnvironment(secondary, Button(::app::strings::ui_revoke_directory).OnClick([draft, directory] {
+            auto value = draft.Get();
+            std::erase(value.file_access.directories, directory);
+            draft = std::move(value);
+          }).With(Enabled(!busy.Get())))}
+          .With(Padding(EdgeInsets::Symmetric(16.0F, 8.0F)), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center)).Key(directory));
+    }
+    content.push_back(SettingsPanel(std::move(rows), colors).Key("settings-file-access"));
+    break;
+  }
   case SettingsSection::Storage:
     content.push_back(SettingsPanel({
         Column{

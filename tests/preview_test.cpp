@@ -267,6 +267,14 @@ void TapFormButton(UiTest& preview, const char* label) {
   TapControl(preview, ButtonText(label), label);
 }
 
+void StartProjectDraft(UiTest& preview, const File& workspace) {
+  const auto label = "New conversation in " + workspace.Name();
+  const auto action = preview.FindSemantics(UiSemanticSelector::AllOf(
+      UiSemanticSelector::Role(SemanticRole::Button), UiSemanticSelector::Label(label)));
+  Wait(preview, [&] { return action.Exists() && action.One().enabled && !action.One().offscreen; }, label.c_str());
+  action.PerformSemanticAction({SemanticActionKind::Activate, {}});
+}
+
 void TapWorkspaceAction(UiTest& preview, const char* label) {
   auto trigger = preview.FindSemantics(UiSemanticSelector::AllOf(
       UiSemanticSelector::Role(SemanticRole::Button), UiSemanticSelector::Label("Workspace actions")));
@@ -1779,7 +1787,7 @@ void VerifyConversationNavigation(const File& root) {
     composer.ReplaceText("Keep my conversation draft");
     NavigationGroupLabel(ui, "Plans").Tap();
     Wait(ui, [&] { return !design_row.Exists(); }, "The grouped conversation remained in the root list");
-    ui.Find(UiSelector::Key("new-conversation")).Tap();
+    StartProjectDraft(ui, workspace);
     ChooseDraftAssistant(ui, "PPT");
     SendNewConversation(ui, deck);
     Wait(ui, [&] { return ui.Find(ButtonText("Draft outline")).Exists(); }, "The slide conversation did not request its brief");
@@ -3461,6 +3469,11 @@ public:
   kit::ModelCapabilities Capabilities() const override { return {.text_stream = true, .structured_output = true}; }
 
   kit::Async<std::unique_ptr<kit::ModelTurnStream>> StartTurnAsync(kit::ModelTurnRequest request) override {
+    const bool retry_fixture = std::ranges::any_of(request.items, [](const auto& item) {
+      const auto* content = std::get_if<kit::ModelContent>(&item);
+      const auto* body = content ? std::get_if<std::string>(&content->body) : nullptr;
+      return body && *body == "Retry on the original model";
+    });
     const bool supplement = std::ranges::any_of(request.items, [](const auto& item) {
       const auto* content = std::get_if<kit::ModelContent>(&item);
       const auto* body = content ? std::get_if<std::string>(&content->body) : nullptr;
@@ -3472,12 +3485,17 @@ public:
       return content && content->role == kit::ModelContent::Role::Context && body && *body == "Configuration";
     });
     calls_->push_back({request.provider, request.run, supplement, quote});
+    if (retry_fixture && !std::exchange(failed_, true)) {
+      co_return kit::AgentResult<std::unique_ptr<kit::ModelTurnStream>>::Failure(
+          {.code = kit::ErrorCode::ProviderFailure, .message = "Fixture model failed"});
+    }
     co_return kit::AgentResult<std::unique_ptr<kit::ModelTurnStream>>::Success(std::make_unique<SettingsPatchStream>(label_));
   }
 
 private:
   std::string label_;
   std::shared_ptr<std::vector<SettingsTurn>> calls_;
+  bool failed_ = false;
 };
 
 std::vector<kit::ModelRegistration> SettingsModels(std::shared_ptr<std::vector<SettingsTurn>> calls) {
@@ -3521,7 +3539,7 @@ void VerifyPreviewRunSettings(const File& root) {
     preview.Pump(250ms);
   };
   const auto grant = [&] {
-    choose("run-permissions", "Full Access");
+    choose("run-permissions", "Allow project edits");
     auto dialog = preview.Find(ButtonText("Allow"));
     Wait(preview, [&] { return dialog.Exists(); }, "Full Access did not ask for explicit confirmation");
     dialog.Tap();
@@ -3557,8 +3575,8 @@ void VerifyPreviewRunSettings(const File& root) {
 
   choose("run-model", "Model B");
   choose("run-permissions", "Auto Review");
-  Wait(preview, [&] { return ShowsText(preview, "This run  \xc2\xb7  Model A  \xc2\xb7  Ask"); },
-       "Changing future settings changed the active binding");
+  if (preview.Find(UiSelector::Key("active-run-settings")).Exists())
+    throw std::runtime_error("The composer displayed a separate active binding");
   enter("Keep the current file scope", "Send");
   Wait(preview, [&] { return ShowsText(preview, "Waiting to apply"); }, "Direct supplement was not accepted by the active run");
   choose("send-mode", "Queue");
@@ -3568,7 +3586,7 @@ void VerifyPreviewRunSettings(const File& root) {
 
   choose("run-model", "Model C");
   grant();
-  choose("run-permissions", "Full Access");
+  choose("run-permissions", "Allow project edits");
   if (preview.Find(ButtonText("Allow")).Exists())
     throw std::runtime_error("Selecting an already confirmed Full Access mode asked again");
   preview.Pump(16ms);
@@ -3669,7 +3687,7 @@ void VerifyPreviewRunSettings(const File& root) {
   });
   Wait(preview, [&] { return saved; }, "Idle configuration changes were not committed");
 
-  preview.Find(UiSelector::Key("new-conversation")).Tap();
+  StartProjectDraft(preview, workspace);
   ChooseDraftAssistant(preview, "Code");
   choose("run-model", "Model A");
   SendNewConversation(preview, "Configuration supplement recovery");
@@ -3685,6 +3703,33 @@ void VerifyPreviewRunSettings(const File& root) {
   const auto restore = preview.Find(UiSelector::Key("restore-supplement"));
   Wait(preview, [&] { return restore.Exists() && restore.One().enabled && ShowsText(preview, "Not applied"); },
        "The stopped run did not make its original supplement recoverable", 25s);
+
+  StartProjectDraft(preview, workspace);
+  ChooseDraftAssistant(preview, "Code");
+  choose("run-model", "Model B");
+  SendNewConversation(preview, "Retry on the original model");
+  scope();
+  auto retry = preview.Find(UiSelector::Key("agent-chat-retry"));
+  Wait(preview, [&] { return retry.Exists() && retry.One().enabled && ShowsText(preview, "Fixture model failed"); },
+      "The model failure did not offer retry");
+  const auto failed_run = calls->back().run;
+  choose("run-model", "Model C");
+  auto retry_action = preview.FindSemantics(UiSemanticSelector::AllOf(
+      UiSemanticSelector::Role(SemanticRole::Button), UiSemanticSelector::Label("Retry")));
+  retry_action.PerformSemanticAction({SemanticActionKind::Activate, {}});
+  try {
+    Wait(preview, [&] { return preview.Find(UiSelector::Key("code-scope")).Exists(); }, "The retry did not resume file scope");
+  } catch (...) {
+    static_cast<void>(root.Child("retry.snapshot").WriteString(preview.CaptureSnapshot().ToString()));
+    throw;
+  }
+  if (!ShowsText(preview, "Model C") || preview.Find(UiSelector::Key("active-run-settings")).Exists())
+    throw std::runtime_error("The retry changed or annotated the next model selector");
+  scope();
+  Wait(preview, [&] { return calls->back().run != failed_run; }, "The retry did not call a model");
+  if (calls->back().model != models[1].ref)
+    throw std::runtime_error("The retry did not use the failed run's model");
+  approve_patch();
 }
 
 void VerifyRunSettingsReload(const File& root) {
@@ -4080,7 +4125,7 @@ void StartWorkspaceRelease(const Application& application, const File& config, c
   constexpr auto transition_timeout = 25s;
   UiTest preview(application, {.viewport = {1080.0F, 920.0F}, .resource_provider = std::make_shared<PreviewTestResources>()});
   PrepareReleaseTarget(preview);
-  preview.Find(UiSelector::Key("new-conversation")).Tap();
+  StartProjectDraft(preview, *config.Parent());
   SendNewConversation(preview, std::move(objective));
   auto goal = preview.Find(ButtonText("Goal"));
   Wait(preview, [&] { return goal.Exists(); }, "Release conversation did not open");
@@ -6007,7 +6052,7 @@ void VerifyCodeEditorBaseline(const File& directory, EditorBaselineCase scenario
       auto permissions = preview.Find(UiSelector::Key("run-permissions"));
       Wait(preview, [&] { return permissions.Exists() && permissions.One().in_viewport; }, "Code permission control did not mount");
       ClickPreviewMouse(preview, permissions.One().visible_bounds);
-      auto full_access = preview.Find(UiSelector::Text("Full Access"));
+      auto full_access = preview.Find(UiSelector::Text("Allow project edits"));
       Wait(preview, [&] { return full_access.Exists() && full_access.One().enabled; }, "Full Access was unavailable");
       full_access.Tap();
       TapFormButton(preview, "Allow");
@@ -6666,7 +6711,7 @@ public:
       events.emplace_back(kit::ModelTextDelta{"Workspace tools unavailable."});
     } else {
       const std::array names{"list_files", "search_files", "read_files", "apply_patch"};
-      if (request.tools.size() != names.size() || std::ranges::any_of(names, [&](const auto* name) {
+      if (std::ranges::any_of(names, [&](const auto* name) {
             return std::ranges::find(request.tools, name, &kit::ModelToolSpec::name) == request.tools.end();
           })) co_return Result::Failure({.code = kit::ErrorCode::InvalidState, .message = "Unexpected workspace tool offer"});
       const std::array arguments{
@@ -6749,13 +6794,13 @@ void VerifyWorkspaceTools(const File& root) {
   exercise("Find config.txt and change mode from disabled to enabled.");
   for (const auto* assistant : {"Code", "PPT", "Design"}) {
     if (!config.WriteString("mode=disabled\n")) throw std::runtime_error("Could not reset the workspace");
-    ui.Find(UiSelector::Key("new-conversation")).Tap();
+    StartProjectDraft(ui, workspace);
     ChooseDraftAssistant(ui, assistant);
     exercise("Inspect the workspace and update the mode in config.txt.");
   }
 
   if (!config.WriteString("mode=disabled\n")) throw std::runtime_error("Could not reset the workspace");
-  ui.Find(UiSelector::Key("new-conversation")).Tap();
+  StartProjectDraft(ui, workspace);
   ChooseDraftAssistant(ui, "Code");
   SendNewConversation(ui, timeline_layout_prompt);
   const auto history = ui.Find(UiSelector::Key("agent-chat-history"));
@@ -6820,6 +6865,248 @@ void VerifyWorkspaceTools(const File& root) {
       "Jump to latest did not return to the streaming reply");
   released->store(3);
   Wait(ui, [&] { return !ui.Find(UiSelector::Key("agent-chat-stop")).Exists(); }, "The layout check did not finish");
+}
+
+class LocalFileModel final : public kit::ModelProvider {
+public:
+  LocalFileModel(File directory, std::shared_ptr<std::atomic<bool>> read_pending, std::shared_ptr<std::atomic<bool>> release_read)
+      : directory_(std::move(directory)), read_pending_(std::move(read_pending)), release_read_(std::move(release_read)) {}
+
+  kit::ModelCapabilities Capabilities() const override {
+    return {.text_stream = true, .tool_calls = true, .structured_output = true};
+  }
+
+  kit::Async<std::unique_ptr<kit::ModelTurnStream>> StartTurnAsync(kit::ModelTurnRequest request) override {
+    using Result = kit::AgentResult<std::unique_ptr<kit::ModelTurnStream>>;
+    using nlohmann::json;
+    std::vector<kit::ModelEvent> events;
+    auto finish = kit::ModelFinishReason::Completed;
+    if (request.output_schema) {
+      events.emplace_back(kit::ModelStructuredOutput{agentkit_preview::DecodeJson({{"route", "answer"}})});
+    } else {
+      std::string prompt;
+      const kit::ModelToolResult* last = nullptr;
+      std::size_t index = 0;
+      for (const auto& item : request.items) {
+        if (const auto* text = std::get_if<kit::ModelContent>(&item); text && text->role == kit::ModelContent::Role::User) {
+          const auto* value = std::get_if<std::string>(&text->body);
+          if (value && value->starts_with("Local files:")) { prompt = *value; index = 0; last = nullptr; }
+        } else if (const auto* tool = std::get_if<kit::ModelToolResult>(&item)) {
+          last = tool;
+          ++index;
+        }
+      }
+      const auto note = directory_.Child("new").Child("original.txt");
+      const auto copy = directory_.Child("new").Child("copy.txt");
+      const auto renamed = directory_.Child("new").Child("renamed.txt");
+      std::vector<std::pair<std::string, json>> steps;
+      const bool picker = prompt.starts_with("Local files: pick directory");
+      const bool cancel_picker = prompt == "Local files: pick directory and cancel";
+      if (picker) {
+        steps = {{"choose_directory", {{"reason", "Select the folder in the Windows directory picker fixture."}}}};
+      } else if (prompt == "Local files: edit and search") {
+        steps = {
+            {"create_directory", {{"path", directory_.Child("new").Path()}}},
+            {"create_file", {{"path", note.Path()}, {"content", "initial content\n"}}},
+            {"find_files", {{"path", directory_.Path()}, {"query", "initial content"}, {"match_contents", true}}},
+            {"read_file", {{"path", note.Path()}, {"start_line", 1}, {"end_line", 1}}},
+            {"edit_file", {{"path", note.Path()}, {"old_text", "initial"}, {"new_text", "edited"}}},
+            {"copy_file", {{"path", note.Path()}, {"destination", copy.Path()}}},
+            {"move_file", {{"path", note.Path()}, {"destination", renamed.Path()}}},
+            {"delete_file", {{"path", copy.Path()}}},
+        };
+      } else if (prompt == "Local files: temporary output") {
+        steps = {{"task_directory", json::object()}, {"create_file", {}}};
+        if (index == 1 && last && last->value) {
+          const auto path = agentkit_preview::EncodeJson(*last->value).at("path").get<std::string>();
+          steps.back().second = {{"path", File(path).Child("draft.txt").Path()}, {"content", "temporary output"}};
+        }
+      } else if (prompt == "Local files: build in an empty project") {
+        steps = {{"list_files", {{"directory", ""}}},
+            {"create_file", {{"path", "index.html"}, {"content", "<!doctype html><title>Empty project fixture</title>\n"}}}};
+      } else {
+        steps = {{"read_file", {{"path", renamed.Path()}}}};
+      }
+      const bool denied = prompt == "Local files: check revoked access";
+      if (last) {
+        if (cancel_picker ? last->value.has_value() : denied ? !last->error || last->value : last->error.has_value())
+          co_return Result::Failure({.code = kit::ErrorCode::InvalidState, .message = "Unexpected local file outcome"});
+        if (picker && !cancel_picker && (!last->value ||
+            File(agentkit_preview::EncodeJson(*last->value).at("path").get<std::string>()) != directory_))
+          co_return Result::Failure({.code = kit::ErrorCode::InvalidState, .message = "The native picker returned another path"});
+        if (!denied && prompt == "Local files: edit and search" && index == 3 &&
+            (!last->value || agentkit_preview::EncodeJson(*last->value).at("entries").size() != 1))
+          co_return Result::Failure({.code = kit::ErrorCode::InvalidState, .message = "The new file was not found"});
+        if (!denied && !picker && index == (steps.size() == 1 ? 1U : 4U) &&
+            (!last->value || agentkit_preview::EncodeJson(*last->value).at("text") !=
+                (steps.size() == 1 ? "edited content\n" : "initial content\n")))
+          co_return Result::Failure({.code = kit::ErrorCode::InvalidState, .message = "The file read returned the wrong contents"});
+      }
+      if (index == steps.size()) {
+        events.emplace_back(kit::ModelTextDelta{denied ? "Revoked file was not read." : "Local file request completed."});
+      } else {
+        const auto& [name, args] = steps.at(index);
+        if (denied) {
+          read_pending_->store(true);
+          while (!release_read_->load() && !request.stop.stop_requested()) co_await Delay(2ms);
+        }
+        if (std::ranges::find(request.tools, name, &kit::ModelToolSpec::name) == request.tools.end())
+          co_return Result::Failure({.code = kit::ErrorCode::InvalidState, .message = "Standalone assistant did not receive " + name});
+        const auto call = request.turn.value + "/local";
+        events.emplace_back(kit::ModelToolStarted{call, name});
+        events.emplace_back(kit::ModelToolArguments{call, args.dump()});
+        events.emplace_back(kit::ModelToolFinished{call});
+        finish = kit::ModelFinishReason::ToolCalls;
+      }
+    }
+    events.emplace_back(kit::ModelFinished{finish});
+    co_return Result::Success(std::make_unique<WorkspaceToolStream>(std::move(events)));
+  }
+
+private:
+  File directory_;
+  std::shared_ptr<std::atomic<bool>> read_pending_;
+  std::shared_ptr<std::atomic<bool>> release_read_;
+};
+
+void VerifyLocalFiles(const File& root) {
+  const auto directory = root.Child("files");
+  const auto project = root.Child("empty-project");
+  if (!directory.CreateDirectories() || !project.CreateDirectories())
+    throw std::runtime_error("Could not initialize the local files fixture");
+  const auto settings = root.Child("settings.json");
+  WriteFixture(settings, nlohmann::json{{"file_access", {{"full_access", false}, {"directories", {directory.Path()}},
+      {"revision", "fixture"}}}}.dump());
+  const auto read_pending = std::make_shared<std::atomic<bool>>(false);
+  const auto release_read = std::make_shared<std::atomic<bool>>(false);
+  kit::ModelRegistration model{{{"local-files-fixture"}, 1}, {"fixture", "local-files", "script", {}},
+      std::make_shared<LocalFileModel>(directory, read_pending, release_read)};
+  std::shared_ptr<kit::AgentRuntime> runtime;
+  std::optional<TaskScope> tasks;
+  const Application application{App, {.application_hooks = {
+      MakeRunSettingsTestInstaller(root.Child("sessions.sqlite3"), project, {std::move(model)},
+          [&](auto started, auto, auto) -> Task<void> {
+            runtime = LiveTake(std::move(started));
+            tasks = UseApplicationTaskScope();
+            co_return;
+          })}}};
+  UiTest ui(application, {.viewport = {1160.0F, 900.0F}, .resource_provider = std::make_shared<PreviewTestResources>()});
+  const auto open = ui.Find(UiSelector::Key("open-settings"));
+  const auto settings_panel = ui.Find(UiSelector::Key("settings-file-access"));
+  const auto full_access = ui.Find(UiSelector::Key("settings-local-full-access"));
+  const auto permissions = [&] {
+    open.Tap();
+    ui.Find(UiSelector::Key("settings-section-permissions")).Tap();
+    Wait(ui, [&] { return settings_panel.Exists(); }, "File permissions did not mount");
+  };
+  const auto save_and_close = [&] {
+    const auto save = ui.Find(ButtonText("Save settings"));
+    try {
+      TapFormButton(ui, "Save settings");
+      Wait(ui, [&] { return save.Exists() && !save.One().enabled; }, "File access was not saved");
+    } catch (...) {
+      WriteFixture(root.Child("permissions.snapshot"), ui.CaptureSnapshot().ToString());
+      throw;
+    }
+    ui.Find(UiSelector::Key("close-settings")).Tap();
+  };
+  Wait(ui, [&] { return runtime && open.Exists(); }, "Settings did not mount");
+  permissions();
+  full_access.Tap();
+  TapFormButton(ui, "Allow");
+  Wait(ui, [&] { return !ui.Find(ButtonText("Allow")).Exists(); }, "The access confirmation did not close");
+  ui.Pump(250ms);
+  save_and_close();
+  ui.Find(UiSelector::Key("new-conversation")).Tap();
+  ChooseDraftAssistant(ui, "Code");
+  SendNewConversation(ui, "Local files: edit and search");
+  Wait(ui, [&] { return ShowsText(ui, "Local file request completed."); }, "Standalone file tool sequence did not complete", 20s);
+  const auto written = directory.Child("new");
+  CheckText(written.Child("renamed.txt"), "edited content\n");
+  if (written.Child("original.txt").Exists() || written.Child("copy.txt").Exists())
+    throw std::runtime_error("Local move or delete did not settle");
+  std::optional<kit::SessionSummary> summary;
+  tasks->Launch([&]() -> Task<void> {
+    const auto page = LiveTake(co_await runtime->Sessions().ListAsync({}, {}));
+    if (!page.sessions.empty()) summary = page.sessions.front();
+  });
+  Wait(ui, [&] { return summary.has_value(); }, "The standalone session was not saved");
+  if (summary->workspace) throw std::runtime_error("The file tools bound the standalone conversation to a workspace");
+
+  permissions();
+  full_access.Tap();
+  save_and_close();
+  ui.Find(UiSelector::Key("new-conversation")).Tap();
+  SendNewConversation(ui, "Local files: use authorized directory");
+  Wait(ui, [&] { return ShowsText(ui, "Local file request completed."); }, "A second session could not use the global directory grant");
+
+  ui.Find(UiSelector::Key("new-conversation")).Tap();
+  SendNewConversation(ui, "Local files: check revoked access");
+  Wait(ui, [&] { return read_pending->load(); }, "The next read did not reach the model");
+  permissions();
+  TapFormButton(ui, "Remove access");
+  save_and_close();
+  release_read->store(true);
+  auto approve = ui.Find(ButtonText("Approve"));
+  Wait(ui, [&] { return approve.Exists() && approve.One().in_viewport; }, "Reading a revoked directory did not require approval");
+  TapFormButton(ui, "Deny");
+  Wait(ui, [&] { return ShowsText(ui, "Revoked file was not read."); }, "The denied read reached the model");
+
+  ui.Find(UiSelector::Key("new-conversation")).Tap();
+  SendNewConversation(ui, "Local files: temporary output");
+  Wait(ui, [&] { return ShowsText(ui, "Local file request completed."); }, "The run could not create private temporary output");
+  const auto folders = root.Child("ganwork-task-files").ListChildren();
+  if (!folders.Succeeded() || folders.Value().size() != 1)
+    throw std::runtime_error("The run did not get a private temporary directory");
+  CheckText(folders.Value().front().Child("draft.txt"), "temporary output");
+
+  StartProjectDraft(ui, project);
+  SendNewConversation(ui, "Local files: build in an empty project");
+  Wait(ui, [&] { return approve.Exists() && approve.One().in_viewport; }, "Creating a file in the empty project did not request approval");
+  const auto html = project.Child("index.html");
+  if (html.Exists()) throw std::runtime_error("The empty-project file was created before approval");
+  approve.Tap();
+  Wait(ui, [&] { return html.Exists() && ShowsText(ui, "Local file request completed."); }, "The empty project did not receive the file");
+  CheckText(html, "<!doctype html><title>Empty project fixture</title>\n");
+}
+
+void VerifyNativeDirectoryPicker(const File& root) {
+  const auto folder = root.Child("choose-this-folder");
+  if (!folder.CreateDirectories()) throw std::runtime_error("Could not create the directory picker fixture");
+  std::exception_ptr failure;
+  bool done = false;
+  kit::ModelRegistration model{{{"directory-picker-fixture"}, 1}, {"fixture", "directory-picker", "script", {}},
+      std::make_shared<LocalFileModel>(folder, std::make_shared<std::atomic<bool>>(false), std::make_shared<std::atomic<bool>>(false))};
+  const Application application{App, {.window = {.title = "GanWork Directory Picker Acceptance"},
+      .application_hooks = {MakeRunSettingsTestInstaller(root.Child("sessions.sqlite3"), root, {std::move(model)},
+          [&, folder](auto started, auto, auto) -> Task<void> {
+            const auto app = UseApplication();
+            try {
+              auto runtime = LiveTake(std::move(started));
+              const auto title = UseService<Resources>()->GetString(::app::strings::ui_local_choose_directory);
+              for (const auto* prompt : {"Local files: pick directory", "Local files: pick directory and cancel"}) {
+                const auto created = LiveTake(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
+                    .options = {.agent = agentkit_preview::CodeAgent, .title = prompt}, .initial = kit::SendInput{.text = prompt}}));
+                const auto id = std::get<kit::SessionCreated>(created.outcome).session;
+                const auto session = LiveTake(co_await runtime->Sessions().OpenAsync(id));
+                const auto watching = co_await LiveObserve(session);
+                const auto approval = co_await LiveInteraction(session, title);
+                std::cout << (prompt == std::string_view{"Local files: pick directory"} ? "Select " + folder.Path() : "Cancel the picker")
+                          << std::endl;
+                co_await LiveApprove(session, approval);
+                co_await LiveRunCompleted(session, 120s);
+                if (session->Snapshot()->summary.workspace)
+                  throw std::runtime_error("Directory selection bound the standalone conversation");
+              }
+              LiveTake(co_await runtime->CloseAsync());
+              done = true;
+            } catch (...) { failure = std::current_exception(); }
+            app.Quit();
+          })}}};
+  static_cast<void>(RunApplication());
+  if (failure) std::rethrow_exception(failure);
+  if (!done) throw std::runtime_error("The directory picker acceptance did not finish");
+  std::cout << "The native picker returned the selected path and resumed after cancellation without binding a workspace.\n";
 }
 
 void VerifyLiveWorkspaceRead(const File& root) {
@@ -8578,6 +8865,19 @@ void VerifyLocalization(const File& root) {
 } // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 3 && std::string_view(argv[1]) == "--native-directory-picker") {
+    try {
+      VerifyNativeDirectoryPicker(File(std::filesystem::absolute(std::filesystem::u8path(argv[2])).u8string()));
+      return 0;
+    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+  }
+  if (argc == 2 && std::string_view(argv[1]) == "--local-files") {
+    const auto path = std::filesystem::temp_directory_path() / ("ganwork-local-files-" + kit::NewCommandId().value);
+    try {
+      VerifyLocalFiles(File(path.u8string()));
+      return 0;
+    } catch (const std::exception& error) { std::cerr << error.what() << "\nFixture: " << path.string() << '\n'; return 1; }
+  }
   if (argc == 4 && std::string_view(argv[1]) == "--model-editing") {
     try {
       const auto root = std::filesystem::absolute(std::filesystem::u8path(argv[2]));

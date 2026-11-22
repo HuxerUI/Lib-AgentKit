@@ -96,7 +96,7 @@ const ModelBrand* FindModelBrand(const std::string& model) {
 StringVariant ProfileLabel(const std::optional<kit::ExecutionProfileRef>& profile) {
   if (!profile || *profile == AskProfile) return ::app::strings::ui_ask;
   if (*profile == ReviewProfile) return ::app::strings::ui_auto_review;
-  if (profile->id.value.starts_with(full_access_prefix)) return ::app::strings::ui_full_access;
+  if (profile->id.value.starts_with(full_access_prefix)) return ::app::strings::ui_approve_project_edits;
   return ::app::strings::ui_unavailable_permissions;
 }
 
@@ -745,7 +745,7 @@ View RunOptionTrigger(std::string value, StringResource label, std::string key, 
 
 [[huxerui::composable]]
 View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserRunOptions> next, kit::AgentId agent,
-    std::optional<kit::WorkspaceId> workspace, std::optional<File> workspace_root, std::optional<kit::RunStartBinding> current,
+    std::optional<kit::WorkspaceId> workspace, std::optional<File> workspace_root,
     std::function<void()> changed, std::optional<View> extra_action, AddModelProfile add_model, bool show_permissions) {
   const auto model_menu = UseMenu();
   const auto permission_menu = UseMenu();
@@ -770,8 +770,6 @@ View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserR
       selected != choices.end() ? selected->name : effective_model ? UseString(::app::strings::ui_unavailable_model) :
       UseString(::app::strings::ui_select_model);
   const auto effective_profile = next->execution_profile.value_or(AskProfile);
-  const bool next_model = current && effective_model != current->model;
-  const bool next_permission = show_permissions && current && effective_profile != current->execution_profile.value_or(AskProfile);
   const bool full_access = workspace && workspace_root;
   const bool full_access_selected = full_access && settings->HasFullAccess(effective_profile, workspace);
   const auto select_model = [next, changed](kit::ModelProviderRef ref) {
@@ -808,7 +806,7 @@ View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserR
     permission_menu.Show(permission_anchor, {
         MenuItem(::app::strings::ui_ask, [set] { set(AskProfile); }).Checked(effective_profile == AskProfile),
         MenuItem(::app::strings::ui_auto_review, [set] { set(ReviewProfile); }).Checked(effective_profile == ReviewProfile),
-        MenuItem(::app::strings::ui_full_access, [dialogs, settings, workspace, workspace_root, set, full_access_selected] {
+        MenuItem(::app::strings::ui_approve_project_edits, [dialogs, settings, workspace, workspace_root, set, full_access_selected] {
           if (!workspace || !workspace_root || full_access_selected) return;
           ShowPreviewDialog(dialogs, DialogFactory{[settings, workspace = *workspace, root = *workspace_root, set](DialogContext dialog) {
             const auto colors = UseTheme().colors;
@@ -831,9 +829,7 @@ View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserR
     }, {.placement = {AnchorSide::Above, AnchorAlignment::Start}});
   };
   auto permission = effective_profile.id.value.starts_with(full_access_prefix) && !full_access_selected
-      ? UseString(::app::strings::ui_confirm_full_access) : UseString(ProfileLabel(effective_profile));
-  if (next_model) model += std::string(separator) + UseString(::app::strings::ui_next);
-  if (next_permission) permission += std::string(separator) + UseString(::app::strings::ui_next);
+      ? UseString(::app::strings::ui_confirm_project_edits) : UseString(ProfileLabel(effective_profile));
   const auto permission_ink = full_access_selected ? colors.on_primary_container : colors.on_surface_variant;
   std::vector<View> controls{
       RunOptionTrigger(std::move(model), ::app::strings::ui_model, "run-model", model_anchor, choose_model,
@@ -849,12 +845,7 @@ View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserR
     style.minimum_height = 32.0F;
     controls.push_back(ProvideEnvironment(style, std::move(*extra_action)));
   }
-  auto row = Flow(std::move(controls)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center));
-  if (next_model || next_permission) return Column{std::move(row),
-      Text(UseString(::app::strings::ui_this_run) + separator + settings->Describe(*current, *UseService<Resources>()), TextRole::Label)
-          .With(Foreground(colors.on_surface_variant)).Key("active-run-settings")}
-      .With(Spacing(2.0F), CrossAlign(CrossAxisAlignment::Stretch));
-  return row;
+  return Flow(std::move(controls)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center));
 }
 
 } // namespace agentkit_preview

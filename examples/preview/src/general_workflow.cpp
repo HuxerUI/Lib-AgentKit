@@ -289,7 +289,7 @@ kit::Async<kit::RunCompletion> RunGeneral(kit::RunContext run, kit::RunInput inp
   }
   const bool release = route == WorkspaceRelease;
   if (route != "design-briefing" && !release) {
-    auto allowed = co_await AllowsWorkspaceTools(run, GeneralAgent, runtime, *workspaces, *settings);
+    auto allowed = co_await AllowsWorkspaceTools(run, GeneralAgent, runtime, *settings);
     if (!allowed.Succeeded()) co_return Completion::Failure(allowed.Error());
     if (allowed.Value()) co_return co_await AnswerWithWorkspaceTools(run, tests_configured, false);
     auto reply = co_await run.CompleteAsync({.instruction = std::string(GeneralAnswerInstruction)});
