@@ -41,6 +41,7 @@
 #include <thread>
 
 huxerui::View App();
+std::size_t PreviewShellCompositionCountForTest();
 huxerui::View DetachedArtifactReview(std::shared_ptr<huxerui::agentkit::Conversation> conversation,
     std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime, huxerui::agentkit::AgentId agent,
     huxerui::agentkit::AgentChatReviewRequest request, agentkit_preview::PresentationReviewPages initial_pages,
@@ -165,8 +166,10 @@ UiSelector ButtonText(const char* label) {
     return UiSelector::Key(std::string("chat-send/") + label);
   if (label == std::string_view("New group")) return UiSelector::Key("new-group");
   if (label == std::string_view("Goal")) return UiSelector::Key("conversation-goal");
+  if (label == std::string_view("Close goal")) return UiSelector::Key("goal-close");
   if (label == std::string_view("Compare alternatives")) return UiSelector::Key("comparison-entry");
   if (label == std::string_view("Back to comparison")) return UiSelector::Key("comparison-return");
+  if (label == std::string_view("Back to conversation")) return UiSelector::Key("back-to-conversation");
   if (label == std::string_view("Jump to latest")) return UiSelector::Key("jump-to-latest");
   return UiSelector::AllOf(UiSelector::Type<Button>(), UiSelector::Text(label));
 }
@@ -698,6 +701,13 @@ void ApproveAndReviseDesign(const Application& application, const std::filesyste
       composer.Exists() && composer.One().in_viewport; }, "The desktop goal did not open beside the conversation");
   click("Set goal");
   auto objective = preview.Find(UiSelector::Key("goal-objective"));
+  Wait(preview, [&] { return objective.Exists() && objective.One().focused; }, "The goal editor did not focus its objective");
+  const auto advanced = goal_panel_view.Find(UiSelector::Key("goal-advanced"));
+  const auto budget = goal_panel_view.Find(UiSelector::Key("goal-budget-tokens"));
+  advanced.Tap();
+  Wait(preview, [&] { return budget.Exists(); }, "Goal advanced settings did not reveal budget controls");
+  advanced.Tap();
+  Wait(preview, [&] { return !budget.Exists(); }, "Goal advanced settings did not collapse");
   objective.Tap();
   objective.ReplaceText("Review compact preferences");
   auto conditions = preview.Find(UiSelector::Key("goal-conditions"));
@@ -1668,7 +1678,14 @@ void VerifyConversationNavigation(const File& root) {
     Wait(ui, [&] { return permission_summary.Exists() &&
         permission_summary.One().value == "Auto Review"; }, "The workspace permissions were not applied");
     FocusPreviewEditor(ui, draft_input, "The workspace draft did not receive focus");
+    ui.Pump(200ms);
+    const auto before_typing = PreviewShellCompositionCountForTest();
+    draft_input.ReplaceText("W");
+    ui.Pump(32ms);
     draft_input.ReplaceText(workspace_text);
+    ui.Pump(32ms);
+    if (PreviewShellCompositionCountForTest() != before_typing)
+      throw std::runtime_error("Typing in a new draft recomposed the workbench");
 
     workspace_choice.Tap({.device_kind = PointerDeviceKind::Mouse});
     try {
@@ -2439,8 +2456,11 @@ void VerifyComposerIme(const File& root) {
   if (!composing || composing->composition != TextRange{3, 5} || composing->selection != TextSelection{5, 4})
     throw std::runtime_error("The composer did not retain the UTF-16 composition and selection");
   if (send.One().enabled) throw std::runtime_error("Active Run allows provisional text to be sent");
+  const auto before_delta = PreviewShellCompositionCountForTest();
   released->store(1);
   Wait(ui, [&] { return ShowsText(ui, "The model is streaming another delta"); }, "The gated model delta did not render");
+  if (PreviewShellCompositionCountForTest() != before_delta)
+    throw std::runtime_error("A text delta with unchanged navigation recomposed the workbench");
   if (!ShowsText(ui, "Render") || !ShowsText(ui, "Pass") || ShowsText(ui, "```text"))
     throw std::runtime_error("The streaming Markdown did not render the table and code as formatted content");
   const auto streamed = ui.ActiveTextInput();
@@ -2715,7 +2735,7 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
   Wait(ui, [&] { return source_refs.has_value(); }, "Side chat source refs were not available");
   if (*source_refs != expected) throw std::runtime_error("Side chat lost the exact Markdown source version or UTF-8 ranges");
 
-  pane.Find(ButtonText("Close")).Tap();
+  pane.Find(UiSelector::Key("side-chat-close")).Tap();
   auto composer = ui.Find(UiSelector::Key("composer"));
   Wait(ui, [&] { return !pane.Exists() && composer.Exists() && remove.Exists(); }, "Closing side chat lost the quoted draft");
   const auto submit_quote = [&](std::string message, const std::vector<kit::SourceSlice>& slices) {
@@ -2843,7 +2863,7 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
     } else if (!pane.Find(UiSelector::Key("side-chat-composer")).Exists() || question.Exists()) {
       throw std::runtime_error("Reversing the range did not reopen the side chat for the same source slices");
     }
-    pane.Find(ButtonText("Close")).Tap();
+    pane.Find(UiSelector::Key("side-chat-close")).Tap();
     TapFormButton(ui, "Quote");
     Wait(ui, [&] { return remove.Exists() && ShowsText(ui, range_quote); }, "The quote did not preserve the extended rendered range");
     submit_quote(reverse ? "Use the backward Markdown range" : "Use the forward Markdown range", extended);
@@ -3176,7 +3196,7 @@ void VerifyReviewApproval(const File& root) {
       !ui.FindSemantics(UiSemanticSelector::Label("Review config.txt")).Exists()) {
     throw std::runtime_error("The approval attachments did not display their file names");
   }
-  opener.Tap();
+  TapControl(ui, ReviewCard("Review attachment 1"), "The first approval attachment was not visible", "agent-chat-history", -80.0F);
   auto patch = ui.Find(UiSelector::Key("artifact-text"));
   auto title = ui.Find(UiSelector::Key("artifact-review-title"));
   auto tabs = ui.Find(UiSelector::Key("review-attachments"));
@@ -4565,13 +4585,25 @@ void VerifyForkReview(const File& directory, PublicationInterruption scenario = 
     TapReviewCard(ui, "Review attachment 2");
     Wait(ui, [&] { return ShowsText(ui, "Compact navigation"); }, "The approval did not open the selected board");
     TapFormButton(ui, "Back to conversation");
+    const auto opener = ui.Find(ReviewCard("Review attachment 2"));
+    Wait(ui, [&] { return opener.Exists() && opener.Find(UiSelector::Focused(true)).Exists(); },
+        "Returning from the board did not restore the approval attachment focus");
     if (scenario == PublicationInterruption::Design) {
       interrupt_publication(design_criteria, selected);
       return;
     }
-    TapFormButton(ui, "Approve");
-    Wait(ui, [&] { return target->Snapshot()->artifacts.size() == 2 && !target->Snapshot()->summary.active_run; },
-        "The approved candidate did not update the target board");
+    ui.Find(UiSelector::Key("agent-chat-history")).ScrollBy({0.0F, 96.0F});
+    const auto approve = ui.Find(ButtonText("Approve"));
+    Wait(ui, [&] { return approve.Exists() && approve.One().in_viewport && approve.One().enabled; },
+        "The design adoption approval did not return to view");
+    ClickPreviewMouse(ui, approve.One().visible_bounds);
+    try {
+      Wait(ui, [&] { return target->Snapshot()->artifacts.size() == 2 && !target->Snapshot()->summary.active_run; },
+          "The approved candidate did not update the target board");
+    } catch (...) {
+      static_cast<void>(directory.Child("comparison-approval.snapshot").WriteString(ui.CaptureSnapshot().ToString()));
+      throw;
+    }
     bool verified = false;
     tasks->Launch([&]() -> Task<void> {
       try {
@@ -7709,7 +7741,7 @@ void VerifyMessageSideChat(const Application& application) {
   side_chat.Tap();
   auto question = preview.Find(UiSelector::Key("side-chat-question"));
   auto pane = preview.Find(UiSelector::Key("side-chat-pane"));
-  const auto close_side = pane.Find(ButtonText("Close"));
+  const auto close_side = pane.Find(UiSelector::Key("side-chat-close"));
   Wait(preview, [&] { return pane.Exists() && question.Exists() && question.One().focused &&
       question.One().bounds.width >= pane.One().bounds.width - 64.0F &&
       source.One().in_viewport && composer.One().in_viewport &&
@@ -7731,7 +7763,10 @@ void VerifyMessageSideChat(const Application& application) {
   const auto initial_handles = splitters();
   if (initial_handles.size() != 2) throw std::runtime_error("The wide workbench did not expose two resize handles");
   const auto initial_left_divider = initial_handles.front().bounds.x;
+  const auto before_resize = PreviewShellCompositionCountForTest();
   drag(0, 36.0F);
+  if (PreviewShellCompositionCountForTest() != before_resize)
+    throw std::runtime_error("Resizing the sidebar recomposed the workbench");
   const auto moved_handles = splitters();
   if (moved_handles.size() != 2 || moved_handles.front().bounds.x < initial_left_divider + 30.0F)
     throw std::runtime_error("Dragging the left divider did not resize navigation");
@@ -8030,7 +8065,7 @@ void VerifyLiveSettings(const File& root, const std::string& url, const std::str
     const auto save_button = ui.Find(UiSelector::Key("settings-save")).One().bounds;
     const auto back_button = ui.Find(UiSelector::Key("close-settings")).One().bounds;
     if (std::abs(form.x + form.width - save_button.x - save_button.width) > 2.0F ||
-        std::abs(form.x + form.width - back_button.x - back_button.width) > 2.0F)
+        std::abs(form.x - back_button.x) > 2.0F)
       throw std::runtime_error("The settings actions did not align with the form");
     const auto navigation = ui.Find(UiSelector::Key("workbench-navigation"));
     const auto settings = ui.Find(UiSelector::Key("preview-settings"));
@@ -8275,6 +8310,32 @@ void VerifyLocalization(const File& root) {
     const auto scroll = ui.Find(UiSelector::Key("settings-scroll")).One().bounds;
     if (content.width < scroll.width - 80.0F || content.x + content.width > scroll.x + scroll.width)
       throw std::runtime_error("The settings content did not use the available pane width");
+    const auto title = ui.Find(UiSelector::Key("settings-title")).One().bounds;
+    const auto back = ui.Find(UiSelector::Key("close-settings"));
+    const auto catalog = ui.Find(UiSelector::Key("settings-model-list")).One().bounds;
+    const auto add_action = add.One().bounds;
+    const auto back_action = back.One().bounds;
+    const auto back_label = package.GetString(::app::strings::ui_back_to_conversations, configuration);
+    if (!ui.FindSemantics(UiSemanticSelector::AllOf(UiSemanticSelector::Role(SemanticRole::Button),
+            UiSemanticSelector::Label(back_label))).Exists() || back_action.x + back_action.width > title.x ||
+        add_action.y + add_action.height > catalog.y || std::abs(add_action.x + add_action.width - catalog.x - catalog.width) > 2.0F)
+      throw std::runtime_error("The settings back or model actions did not align with their headings");
+    const auto hover = [&](Rect bounds) {
+      ui.SendPointer({.type = PointerEventType::Move, .pointer_id = 1,
+          .position = {bounds.x + bounds.width * 0.5F, bounds.y + bounds.height * 0.5F}, .device_kind = PointerDeviceKind::Mouse});
+    };
+    hover(title);
+    ui.Pump(700ms);
+    const auto idle = ui.CaptureSnapshot();
+    hover(back_action);
+    ui.Pump(80ms);
+    const auto pointed = ui.CaptureSnapshot();
+    if (pointed != idle) throw std::runtime_error("Hovering on the settings back arrow changed the rendered surface: " + pointed.Diff(idle));
+    ui.Find(UiSelector::Key("settings-section-personalization")).Tap();
+    const auto instructions = ui.Find(UiSelector::Key("settings-instructions"));
+    Wait(ui, [&] { return instructions.Exists() && instructions.One().bounds.height >= 100.0F; },
+        "Personal instructions did not provide room for several lines");
+    categories.Tap();
     add.Tap();
     const auto field = ui.FindSemantics(UiSemanticSelector::Label(api_key));
     Wait(ui, [&] { return field.Count() == 1 && field.One().placeholder == placeholder && field.One().secure; },

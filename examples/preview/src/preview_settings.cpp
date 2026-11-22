@@ -95,8 +95,8 @@ View SettingsPanel(std::vector<View> rows, const ColorScheme& colors) {
 
 [[huxerui::composable]]
 View SettingsCategoryLink(SettingsCategory category, State<SettingsSection> active) {
-  const auto colors = UseTheme().colors;
-  const auto hovered = UseState(false);
+  const auto theme = UseTheme();
+  const auto& colors = theme.colors;
   const auto select = [active, section = category.section] { active = section; };
   const bool selected = active.Get() == category.section;
   return Row{
@@ -110,10 +110,11 @@ View SettingsCategoryLink(SettingsCategory category, State<SettingsSection> acti
         if (event.key != Key::Enter && event.key != Key::Space) return false;
         select();
         return true;
-      }).On<ViewEvents::Hover>([hovered](const HoverEvent& event) { hovered = event.type != HoverEventType::Leave; })
+      })
       .With(Focusable{}, Padding(EdgeInsets::Symmetric(10.0F, 0.0F)), Frame{.height = 38.0F}, Spacing(7.0F),
           CrossAlign(CrossAxisAlignment::Center), CornerRadius(9.0F),
-          Background(selected ? colors.primary_container : hovered.Get() ? colors.surface_container_high : Color::Transparent()),
+          Background(selected ? colors.primary_container : Color::Transparent()), PreviewRowIndication(theme, 9.0F),
+          PointerCursor(PointerCursorKind::Hand),
           Semantics{.role = SemanticRole::Button, .label = category.title, .selected = selected});
 }
 
@@ -190,12 +191,12 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
   const auto section = UseState(SettingsSection::Models);
   const auto dialog = UseDialog();
   const auto tasks = UseTaskScope();
-  const auto colors = UseTheme().colors;
+  const auto theme = UseTheme();
+  const auto& colors = theme.colors;
   const auto viewport = UseViewportClass();
   const bool compact = viewport == ViewportClass::Compact;
   const bool stack_fields = viewport != ViewportClass::Expanded;
   auto fields = UseEnvironment<TextFieldStyle>();
-  fields.show_label = false;
   fields.show_label = false;
   const auto secondary = PreviewSecondaryButton(UseEnvironment<ButtonStyle>(), colors);
   const auto save = [current, draft, file, tasks, error, busy] {
@@ -216,8 +217,27 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
   std::vector<View> links;
   for (const auto& category : categories) {
     links.push_back(SettingsCategoryLink(category, section).Key(category.key));
-    if (category.section == section.Get()) content.push_back(Text(category.title, TextRole::Title)
-        .Style({Font::System(22.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}));
+    if (category.section != section.Get()) continue;
+    auto title = Text(category.title, TextRole::Title)
+        .Style({Font::System(22.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}).Key("settings-section-title");
+    if (category.section == SettingsSection::Models && add_model) {
+      auto action_style = UseEnvironment<ChipStyle>();
+      action_style.background = Color::Transparent();
+      action_style.border = Border{Color::Transparent()};
+      action_style.label_style = {Font::System(13.0F).WithWeight(FontWeight::Medium), colors.primary};
+      action_style.corner_radii = CornerRadii{7.0F};
+      action_style.minimum_height = 34.0F;
+      action_style.icon_size = 16.0F;
+      action_style.icon_spacing = 5.0F;
+      action_style.indication = theme.interactions.indication;
+      action_style.indication->ripple.reset();
+      content.push_back(Row{std::move(title).With(Grow()), ProvideEnvironment(action_style,
+          Chip(::app::images::add, ::app::strings::ui_add_model).OnClick([dialog, add_model, refresh_models] {
+            ShowAddModel(dialog, add_model, [refresh_models](kit::ModelProviderRef) { refresh_models = refresh_models.Get() + 1; });
+          }).Key("settings-add-model"))}.With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center)));
+    } else {
+      content.push_back(std::move(title));
+    }
   }
   switch (section.Get()) {
   case SettingsSection::Models: {
@@ -226,32 +246,25 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
     std::erase_if(choices, [](const auto& item) { return item.ref == DemoModel; });
     auto vision = choices;
     std::erase_if(vision, [](const auto& item) { return !item.capabilities.image_input; });
-    std::vector<View> catalog_heading{
-        Text(::app::strings::ui_configured_models).Style({Font::System(15.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}).With(Grow()),
-    };
-    if (add_model) catalog_heading.push_back(ProvideEnvironment(secondary,
-        Button(::app::strings::ui_add_model_dots).OnClick([dialog, add_model, refresh_models] {
-          ShowAddModel(dialog, add_model, [refresh_models](kit::ModelProviderRef) { refresh_models = refresh_models.Get() + 1; });
-        })).Key("settings-add-model"));
-    std::vector<View> catalog{
-        Row(std::move(catalog_heading)).With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Center)),
-    };
-    if (choices.empty()) catalog.push_back(Text(::app::strings::ui_no_models_configured).Style({Font::System(13.0F), colors.on_surface_variant}));
+    std::vector<View> catalog;
+    if (choices.empty()) catalog.push_back(Text(::app::strings::ui_no_models_configured)
+        .Style({Font::System(13.0F), colors.on_surface_variant}).With(Padding(16.0F)));
     const auto token_display = [unknown = UseString(::app::strings::ui_model_limit_unknown)](auto value) {
       return value ? std::to_string(*value) : unknown;
     };
     for (const auto& model : choices) {
       const auto& limits = model.limits;
-      catalog.push_back(Column {
+      auto details = Column {
         Text(model.label).Style({Font::System(13.0F), colors.on_surface})
             .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Tooltip(model.endpoint + " / " + model.protocol)),
         Text(StringVariant::Format(::app::strings::ui_model_limit_details, token_display(limits.context_window),
             token_display(limits.max_input_tokens), token_display(limits.max_output_tokens)), TextRole::Label)
             .With(Foreground(colors.on_surface_variant)),
-      }.With(Spacing(3.0F), Padding(EdgeInsets{.top = 4.0F, .bottom = 4.0F})).Key(model.ref.id.value));
+      }.With(Spacing(3.0F), Grow());
+      catalog.push_back(Row{std::move(details)}.With(Padding(EdgeInsets::Symmetric(16.0F, 10.0F)),
+          Spacing(12.0F), CrossAlign(CrossAxisAlignment::Center)).Key(model.ref.id.value));
     }
-    content.push_back(SettingsPanel({Column(std::move(catalog)).With(Padding(16.0F), Spacing(9.0F),
-        CrossAlign(CrossAxisAlignment::Stretch))}, colors));
+    content.push_back(SettingsPanel(std::move(catalog), colors).Key("settings-model-list"));
     content.push_back(Text(::app::strings::ui_model_roles).Style({Font::System(15.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}));
     content.push_back(SettingsPanel({
         SettingsRow(::app::strings::ui_daily_model, ::app::strings::ui_default_for_new_conversations,
@@ -280,7 +293,7 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
             ProvideEnvironment(fields, TextField(instructions).Label(::app::strings::ui_personal_instructions)
                 .Variant(TextFieldVariant::Outlined)
                 .Placeholder(::app::strings::ui_add_preferences_the_assistant_should_follow_when)
-                .LineLimits(TextFieldLineLimits::MultiLine(3, 8)).OnChanged([draft, instructions](const TextEditingValue& text) {
+                .LineLimits(TextFieldLineLimits::MultiLine(6, 12)).OnChanged([draft, instructions](const TextEditingValue& text) {
                   instructions = text;
                   auto value = draft.Get();
                   value.instructions = text.text;
@@ -324,9 +337,9 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
           .With(Foreground(colors.on_surface_variant)).With(Grow()) : View(Spacer().With(Grow()));
   return Column{
       settings_lane(Column{
-          Row{Text(::app::strings::ui_settings, TextRole::Title)
-                  .Style({Font::System(20.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}).With(Grow()),
-              ProvideEnvironment(secondary, Button(::app::strings::ui_back_to_conversations).OnClick(std::move(close))).Key("close-settings"),
+          Row{PreviewBackAction(::app::strings::ui_back_to_conversations, std::move(close), theme).Key("close-settings"),
+              Text(::app::strings::ui_settings, TextRole::Title)
+                  .Style({Font::System(20.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}).With(Grow()).Key("settings-title"),
           }.With(Padding(EdgeInsets::Symmetric(0.0F, 10.0F)), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center)),
           Flow(std::move(links)).With(Spacing(5.0F), Padding(EdgeInsets{.bottom = 8.0F})),
       }.With(CrossAlign(CrossAxisAlignment::Stretch))),

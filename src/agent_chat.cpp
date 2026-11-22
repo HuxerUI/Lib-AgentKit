@@ -229,6 +229,22 @@ ButtonStyle ChatActionStyle(ButtonStyle style, const ThemeSpec& theme) {
   return style;
 }
 
+View ChatBackAction(const ThemeSpec& theme, std::function<void()> back) {
+  auto style = IconButtonStyle::Default();
+  style.foreground = theme.colors.on_surface_variant;
+  style.icon_size = 18.0F;
+  style.minimum_interactive_size = 34.0F;
+  style.state_layer_size = 32.0F;
+  style.corner_radius = 7.0F;
+  style.indication = theme.interactions.indication;
+  style.indication->hover.reset();
+  style.indication->press.reset();
+  style.indication->ripple.reset();
+  const auto label = huxerui_agentkit::strings::ui_back_to_conversation;
+  return ProvideEnvironment(style, IconButton(huxerui_agentkit::images::arrow_left, label)
+      .OnClick(std::move(back)).With(PointerCursor(PointerCursorKind::Hand), Tooltip(label)).Key("back-to-conversation"));
+}
+
 bool SubmitOnEnter(const KeyEvent& event, const TextEditingValue& draft, const std::function<void()>& submit) {
   if (event.type != KeyEventType::Down || (event.key != Key::Enter && event.key != Key::NumpadEnter) ||
       event.modifiers.control || event.modifiers.alt || event.modifiers.meta) return false;
@@ -259,12 +275,31 @@ View ChatComposerInput(State<TextEditingValue> draft, ViewHandle focus, State<bo
          Padding(EdgeInsets{.top = 4.0F, .right = 4.0F, .left = 4.0F})).Key("message-input"));
 }
 
-View ChatComposerPanel(std::vector<View> content, bool focused, bool bubbles, const ColorScheme& colors) {
+[[huxerui::composable]]
+View ChatComposerPanel(std::vector<View> content, State<bool> focused, bool bubbles, const ColorScheme& colors) {
   return Column(std::move(content)).With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Stretch),
       Padding(bubbles ? 11.0F : 8.0F), CornerRadius(bubbles ? 17.0F : 11.0F),
       Background(bubbles ? colors.surface_container : colors.surface),
       Shadow{.color = Color::Rgb(34, 25, 55, 0.11F), .offset = {0.0F, 3.0F}, .blur_radius = 9.0F, .spread = -5.0F},
-      Border{focused ? colors.on_primary_container : colors.outline}).Key("agent-chat-composer");
+      Border{focused.Get() ? colors.on_primary_container : colors.outline}).Key("agent-chat-composer");
+}
+
+[[huxerui::composable]]
+View ComposerSendControl(StringVariant label, const char* key, std::function<void()> send,
+    std::function<bool()> send_available, bool bubbles) {
+  const auto colors = UseTheme().colors;
+  const bool enabled = send_available();
+  if (bubbles) return detail::ChatSendAction(label, key, std::move(send), enabled, colors, UseEnvironment<IconButtonStyle>());
+  auto style = UseEnvironment<ButtonStyle>();
+  style.background = colors.primary;
+  style.label_style = {Font::System(13.0F).WithWeight(FontWeight::SemiBold), colors.on_primary};
+  style.disabled_background = colors.surface_container_high;
+  style.disabled_label = colors.on_surface_variant;
+  style.minimum_height = 34.0F;
+  style.padding = EdgeInsets::Symmetric(11.0F, 5.0F);
+  style.corner_radii = CornerRadii{6.0F};
+  return detail::ChatControlWithIcons(Button(label).OnClick(std::move(send)).With(Enabled(enabled)).Key(key),
+      style, enabled ? colors.on_primary : colors.on_surface_variant, detail::ChatControlIcon::Send);
 }
 
 struct ChatActivityFeed {
@@ -1865,13 +1900,13 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
     return !sending.Get() && draft->text.empty() && !draft->composition && !draft_sources->quote &&
         !draft_sources->conclusion && draft_sources->attachments.empty() && recovered.Get().empty() && draft_skills.Get().empty();
   };
-  const bool empty_draft = vacant();
-  Lifecycle([empty_draft, draft_sources] {
-    if (!empty_draft || !draft_sources->send_as_new_task) return;
+  const bool reset_send_as_new = draft_sources->send_as_new_task && vacant();
+  Lifecycle([reset_send_as_new, draft_sources] {
+    if (!reset_send_as_new || !draft_sources->send_as_new_task) return;
     auto sources = draft_sources.Get();
     sources.send_as_new_task = false;
     draft_sources = std::move(sources);
-  }, empty_draft);
+  }, reset_send_as_new);
   const auto current = history_owner.Get() == conversation ? snapshot.Get() : std::shared_ptr<const SessionSnapshot>{};
   if (!current && !options.review_only) return Text(error->empty() ? StringVariant{huxerui_agentkit::strings::ui_opening_conversation} : StringVariant{error.Get()});
   const auto detached_status = [&](StringVariant message) -> View {
@@ -1913,9 +1948,10 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
           return entry.reference && std::holds_alternative<ArtifactRef>(*entry.reference);
         });
   };
-  const bool can_send = !sending.Get() && has_input() && !draft->composition && std::ranges::all_of(recovered.Get(), [](const auto& entry) {
-    return entry.reference.has_value();
-  });
+  const auto send_available = [sending, has_input, draft, recovered] {
+    return !sending.Get() && has_input() && !draft->composition &&
+        std::ranges::all_of(recovered.Get(), [](const auto& entry) { return entry.reference.has_value(); });
+  };
   const auto send = [tasks, conversation, draft, error, sending, enqueue, active, draft_sources, recovered, has_input,
                      follow_sent_message, sequence = current->through_sequence, follow = layout_style.chat_bubbles && !side_chat,
                      controls = options.run_controls, draft_skills] {
@@ -2093,7 +2129,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
        opened_steps, tasks, error, history_controller, keep_reading, focused_request = focused_interaction.Get(),
        attachment_label = options.review_attachment_label,
        history_loading, history_window, loading = history_loading.Get(), theme, action_style, restore,
-       can_restore = empty_draft && !recovering.Get(),
+       vacant, recovering,
        agent_label = options.agent_label, avatar_for, links, selected, draft_sources, selection_focus, focus_cited_draft,
        inline_summary = std::move(inline_summary), render_block = options.render_block,
        activity, host_selection = options.selection.has_value(), tool_label = options.tool_label, bubbles = layout_style.chat_bubbles, narrow = compact || side_chat](std::size_t index) -> View {
@@ -2117,7 +2153,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
           steer = found->state;
           if (found->recovery) recover = ProvideEnvironment(action_style,
               Button(huxerui_agentkit::strings::ui_restore_draft).OnClick([restore, command = *found->recovery] { restore(command); })
-                  .With(Enabled(can_restore)).Key("restore-supplement"));
+                  .With(Enabled(vacant() && !recovering.Get())).Key("restore-supplement"));
         }
         if (agent_label && message.author == MessageAuthor::Agent) agent = agent_label(run->agent);
       }
@@ -2220,21 +2256,15 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
       }
       active_page = AgentChatReviewRequest{reviewed->artifact, review_ticket.Get(), approval, first};
     }
-    std::vector<View> toolbar;
-    if (!review_only)
-      toolbar.push_back(Button(huxerui_agentkit::strings::ui_back_to_conversation).OnClick(return_to_chat));
-    std::vector<View> details;
-    if (!toolbar.empty()) details.push_back(Column{ProvideEnvironment(action_style, Row(std::move(toolbar))
-        .With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)))}
-        .With(CrossAlign(CrossAxisAlignment::Stretch), LayoutPriority(4.0F)));
-    details.push_back(
-        Row{
-            Text(reviewed->name.empty() ? StringVariant{huxerui_agentkit::strings::ui_artifact} : StringVariant{reviewed->name}, TextRole::Title)
-                .Style({Font::System(compact ? 21.0F : 28.0F).WithWeight(FontWeight::SemiBold), theme.colors.on_surface})
-                .LineLimit(2).Overflow(TextOverflow::Ellipsis).With(Grow()).Key("artifact-review-title"),
-            Text(StringVariant::Format(huxerui_agentkit::strings::ui_version_0, reviewed->artifact.version), TextRole::Label)
-                .Style({Font::System(12.0F), theme.colors.on_surface_variant}).Key("artifact-review-version"),
-        }.With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center), LayoutPriority(3.0F)).Key("artifact-review-heading"));
+    std::vector<View> heading;
+    if (!review_only) heading.push_back(ChatBackAction(theme, return_to_chat));
+    heading.push_back(Text(reviewed->name.empty() ? StringVariant{huxerui_agentkit::strings::ui_artifact} : StringVariant{reviewed->name},
+        TextRole::Title).Style({Font::System(compact ? 21.0F : 28.0F).WithWeight(FontWeight::SemiBold), theme.colors.on_surface})
+        .LineLimit(2).Overflow(TextOverflow::Ellipsis).With(Grow()).Key("artifact-review-title"));
+    heading.push_back(Text(StringVariant::Format(huxerui_agentkit::strings::ui_version_0, reviewed->artifact.version), TextRole::Label)
+        .Style({Font::System(12.0F), theme.colors.on_surface_variant}).Key("artifact-review-version"));
+    std::vector<View> details{Row(std::move(heading)).With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center),
+        LayoutPriority(3.0F)).Key("artifact-review-heading")};
     if (approval) {
       const auto item = std::ranges::find(current->interactions, approval->id, &InteractionSnapshot::id);
       const auto* plan = item != current->interactions.end() && item->version == approval->version
@@ -2450,7 +2480,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
   }
   composer.push_back(ChatComposerInput(draft, composer_focus, composer_focused,
       side_chat ? huxerui_agentkit::strings::ui_ask_a_follow_up : huxerui_agentkit::strings::ui_send_a_message,
-      side_chat ? "side-chat-composer" : "composer", send, true, side_chat && !layout_style.chat_bubbles)
+      side_chat ? "side-chat-composer" : "composer", send, true, side_chat)
       .Key("chat-composer-editor"));
   std::optional<View> run_controls;
   const bool stable_toolbar = layout_style.chat_bubbles && !side_chat;
@@ -2510,24 +2540,10 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
           (*bring_back)(selected);
         }).Key(returning_selection ? "side-chat-return-selection" : "side-chat-return-reply")));
   }
-  auto send_style = UseEnvironment<ButtonStyle>();
-  send_style.background = theme.colors.primary;
-  send_style.label_style = {Font::System(13.0F).WithWeight(FontWeight::SemiBold), theme.colors.on_primary};
-  send_style.disabled_background = theme.colors.surface_container_high;
-  send_style.disabled_label = theme.colors.on_surface_variant;
-  send_style.minimum_height = 34.0F;
-  send_style.padding = EdgeInsets::Symmetric(11.0F, 5.0F);
-  send_style.corner_radii = CornerRadii{6.0F};
   const auto& send_label = enqueue ? huxerui_agentkit::strings::ui_queue_message :
       send_as_new ? huxerui_agentkit::strings::ui_send_as_new_task : huxerui_agentkit::strings::ui_send;
   const auto send_key = enqueue ? "chat-send/Queue message" : send_as_new ? "chat-send/Send as new task" : "chat-send/Send";
-  if (layout_style.chat_bubbles) {
-    actions.push_back(detail::ChatSendAction(send_label, send_key, send, can_send, theme.colors, UseEnvironment<IconButtonStyle>()));
-  } else {
-    actions.push_back(detail::ChatControlWithIcons(
-        Button(send_label).OnClick(send).With(Enabled(can_send)).Key(send_key), send_style,
-        can_send ? theme.colors.on_primary : theme.colors.on_surface_variant, detail::ChatControlIcon::Send));
-  }
+  actions.push_back(ComposerSendControl(send_label, send_key, send, send_available, layout_style.chat_bubbles));
   if (compact && run_controls && active && !stable_toolbar) {
     composer.push_back(std::move(*run_controls));
     run_controls.reset();
@@ -2547,7 +2563,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
       auto detail = options.run_controls->describe(*item.user_start);
       if (rejected && item.reason) detail += "\n" + item.reason->message;
       auto button = rejected ? Button(huxerui_agentkit::strings::ui_edit_queued_input).OnClick([restore, id = item.id] { restore(id); })
-          .With(Enabled(empty_draft && !recovering.Get())) : Button(huxerui_agentkit::strings::ui_withdraw).OnClick([tasks, conversation, error, id = item.id] {
+          .With(Enabled(vacant() && !recovering.Get())) : Button(huxerui_agentkit::strings::ui_withdraw).OnClick([tasks, conversation, error, id = item.id] {
         tasks.Launch([conversation, error, id]() -> Task<void> {
           auto withdrawn = co_await conversation->WithdrawQueuedInputAsync(NewCommandId(), id);
           if (!withdrawn.Succeeded()) error = withdrawn.Error().message;
@@ -2572,7 +2588,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
   if (unanchored_summary) content.push_back(std::move(*unanchored_summary));
   if (has_notices) content.push_back(Column(std::move(notices))
       .With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch), LayoutPriority(2.0F)));
-  auto composer_panel = ChatComposerPanel(std::move(composer), composer_focused.Get(), layout_style.chat_bubbles, theme.colors)
+  auto composer_panel = ChatComposerPanel(std::move(composer), composer_focused, layout_style.chat_bubbles, theme.colors)
       .With(composer_anchor);
   if (part == ChatPart::Composer) {
     if (has_notices) return Column{std::move(content.back()), std::move(composer_panel)}
@@ -2599,9 +2615,12 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
   if (focused_interaction.Get()) {
     const auto item = std::ranges::find(current->interactions, *focused_interaction.Get(), &InteractionSnapshot::id);
     std::vector<View> request{
-        Row{ProvideEnvironment(action_style, Button(huxerui_agentkit::strings::ui_back_to_conversation)
-                .OnClick([focused_interaction] { focused_interaction = std::nullopt; })),
-            Spacer(), Text(current->summary.title, TextRole::Label)}.With(Spacing(10.0F)), Divider(),
+        Row{ChatBackAction(theme, [focused_interaction] { focused_interaction = std::nullopt; }),
+            Text(current->summary.title, TextRole::Title)
+                .Style({Font::System(18.0F).WithWeight(FontWeight::SemiBold), theme.colors.on_surface})
+                .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow())}
+            .With(Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center)),
+        Divider(),
     };
     if (item == current->interactions.end() || item->state != InteractionState::Pending) {
       request.push_back(Text(huxerui_agentkit::strings::ui_this_request_is_no_longer_pending, TextRole::Label));

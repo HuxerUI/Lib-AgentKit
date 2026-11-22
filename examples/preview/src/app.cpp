@@ -1503,13 +1503,20 @@ View NavigationIcon(NavigationSymbol symbol, Color ink) {
   return Image(*icons.at(static_cast<std::size_t>(symbol))).Tint(ink).With(Frame{.width = 16.0F, .height = 16.0F});
 }
 
+View NavigationRowWithAction(View primary, View trailing) {
+  return Stack{std::move(primary), Row{Spacer(), std::move(trailing)}.With(CrossAlign(CrossAxisAlignment::Center))}
+      .With(Align(HorizontalAlignment::Stretch, VerticalAlignment::Center));
+}
+
 [[huxerui::composable]]
 View NavigationAction(StringVariant label, NavigationSymbol symbol, std::function<void()> action,
-    bool enabled = true, bool selected = false, std::string count = {}, std::optional<bool> expanded = {}) {
-  const auto colors = UseTheme().colors;
-  const auto hovered = UseState(false);
+    bool enabled = true, bool selected = false, std::string count = {}, std::optional<bool> expanded = {},
+    float trailing_space = 0.0F) {
+  const auto theme = UseTheme();
+  const auto& colors = theme.colors;
   const bool new_conversation = symbol == NavigationSymbol::New;
   const bool folder_heading = expanded.has_value();
+  const float inset = folder_heading ? 6.0F : 10.0F;
   const auto ink = selected ? colors.on_primary_container : colors.on_surface;
   std::vector<View> content{NavigationIcon(symbol, folder_heading ? colors.on_surface_variant : ink)};
   if (folder_heading) content.push_back(NavigationIcon(NavigationSymbol::Folder, colors.on_surface_variant));
@@ -1523,12 +1530,12 @@ View NavigationAction(StringVariant label, NavigationSymbol symbol, std::functio
     if (event.key != Key::Enter && event.key != Key::Space) return false;
     action();
     return true;
-  }).On<ViewEvents::Hover>([hovered](const HoverEvent& event) { hovered = event.type != HoverEventType::Leave; })
+  })
       .With(Frame{.height = new_conversation ? 42.0F : folder_heading ? 34.0F : 36.0F},
-            Padding(EdgeInsets::Symmetric(folder_heading ? 6.0F : 10.0F, 0.0F)), Spacing(folder_heading ? 6.0F : 9.0F),
+            Padding(EdgeInsets{.right = inset + trailing_space, .left = inset}), Spacing(folder_heading ? 6.0F : 9.0F),
             CrossAlign(CrossAxisAlignment::Center), CornerRadius(9.0F), Focusable{}, Enabled(enabled),
-            Background(hovered.Get() && enabled ? colors.surface_container_highest : selected ? colors.primary_container :
-                new_conversation ? colors.surface_container_high : Color::Transparent()),
+            agentkit_preview::PreviewRowIndication(theme, 9.0F), PointerCursor(PointerCursorKind::Hand),
+            Background(selected ? colors.primary_container : new_conversation ? colors.surface_container_high : Color::Transparent()),
             Border{new_conversation ? colors.outline : Color::Transparent()},
             Semantics{.role = SemanticRole::Button, .label = label, .value = count, .selected = selected, .expanded = expanded});
 }
@@ -1536,10 +1543,10 @@ View NavigationAction(StringVariant label, NavigationSymbol symbol, std::functio
 [[huxerui::composable]]
 View DraftChoice(NavigationSymbol icon, StringVariant label, std::string value, std::string hint, std::string key,
     std::function<std::vector<MenuEntry>()> choices, bool enabled) {
-  const auto colors = UseTheme().colors;
+  const auto theme = UseTheme();
+  const auto& colors = theme.colors;
   const auto anchor = UseViewHandle();
   const auto menu = UseMenu();
-  const auto hovered = UseState(false);
   const auto open = [anchor, menu, choices] { menu.Show(anchor, choices()); };
   return Row{
       NavigationIcon(icon, colors.on_surface_variant),
@@ -1551,10 +1558,11 @@ View DraftChoice(NavigationSymbol icon, StringVariant label, std::string value, 
     if (event.key != Key::Enter && event.key != Key::Space && event.key != Key::ArrowDown) return false;
     open();
     return true;
-  }).On<ViewEvents::Hover>([hovered](const HoverEvent& event) { hovered = event.type != HoverEventType::Leave; })
+  })
       .With(anchor, Enabled(enabled), Focusable{}, Frame{.height = 34.0F}, Padding(EdgeInsets::Symmetric(10.0F, 0.0F)),
           Spacing(7.0F), CrossAlign(CrossAxisAlignment::Center), CornerRadius(9.0F), Border{colors.outline},
-          Background(hovered.Get() && enabled ? colors.surface_container_highest : colors.surface_container_low),
+          Background(colors.surface_container_low), agentkit_preview::PreviewRowIndication(theme, 9.0F),
+          PointerCursor(PointerCursorKind::Hand),
           Tooltip(hint.empty() ? value : hint),
           Semantics{.role = SemanticRole::Button, .label = label, .value = value, .hint = hint}).Key(key);
 }
@@ -1579,7 +1587,8 @@ StringVariant PreviewAgentLabel(const kit::AgentRef& agent) {
 [[huxerui::composable]]
 View SessionRow(kit::SessionSummary item, bool selected, bool grouped, std::function<void(kit::SessionId)> open,
     std::function<std::vector<MenuEntry>()> actions) {
-  const auto theme = UseTheme().colors;
+  const auto spec = UseTheme();
+  const auto& theme = spec.colors;
   const auto menu = UseMenu();
   const auto target = UseViewHandle();
   const auto hovered = UseState(false);
@@ -1606,8 +1615,10 @@ View SessionRow(kit::SessionSummary item, bool selected, bool grouped, std::func
     activate();
     return true;
   }).On<ViewEvents::FocusChanged>([focused](bool active) { focused = active; })
-      .With(Grow(), Focusable{}, CrossAlign(CrossAxisAlignment::Center), Spacing(5.0F),
-        Padding(EdgeInsets::Symmetric(grouped ? 10.0F : 8.0F, 7.0F)),
+      .With(Frame{.height = 34.0F}, Focusable{}, CrossAlign(CrossAxisAlignment::Center), Spacing(5.0F), CornerRadius(7.0F),
+        Padding(EdgeInsets{.right = 34.0F, .left = grouped ? 10.0F : 8.0F}),
+        Background(selected ? theme.primary_container : Color::Transparent()),
+        agentkit_preview::PreviewRowIndication(spec, 7.0F), PointerCursor(PointerCursorKind::Hand),
         Semantics{.role = SemanticRole::Button, .label = item.title, .hint = agent, .state_description = status, .selected = selected});
   const auto show_more = selected || hovered.Get() || focused.Get();
   auto more = Row{NavigationIcon(NavigationSymbol::More, show_more ? theme.on_surface_variant : Color::Transparent())
@@ -1619,18 +1630,17 @@ View SessionRow(kit::SessionSummary item, bool selected, bool grouped, std::func
         return true;
       }).On<ViewEvents::FocusChanged>([focused](bool active) { focused = active; })
       .With(target, Focusable{}, Frame{.width = 30.0F, .height = 32.0F}, MainAlign(MainAxisAlignment::Center),
-          CrossAlign(CrossAxisAlignment::Center), Semantics{.role = SemanticRole::Button, .label = ::app::strings::ui_conversation_actions})
+          CrossAlign(CrossAxisAlignment::Center), agentkit_preview::PreviewRowIndication(spec, 6.0F),
+          PointerCursor(PointerCursorKind::Hand), Semantics{.role = SemanticRole::Button, .label = ::app::strings::ui_conversation_actions})
       .Key("session-actions/" + item.id.value);
-  return Row{std::move(item_button), std::move(more)}
+  return NavigationRowWithAction(std::move(item_button), std::move(more))
       .On<ViewEvents::Hover>([hovered](const HoverEvent& event) { hovered = event.type != HoverEventType::Leave; })
       .On<ViewEvents::ContextMenuRequested>([menu, actions](Point location) { menu.ShowAt(location, actions()); })
       .On<ViewEvents::KeyDown>([menu, target, actions](const KeyEvent& event) {
         if (event.key != Key::ContextMenu && (event.key != Key::F10 || !event.modifiers.shift)) return false;
         menu.Show(target, actions());
         return true;
-      })
-      .With(Frame{.height = 34.0F}, CrossAlign(CrossAxisAlignment::Center), CornerRadius(6.0F),
-            Background(selected ? theme.primary_container : hovered.Get() ? theme.surface_container_highest : Color::Transparent()));
+      });
 }
 
 [[huxerui::composable]]
@@ -1688,27 +1698,29 @@ void MoveGroup(const std::shared_ptr<PreviewService>& service, std::string id, s
 View ConversationGroupRow(ConversationGroup group, std::function<void()> toggle, std::function<std::vector<MenuEntry>()> actions) {
   const auto menu = UseMenu();
   const auto anchor = UseViewHandle();
-  const auto colors = UseTheme().colors;
+  const auto theme = UseTheme();
+  const auto& colors = theme.colors;
   const auto actions_id = "group-actions/" + group.id;
-  auto style = UseEnvironment<ButtonStyle>();
-  style.background = Color::Transparent();
-  style.label_style = TextStyle{Font::System(13.0F).WithWeight(FontWeight::SemiBold), colors.on_surface};
-  style.padding = EdgeInsets::Symmetric(3.0F, 4.0F);
-  auto label = Row{
+  auto row = Row{
       NavigationIcon(group.collapsed ? NavigationSymbol::Right : NavigationSymbol::Down, colors.on_surface_variant),
-      Text(group.name).Style(style.label_style).LineLimit(1).Overflow(TextOverflow::Ellipsis)
+      Text(group.name).Style({Font::System(13.0F).WithWeight(FontWeight::SemiBold), colors.on_surface})
+          .LineLimit(1).Overflow(TextOverflow::Ellipsis)
           .With(Grow()).Key("group/" + group.id),
   }.OnClick(toggle).On<ViewEvents::KeyDown>([toggle](const KeyEvent& event) {
     if (event.key != Key::Enter && event.key != Key::Space) return false;
     toggle();
     return true;
-  }).With(Grow(), Focusable{}, Spacing(3.0F), CrossAlign(CrossAxisAlignment::Center),
+  }).With(Frame{.height = 34.0F}, Padding(EdgeInsets{.right = 34.0F, .left = 6.0F}), Focusable{}, Spacing(6.0F),
+      CrossAlign(CrossAxisAlignment::Center), agentkit_preview::PreviewRowIndication(theme, 7.0F),
+      PointerCursor(PointerCursorKind::Hand),
       Semantics{.role = SemanticRole::Button, .label = group.name, .expanded = !group.collapsed});
-  return Row{std::move(label),
-      IconButton(::app::images::more, ::app::strings::ui_group_actions).With(anchor, Semantics{.identifier = actions_id}).Key(actions_id)
-          .OnClick([menu, anchor, actions] { menu.Show(anchor, actions()); }),
-  }.On<ViewEvents::ContextMenuRequested>([menu, actions](Point location) { menu.ShowAt(location, actions()); })
-      .With(Frame{.height = 32.0F}, Padding(EdgeInsets::Symmetric(8.0F, 0.0F)), CrossAlign(CrossAxisAlignment::Center));
+  auto more = ProvideEnvironment(agentkit_preview::PreviewChromeIconStyle(theme),
+      IconButton(::app::images::more, ::app::strings::ui_group_actions)
+          .OnClick([menu, anchor, actions] { menu.Show(anchor, actions()); })
+          .With(anchor, PointerCursor(PointerCursorKind::Hand), Tooltip(::app::strings::ui_group_actions),
+              Semantics{.identifier = actions_id}).Key(actions_id));
+  return NavigationRowWithAction(std::move(row), std::move(more))
+      .On<ViewEvents::ContextMenuRequested>([menu, actions](Point location) { menu.ShowAt(location, actions()); });
 }
 
 [[huxerui::composable]]
@@ -1922,7 +1934,41 @@ std::optional<View> BrowserDraftReport(const std::shared_ptr<PreviewService>& se
 } // namespace
 
 [[huxerui::composable]]
+static View WorkbenchColumns(View sidebar, View pages, ViewportClass viewport, float sidebar_width) {
+  using PaneSizing = std::pair<Frame, Grow>;
+  const auto split = UseState(std::optional<std::array<PaneSizing, 2>>{});
+  const bool compact = viewport == ViewportClass::Compact;
+  auto sizing = split.Get().value_or(std::array{
+      PaneSizing{Frame{.width = sidebar_width, .min_width = 160.0F, .max_width = 340.0F}, Grow(0.0F)},
+      PaneSizing{Frame{}, Grow()},
+  });
+  sizing[1].first.min_width = compact ? std::nullopt : std::optional{viewport == ViewportClass::Medium ? 360.0F : 600.0F};
+  return SplitLayout({
+      compact ? View{} : View(sidebar).With(sizing[0].first, sizing[0].second),
+      View(pages).With(sizing[1].first, sizing[1].second),
+  }).OnChanged([split, sizing](const std::vector<SplitChange>& changes) mutable {
+    for (const auto& change : changes) sizing[change.index] = {change.frame, change.grow};
+    split = sizing;
+  });
+}
+
+#if defined(AGENTKIT_PREVIEW_TEST)
+static std::size_t preview_shell_compositions = 0;
+
+std::size_t PreviewShellCompositionCountForTest() {
+  return preview_shell_compositions;
+}
+#endif
+
+static void TrackPreviewShellComposition() {
+#if defined(AGENTKIT_PREVIEW_TEST)
+  ++preview_shell_compositions;
+#endif
+}
+
+[[huxerui::composable]]
 View PreviewShell() {
+  TrackPreviewShellComposition();
   const auto theme = UseTheme();
   const auto resources = UseService<Resources>();
   const auto service = UseService<PreviewService>();
@@ -1933,6 +1979,7 @@ View PreviewShell() {
   const auto sessions = UseState(std::shared_ptr<const kit::SessionPage>{});
   const auto loading_sessions = UseState(false);
   const auto pending_page = UseState(std::shared_ptr<const kit::PendingInteractionPage>{});
+  const auto pending_count = UseState(std::string{});
   const auto pending_error = UseState(std::string{});
   const auto review_window_error = UseState(std::string{});
   const auto pending_retry = UseState(std::uint64_t{0});
@@ -1944,8 +1991,6 @@ View PreviewShell() {
   const bool medium = viewport_class == ViewportClass::Medium;
   const float sidebar_width = medium ? 188.0F : 224.0F;
   const float page_gutter = compact ? 14.0F : medium ? 21.0F : 36.0F;
-  using PaneSizing = std::pair<Frame, Grow>;
-  const auto sidebar_split = UseState(std::optional<std::array<PaneSizing, 2>>{});
   auto conversation_action_style = UseEnvironment<IconButtonStyle>();
   conversation_action_style.icon_size = 18.0F;
   conversation_action_style.minimum_interactive_size = 34.0F;
@@ -2006,10 +2051,22 @@ View PreviewShell() {
     auto task = tasks.Launch([service, sessions, error, ready, folder, drafts, refresh_pending, subscription]() -> Task<void> {
       auto started = co_await WaitForRuntime(service);
       if (!started.Succeeded()) { error = started.Error().message; co_return; }
+      auto last_listing = std::make_shared<std::shared_ptr<const kit::SessionPage>>();
       auto observed = co_await started.Value()->Sessions().ObserveListAsync({},
-          [sessions, error](auto result) {
-            if (result.Succeeded()) sessions = std::move(result).Value();
-            else { sessions = std::shared_ptr<const kit::SessionPage>{}; error = result.Error().message; }
+          [sessions, error, last_listing](auto result) {
+            if (!result.Succeeded()) {
+              sessions = std::shared_ptr<const kit::SessionPage>{};
+              error = result.Error().message;
+              return;
+            }
+            auto incoming = std::move(result).Value();
+            const auto& previous = *last_listing;
+            // Keep any additional pages already loaded when the observed first page has not changed.
+            if (previous && incoming->order_revision == previous->order_revision && incoming->sessions == previous->sessions &&
+                bool(incoming->next) == bool(previous->next) && (!incoming->next || incoming->next->value == previous->next->value))
+              return;
+            sessions = incoming;
+            *last_listing = std::move(incoming);
           });
       if (!observed.Succeeded()) { error = observed.Error().message; co_return; }
       *subscription = std::move(observed).Value();
@@ -2026,17 +2083,20 @@ View PreviewShell() {
     });
     return [task, subscription] { task.Cancel(); subscription->reset(); };
   });
-  Lifecycle([service, tasks, ready, pending_page, pending_error]() -> std::function<void()> {
+  Lifecycle([service, tasks, ready, pending_page, pending_count, pending_error]() -> std::function<void()> {
     if (!ready.Get()) return [] {};
     pending_error = "";
     auto subscription = std::make_shared<std::optional<kit::Subscription>>();
-    auto task = tasks.Launch([runtime = service->runtime, pending_page, pending_error, subscription]() -> Task<void> {
-      auto pending = co_await runtime->Interactions().ObservePendingAsync({}, [pending_page, pending_error](auto result) {
+    auto task = tasks.Launch([runtime = service->runtime, pending_page, pending_count, pending_error, subscription]() -> Task<void> {
+      auto pending = co_await runtime->Interactions().ObservePendingAsync({}, [pending_page, pending_count, pending_error](auto result) {
         if (result.Succeeded()) {
-          pending_page = std::move(result).Value();
+          auto page = std::move(result).Value();
+          pending_count = page->items.empty() ? std::string{} : std::to_string(page->items.size()) + (page->next ? "+" : "");
+          pending_page = std::move(page);
           pending_error = "";
         } else {
           pending_page = std::shared_ptr<const kit::PendingInteractionPage>{};
+          pending_count = "";
           pending_error = result.Error().message;
         }
       });
@@ -2444,11 +2504,11 @@ View PreviewShell() {
       const auto create = [use_workspace, id = entry.id] { use_workspace(id); };
       const auto new_label = StringVariant::Format(::app::strings::ui_new_conversation_in_0, title);
       auto folder_row = NavigationAction(std::move(title), open ? NavigationSymbol::Down : NavigationSymbol::Right,
-          toggle, true, false, {}, open)
-          .With(Tooltip(std::move(tooltip)), Grow()).Key("workspace/" + entry.id.value);
-      auto add = ProvideEnvironment(conversation_action_style, IconButton(::app::images::add, new_label)
-          .OnClick(create).With(Tooltip(new_label)).Key("workspace-new/" + entry.id.value));
-      std::vector<View> branch{Row{std::move(folder_row), std::move(add)}.With(CrossAlign(CrossAxisAlignment::Center))};
+          toggle, true, false, {}, open, 34.0F)
+          .With(Tooltip(std::move(tooltip))).Key("workspace/" + entry.id.value);
+      auto add = agentkit_preview::PreviewChromeAction(::app::images::add, new_label, create, theme)
+          .Key("workspace-new/" + entry.id.value);
+      std::vector<View> branch{NavigationRowWithAction(std::move(folder_row), std::move(add))};
       if (open && !children.empty()) branch.push_back(Row{
           Divider(Axis::Vertical),
           Column(std::move(children)).With(Grow(), Spacing(2.0F), CrossAlign(CrossAxisAlignment::Stretch)),
@@ -2461,9 +2521,6 @@ View PreviewShell() {
   sections.push_back(section_label(::app::strings::ui_standalone));
   sections.push_back(Column(workspace_directory(std::nullopt)).With(Spacing(2.0F), CrossAlign(CrossAxisAlignment::Stretch)));
   if (!directory.empty()) sections.push_back(Column(std::move(directory)).With(Spacing(2.0F), CrossAlign(CrossAxisAlignment::Stretch)));
-  const auto pending = pending_page.Get();
-  const auto pending_count = pending && !pending->items.empty() ?
-      std::to_string(pending->items.size()) + (pending->next ? "+" : "") : std::string{};
   const auto settings_available = ready.Get() && service->settings_file.has_value();
   const auto show_settings = [showing_settings, selecting, navigation_open] {
     selecting = selecting.Get() + 1;
@@ -2479,7 +2536,7 @@ View PreviewShell() {
       NavigationAction(::app::strings::ui_open_folder, NavigationSymbol::Folder, pick_workspace, can_open_folder && !choosing_folder.Get())
           .Key("open-folder"),
       NavigationAction(::app::strings::ui_new_group, NavigationSymbol::Plus, new_group, ready.Get()).Key("new-group"),
-      NavigationAction(::app::strings::ui_pending, NavigationSymbol::Inbox, open_pending, ready.Get(), showing_pending.Get(), pending_count)
+      NavigationAction(::app::strings::ui_pending, NavigationSymbol::Inbox, open_pending, ready.Get(), showing_pending.Get(), pending_count.Get())
           .Key("pending-navigation"),
   }.With(Spacing(2.0F), CrossAlign(CrossAxisAlignment::Stretch)));
   sidebar_items.push_back(ProvideEnvironment(DividerStyle{colors.outline}, Divider()));
@@ -2507,9 +2564,9 @@ View PreviewShell() {
       const auto& composer = service->composers.try_emplace(selection.id).first->second;
       const bool returning = comparison->origin.conversation && comparison->review && comparison->branch == selection.id;
       std::vector<View> actions;
+      std::optional<View> back_to_comparison;
       if (returning || (snapshot && snapshot->summary.project)) {
-        const auto& label = returning ? ::app::strings::ui_back_to_comparison : ::app::strings::ui_compare_alternatives;
-        auto compare = IconButton(::app::images::compare, label).OnClick([comparison, selection, returning] {
+        const auto show_comparison = [comparison, selection, returning] {
           auto route = comparison.Get();
           if (!returning) {
             if (route.origin.id != selection.id) route = ComparisonNavigation{};
@@ -2517,10 +2574,14 @@ View PreviewShell() {
           }
           route.showing = true;
           comparison = std::move(route);
-        });
-        if (!returning) compare = std::move(compare).With(comparison_entry);
-        actions.push_back(std::move(compare).With(Tooltip(returning ? label : ::app::strings::ui_comparison_explainer))
-            .Key(returning ? "comparison-return" : "comparison-entry"));
+        };
+        if (returning) {
+          back_to_comparison = agentkit_preview::PreviewBackAction(::app::strings::ui_back_to_comparison, show_comparison, theme)
+              .Key("comparison-return");
+        } else {
+          actions.push_back(IconButton(::app::images::compare, ::app::strings::ui_compare_alternatives).OnClick(show_comparison)
+              .With(comparison_entry, Tooltip(::app::strings::ui_comparison_explainer)).Key("comparison-entry"));
+        }
       }
       kit::AgentChatOptions options{
           .draft_sources = composer.sources,
@@ -2599,7 +2660,7 @@ View PreviewShell() {
       }
       auto chrome = std::make_shared<const agentkit_preview::ChatHeader>(
           [actions = std::move(actions), snapshot, location = std::move(location), conversation_action_style,
-           open_review = std::move(open_review), review_window_error](
+           back_to_comparison = std::move(back_to_comparison), open_review = std::move(open_review), review_window_error](
               const kit::AgentChatPage& page, std::optional<View> workspace_actions) -> std::optional<View> {
             if (const auto* review = std::get_if<kit::AgentChatReviewRequest>(&page)) {
               if (!open_review) return {};
@@ -2630,6 +2691,7 @@ View PreviewShell() {
                 Row(std::move(buttons)).With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Center)))
                 .Key("agent-chat-header-actions");
             std::vector<View> row;
+            if (back_to_comparison) row.push_back(*back_to_comparison);
             if (!location.empty()) {
               row.push_back(Row{
                   NavigationIcon(NavigationSymbol::Folder, colors.on_surface_variant),
@@ -2785,8 +2847,10 @@ View PreviewShell() {
       controls = agentkit_preview::RunSettingsControls(service->run_settings, new_start, new_agent, workspace_id,
           native_workspace, {}, {}, std::move(draft_action), AddModelAction(service));
     }
-    const bool can_send = ready.Get() && !creating.Get() && (!draft->text.empty() || !new_sources->attachments.empty()) &&
-        !draft->composition && (!code || (service->code_available.Get() && native_workspace));
+    const auto send_available = [ready, draft, new_sources, code, service, native_workspace] {
+      return ready.Get() && !draft->composition && (!draft->text.empty() || !new_sources->attachments.empty()) &&
+          (!code || (service->code_available.Get() && native_workspace));
+    };
     const auto placeholder = code ? ::app::strings::ui_describe_the_change : assistant.Get() == 1 ?
         ::app::strings::ui_describe_your_presentation : assistant.Get() == 3 ?
         ::app::strings::ui_describe_the_screen_or_interaction : ::app::strings::ui_send_a_message;
@@ -2846,7 +2910,8 @@ View PreviewShell() {
     if (creating.Get()) lane.push_back(Text(::app::strings::ui_sending_message, TextRole::Label)
         .With(Foreground(colors.on_surface_variant)).Key("chat-sending-message"));
     lane.push_back(agentkit_preview::PreviewDraftComposer(draft, draft_input, draft_focused, placeholder,
-        "new-conversation-composer", std::move(compose), std::move(controls), !creating.Get(), can_send, create).Key("new-draft-composer"));
+        "new-conversation-composer", std::move(compose), std::move(controls), !creating.Get(), send_available, create)
+        .Key("new-draft-composer"));
     main = Column(std::move(lane)).With(Grow(), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch), Padding(EdgeInsets{
         .top = compact ? 20.0F : 28.0F, .right = page_gutter, .bottom = compact ? 14.0F : 25.0F, .left = page_gutter}))
         .Key(current_draft.view_key);
@@ -2909,18 +2974,7 @@ View PreviewShell() {
       : View(Spacer());
   auto pages = IndexedPages({Column(std::move(content)).With(CrossAlign(CrossAxisAlignment::Stretch)),
       std::move(settings)}, showing_settings.Get() ? 1U : 0U).Key("workbench-main");
-  auto sizing = sidebar_split.Get().value_or(std::array{
-      PaneSizing{Frame{.width = sidebar_width, .min_width = 160.0F, .max_width = 340.0F}, Grow(0.0F)},
-      PaneSizing{Frame{}, Grow()},
-  });
-  sizing[1].first.min_width = compact ? std::nullopt : std::optional{medium ? 360.0F : 600.0F};
-  View columns = SplitLayout({
-      compact ? View{} : View(std::move(sidebar).With(sizing[0].first, sizing[0].second)),
-      std::move(pages).With(sizing[1].first, sizing[1].second),
-  }).OnChanged([sidebar_split, sizing](const std::vector<SplitChange>& changes) mutable {
-    for (const auto& change : changes) sizing[change.index] = {change.frame, change.grow};
-    sidebar_split = sizing;
-  });
+  auto columns = WorkbenchColumns(sidebar, std::move(pages), viewport_class, sidebar_width);
   auto workbench = ProvideEnvironment(drawer_style, (compact
       ? DrawerLayout(std::move(columns), StartDrawer(std::move(sidebar)).Open(navigation_open.Get())
           .OnOpenChanged([navigation_open](bool open) { navigation_open = open; }))

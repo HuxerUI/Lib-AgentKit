@@ -1,5 +1,6 @@
 #pragma once
 
+#include <app_resources.h>
 #include <huxerui/huxerui.h>
 
 namespace agentkit_preview {
@@ -23,6 +24,63 @@ inline huxerui::ButtonStyle PreviewPrimaryButton(huxerui::ButtonStyle style, con
   style.disabled_background = colors.surface_container_high;
   style.disabled_label = colors.on_surface_variant;
   return style;
+}
+
+inline huxerui::IconButtonStyle PreviewChromeIconStyle(const huxerui::ThemeSpec& theme) {
+  using namespace huxerui;
+  auto style = IconButtonStyle::Default();
+  style.foreground = theme.colors.on_surface_variant;
+  style.icon_size = 18.0F;
+  style.minimum_interactive_size = 34.0F;
+  style.state_layer_size = 32.0F;
+  style.corner_radius = 7.0F;
+  style.indication = theme.interactions.indication;
+  style.indication->hover.reset();
+  style.indication->press.reset();
+  style.indication->ripple.reset();
+  return style;
+}
+
+inline huxerui::View PreviewChromeAction(huxerui::ImageResource image, huxerui::StringVariant label,
+    std::function<void()> action, const huxerui::ThemeSpec& theme) {
+  using namespace huxerui;
+  return ProvideEnvironment(PreviewChromeIconStyle(theme), IconButton(image, label)
+      .OnClick(std::move(action)).With(PointerCursor(PointerCursorKind::Hand), Tooltip(label)));
+}
+
+inline huxerui::View PreviewBackAction(huxerui::StringVariant label, std::function<void()> back,
+                                      const huxerui::ThemeSpec& theme) {
+  return PreviewChromeAction(::app::images::arrow_left, std::move(label), std::move(back), theme);
+}
+
+inline huxerui::View PreviewPaneHeader(huxerui::ImageResource image, huxerui::StringVariant title,
+    huxerui::StringVariant close_label, const char* close_key, std::function<void()> close, const huxerui::ThemeSpec& theme) {
+  using namespace huxerui;
+  return Row{
+      Image(image).Tint(theme.colors.on_surface_variant).With(Frame{.width = 16.0F, .height = 16.0F}),
+      Text(title, TextRole::Title)
+          .Style({Font::System(15.0F).WithWeight(FontWeight::SemiBold), theme.colors.on_surface}).With(Grow()),
+      PreviewChromeAction(::app::images::close, std::move(close_label), std::move(close), theme).Key(close_key),
+  }.With(Frame{.min_height = 46.0F}, Padding(EdgeInsets{.right = 8.0F, .left = 14.0F}),
+      Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
+}
+
+inline huxerui::Indication PreviewRowIndication(const huxerui::ThemeSpec& theme, float radius) {
+  using namespace huxerui;
+  auto indication = theme.interactions.indication;
+  const auto corners = CornerRadii{radius};
+  auto hover = theme.colors.on_surface;
+  hover.alpha = 0.07F;
+  auto press = hover;
+  press.alpha = 0.13F;
+  indication.geometry = {.clip_corner_radii = corners};
+  indication.hover = IndicationLayer{.fill = hover,
+      .corner_radii = corners, .placement = IndicationPlacement::BehindContent};
+  indication.press = IndicationLayer{.fill = press,
+      .corner_radii = corners, .placement = IndicationPlacement::BehindContent};
+  if (indication.focus) indication.focus->corner_radii = corners;
+  indication.ripple.reset();
+  return indication;
 }
 
 inline huxerui::TextFieldStyle PreviewFormFieldStyle(huxerui::TextFieldStyle field, const huxerui::ColorScheme& colors) {

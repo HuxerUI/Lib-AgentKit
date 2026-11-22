@@ -1,5 +1,6 @@
 #include "side_chat.h"
 #include "chat_chrome.h"
+#include "preview_theme.h"
 
 #include <app_resources.h>
 #include <huxerui/huxerui.h>
@@ -115,20 +116,23 @@ View SideChatPane(std::shared_ptr<const SideChatRequest> request, ViewHandle foc
     if (available) tasks.Post([target] { target.RequestFocus(true); });
   }, static_cast<bool>(conversation), allowed.Get());
 
-  const auto colors = UseTheme().colors;
+  const auto theme = UseTheme();
+  const auto& colors = theme.colors;
   const auto buttons = SelectionActionStyle(UseEnvironment<ButtonStyle>(), colors);
   std::vector<View> body;
   if (visible()) {
     std::vector<View> passages;
     for (const auto& text : request->passages)
-      passages.push_back(Text(text).Style({Font::System(13.0F), colors.on_surface_variant}));
+      passages.push_back(Text(text).Style({Font::System(13.0F), colors.on_surface}));
     StringVariant label = request->passages.size() > 1
         ? StringVariant::Format(::app::strings::ui_0_selected_passages, request->passages.size())
         : StringVariant{::app::strings::ui_selected_text};
-    body.push_back(Column{Text(std::move(label), TextRole::Label),
+    body.push_back(Column{Text(std::move(label), TextRole::Label)
+            .Style({Font::System(12.0F).WithWeight(FontWeight::Medium), colors.on_primary_container}),
         ScrollView(Column(std::move(passages)).With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Stretch)))
-            .With(Frame{.max_height = 78.0F}, ScrollBar(), Padding(EdgeInsets{.left = 7.0F}))}
-        .With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Stretch)).Key("side-chat-source"));
+            .With(Frame{.max_height = 88.0F}, ScrollBar())}
+        .With(Padding(10.0F), Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch),
+            Background(colors.surface_container_low), Border{colors.outline}, CornerRadius(8.0F)).Key("side-chat-source"));
     if (conversation) {
       body.push_back(kit::AgentChatMessages(conversation, selection).With(Grow()).Key("side-chat-messages"));
       if (selection.Get() || reply.Get()) {
@@ -168,7 +172,6 @@ View SideChatPane(std::shared_ptr<const SideChatRequest> request, ViewHandle foc
       body.push_back(kit::AgentChatComposer(conversation, draft->question, draft->sources, follow_up_focus,
           std::move(controls)).Key("side-chat-input"));
     } else {
-      body.push_back(Spacer());
       if (draft->pending.Get()) body.push_back(Text(::app::strings::ui_sending_message, TextRole::Label).Key("chat-sending-message"));
       const auto can_send = [draft] {
         return !draft->pending.Get() && !draft->question->composition &&
@@ -204,19 +207,16 @@ View SideChatPane(std::shared_ptr<const SideChatRequest> request, ViewHandle foc
       std::vector<View> extras;
       if (!draft->sources->attachments.empty()) extras.push_back(kit::AgentChatAttachmentChips(draft->sources));
       body.push_back(PreviewDraftComposer(draft->question, focus, first_focused, ::app::strings::ui_ask_about_this_selection,
-          "side-chat-question", std::move(extras), std::move(toolbar), !draft->pending.Get(), can_send(), submit));
+          "side-chat-question", std::move(extras), std::move(toolbar), !draft->pending.Get(), can_send, submit, true));
     }
     if (!draft->error->empty()) body.push_back(Text(draft->error.Get(), TextRole::Label));
   } else {
     body.push_back(Text(::app::strings::ui_selection_access_changed_close_this_side_chat));
   }
   return Column{
-      Row{Text(::app::strings::ui_side_chat, TextRole::Title), Spacer(),
-          ProvideEnvironment(buttons, Button(::app::strings::ui_close).OnClick(close))}
-          .With(CrossAlign(CrossAxisAlignment::Center), Frame{.min_height = 44.0F}, Padding(EdgeInsets::Symmetric(15.0F, 0.0F))),
-      Divider(),
-      Column(std::move(body)).With(Grow(), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch),
-          Padding(EdgeInsets{.top = 13.0F, .right = 15.0F, .bottom = 16.0F, .left = 15.0F})),
+      PreviewPaneHeader(::app::images::chat, ::app::strings::ui_side_chat, ::app::strings::ui_close, "side-chat-close", close, theme),
+      ProvideEnvironment(DividerStyle{colors.outline}, Divider()),
+      Column(std::move(body)).With(Grow(), Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch), Padding(14.0F)),
   }.With(Grow(), CrossAlign(CrossAxisAlignment::Stretch), Background(colors.surface)).Key("side-chat-pane");
 }
 
@@ -320,9 +320,10 @@ View PreviewChat(std::shared_ptr<kit::Conversation> conversation, kit::AgentChat
 [[huxerui::composable]]
 View PreviewDraftComposer(State<TextEditingValue> draft, ViewHandle focus, State<bool> focused,
     StringVariant placeholder, const char* input_key, std::vector<View> extras, std::optional<View> controls,
-    bool editing, bool can_send, std::function<void()> submit) {
-  auto content = extras;
+    bool editing, std::function<bool()> send_available, std::function<void()> submit, bool dense) {
+  auto content = std::move(extras);
   const auto colors = UseTheme().colors;
+  const bool can_send = editing && send_available();
   auto field = UseEnvironment<TextFieldStyle>();
   field.show_label = false;
   field.standard.border = field.standard.hovered_border = field.standard.focused_border = Color::Transparent();
@@ -333,7 +334,7 @@ View PreviewDraftComposer(State<TextEditingValue> draft, ViewHandle focus, State
   field.padding = {};
   content.push_back(ProvideEnvironment(field, Row {
     TextField(draft).Label(::app::strings::ui_message).Placeholder(placeholder)
-        .Variant(TextFieldVariant::Standard).LineLimits(TextFieldLineLimits::MultiLine(2, 5))
+        .Variant(TextFieldVariant::Standard).LineLimits(TextFieldLineLimits::MultiLine(dense ? 1 : 2, 5))
         .On<ViewEvents::KeyIntercept>([draft, submit](const KeyEvent& event) {
           if (event.type != KeyEventType::Down || (event.key != Key::Enter && event.key != Key::NumpadEnter) ||
               event.modifiers.control || event.modifiers.alt || event.modifiers.meta) return false;
@@ -345,7 +346,8 @@ View PreviewDraftComposer(State<TextEditingValue> draft, ViewHandle focus, State
         .OnChanged([draft](const TextEditingValue& value) { draft = value; })
         .On<ViewEvents::FocusChanged>([focused](bool value) { focused = value; }).OnSubmitted(submit)
         .With(focus, Grow(), Enabled(editing)).Key(input_key),
-  }.With(Frame{.min_height = 54.0F}, Padding(EdgeInsets{.top = 4.0F, .right = 4.0F, .left = 4.0F}))).Key("message-input"));
+  }.With(Frame{.min_height = dense ? 38.0F : 54.0F},
+      Padding(EdgeInsets{.top = 4.0F, .right = 4.0F, .left = 4.0F}))).Key("message-input"));
   auto send = UseEnvironment<IconButtonStyle>();
   send.icon_size = 20.0F;
   send.minimum_interactive_size = send.state_layer_size = 38.0F;

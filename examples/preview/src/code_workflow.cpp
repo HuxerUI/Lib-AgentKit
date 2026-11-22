@@ -559,8 +559,10 @@ static View CodeWorkspaceConversation(std::shared_ptr<kit::Conversation> convers
       } else if (call.artifacts.empty() && (call.reconciliation || call.state == kit::ToolCallState::PartiallyApplied)) {
         if (reviewed.Get() == call.id) {
           recovery_review = Column{
-              Row{Button(::app::strings::ui_back_to_conversation).OnClick([reviewed] { reviewed = std::nullopt; }), Spacer()},
-              Text(::app::strings::ui_applied_workspace_changes, TextRole::Title),
+              Row{PreviewBackAction(::app::strings::ui_back_to_conversation, [reviewed] { reviewed = std::nullopt; }, UseTheme())
+                      .Key("back-to-conversation"),
+                  Text(::app::strings::ui_applied_workspace_changes, TextRole::Title).With(Grow())}
+                  .With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)),
               CodeRevertReview(runtime, conversation, call, workspace, evidence).Key(call.id.value),
           }.With(Grow(), Spacing(12.0F), Padding(20.0F));
         }

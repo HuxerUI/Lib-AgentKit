@@ -455,7 +455,8 @@ View ComparisonDetail(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
     return [load] { load.Cancel(); };
   }, references);
 
-  const auto theme = UseTheme().colors;
+  const auto appearance = UseTheme();
+  const auto& theme = appearance.colors;
   const auto link_style = ComparisonLinkStyle(UseEnvironment<ButtonStyle>(), theme);
   const bool wide = UseViewportClass() == ViewportClass::Expanded;
   if (!snapshot.Get()) return Text(error->empty() ? StringVariant{::app::strings::ui_opening_comparison} : StringVariant{error.Get()});
@@ -473,9 +474,11 @@ View ComparisonDetail(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
     auto workspace = source_view->summary.workspace && services.workspaces
         ? services.workspaces->Find(*source_view->summary.workspace) : std::nullopt;
     return Column{
-        ProvideEnvironment(link_style, Button(::app::strings::ui_back_to_comparison).OnClick([reviewing_recovered] {
-          reviewing_recovered = std::nullopt;
-        })),
+        Row{PreviewBackAction(::app::strings::ui_back_to_comparison, [reviewing_recovered] {
+              reviewing_recovered = std::nullopt;
+            }, appearance).Key("comparison-return"),
+            Text(::app::strings::ui_applied_workspace_changes, TextRole::Title).With(Grow())}
+            .With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)),
         CodeRevertReview(runtime, source, *recovered, std::move(workspace), services.evidence).Key(recovered->id.value),
     }.With(Grow(), Spacing(12.0F));
   }
@@ -724,14 +727,15 @@ View ComparisonWorkspace(std::shared_ptr<kit::AgentRuntime> runtime, std::shared
     std::optional<ReviewId> review, ComparisonWorkspaceServices services,
     SelectReview select, std::function<void()> back, OpenSession open_branch, OpenSession open_approval) {
   const auto snapshot = source->Snapshot();
-  const auto colors = UseTheme().colors;
-  const auto link_style = ComparisonLinkStyle(UseEnvironment<ButtonStyle>(), colors);
+  const auto theme = UseTheme();
   const float gutter = UseViewportClass() == ViewportClass::Compact ? 14.0F : 22.0F;
   auto content = review ? ComparisonDetail(runtime, source, *review, services, select, open_branch, open_approval).Key(review->value) :
       View(ScrollView(ComparisonLibrary(runtime, source, std::move(services), select, open_approval)).With(ScrollBar()));
   return Row{Spacer(), Column{
-      Row{ProvideEnvironment(link_style, Button(::app::strings::ui_back_to_conversation).OnClick(std::move(back))), Spacer(),
-          Text(snapshot ? snapshot->summary.title : "", TextRole::Label).LineLimit(1).Overflow(TextOverflow::Ellipsis)}
+      Row{PreviewBackAction(::app::strings::ui_back_to_conversation, std::move(back), theme).Key("back-to-conversation"),
+          Text(snapshot ? snapshot->summary.title : "", TextRole::Title)
+              .Style({Font::System(17.0F).WithWeight(FontWeight::SemiBold), theme.colors.on_surface})
+              .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow())}
           .With(Spacing(8.0F), Frame{.min_height = 44.0F}, CrossAlign(CrossAxisAlignment::Center)),
       Divider(),
       std::move(content).With(Grow(), Padding(EdgeInsets{.top = 14.0F, .bottom = 20.0F})),

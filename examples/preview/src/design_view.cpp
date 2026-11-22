@@ -174,13 +174,23 @@ View DesignDetails(const ReviewedDesign& design, const std::vector<kit::Artifact
                    std::optional<View> source_actions, bool detached, std::function<void()> detach) {
   if (!design.board) return Spacer();
   const auto& board = *design.board;
-  const auto colors = UseTheme().colors;
+  const auto theme = UseTheme();
+  const auto& colors = theme.colors;
   auto quiet = UseEnvironment<ButtonStyle>();
   quiet.background = Color::Transparent();
   quiet.label_style = {Font::System(12.0F).WithWeight(FontWeight::Medium), colors.on_surface_variant};
   quiet.padding = EdgeInsets::Symmetric(6.0F, 4.0F);
   quiet.minimum_height = 30.0F;
-  std::vector<View> navigation{Button(detached ? ::app::strings::ui_close_review : ::app::strings::ui_back_to_conversation).OnClick(close), Spacer()};
+  std::vector<View> navigation;
+  if (detached) {
+    navigation.push_back(Button(::app::strings::ui_close_review).OnClick(close));
+    navigation.push_back(Spacer());
+  } else {
+    navigation.push_back(PreviewBackAction(::app::strings::ui_back_to_conversation, close, theme).Key("back-to-conversation"));
+    navigation.push_back(Text(board.title, TextRole::Title)
+        .Style({Font::System(19.0F).WithWeight(FontWeight::SemiBold), colors.on_surface})
+        .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow(), Tooltip(board.title)));
+  }
   if (detach) navigation.push_back(Button(::app::strings::ui_open_in_new_window).OnClick(std::move(detach)));
   std::vector<View> revisions;
   std::vector<View> decisions;
@@ -202,13 +212,12 @@ View DesignDetails(const ReviewedDesign& design, const std::vector<kit::Artifact
     navigation.push_back(Text(::app::strings::ui_review_closed, TextRole::Label));
   }
 
-  std::vector<View> details{
-      Text(board.title, TextRole::Title)
-          .Style({Font::System(27.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}),
-      Text(board.brief),
-      DesignArtboard(design.board, selected, 318.0F).With(Padding(10.0F), CornerRadius(8.0F),
-          Border{colors.outline}, Background(colors.surface_container_high)).Key("design-review-artboard"),
-  };
+  std::vector<View> details;
+  if (detached) details.push_back(Text(board.title, TextRole::Title)
+      .Style({Font::System(27.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}));
+  details.push_back(Text(board.brief));
+  details.push_back(DesignArtboard(design.board, selected, 318.0F).With(Padding(10.0F), CornerRadius(8.0F),
+      Border{colors.outline}, Background(colors.surface_container_high)).Key("design-review-artboard"));
   std::vector<View> nodes;
   for (const auto& node : board.nodes) {
     auto item_style = quiet;
