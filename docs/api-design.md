@@ -1157,6 +1157,8 @@ Preview 只在有活动 Run 时显示「直接发送 / 排队」，默认直接�
 
 ### 模型与上下文
 
+`ModelRegistration::context_limits` 由宿主按模型与端点填写。有已知的总窗口或输入上限时，运行时估算请求占用，根据当前任务、结构化输出和工具需求预留空间。压缩先缩减旧工具回传，再由本 Run 绑定的模型摘要早期对话。摘要记录原消息版本，可在同一主体、助手和模型下核对前缀后复用。会话原消息、引用和待审批内容仍按原记录读取。摘要请求占用 Run 的模型轮次和用量预算。`RunSnapshot::context_usage` 提供最近一次模型请求的输入估算、预留空间后的输入预算及压缩前估算（如有）。
+
 ```cpp
 enum class ModelCancellation { StopReading, ProviderCancel };
 
@@ -1180,12 +1182,19 @@ struct ModelEndpoint {
 
 class ModelProvider;
 
+struct ModelContextLimits {
+  std::optional<std::uint64_t> context_window;
+  std::optional<std::uint64_t> max_input_tokens;
+  std::optional<std::uint64_t> max_output_tokens;
+};
+
 struct ModelRegistration {
   ModelProviderRef ref;
   ModelEndpoint endpoint;
   std::shared_ptr<ModelProvider> provider;
   bool allow_server_state = false;
   bool allow_persist_resume_state = false;
+  ModelContextLimits context_limits;
 };
 
 struct ModelResumeState {
@@ -1349,7 +1358,7 @@ using ContextProvider = std::function<Async<ContextSnapshot>(ContextRequest)>;
 
 `<huxerui/agentkit/providers.h>` 提供 `MakeChatCompletionsModel(ChatCompletionsOptions, std::shared_ptr<huxerui::HttpClient> = {})`。在应用线程创建，成功时取得可交给 `RegisterModel` 的 `ModelRegistration`。配置包含模型 ID 和修订、服务基础 URL、模型名、协议变体和可选的异步凭据回调。适配器从基础 URL 构造 `/chat/completions` 路径，使用 HuxerUI 流式 HTTP 读取。端点的工具、同轮多工具、用量和结构化输出能力由宿主按实际模型声明。取消关闭本地读取，结果为 `LocalStopped`。
 
-工具名称按端点命名限制映射，运行时继续使用注册名称。工具回传固定使用端点发出的调用 ID。Chat 的 `finish_reason`、尾部用量和 `[DONE]` 一起决定轮次结束。DeepSeek 思考模式的续轮数据从私有状态回传，写入本地会话存储须显式授权。 [Chat API](https://developers.openai.com/api/reference/resources/chat) · [DeepSeek 续轮](https://api-docs.deepseek.com/guides/thinking_mode/)
+工具名称按端点命名限制映射，运行时继续使用注册名称。工具回传固定使用端点发出的调用 ID。Chat 通过 `finish_reason` 确认轮次结束。如果请求了尾部用量，可在 400 毫秒内接收用量或 `[DONE]`。DeepSeek 思考模式的续轮数据从私有状态回传，写入本地会话存储须显式授权。 [Chat API](https://developers.openai.com/api/reference/resources/chat) · [DeepSeek 续轮](https://api-docs.deepseek.com/guides/thinking_mode/)
 
 兼容端点使用 `json_object` 模式时，适配器把宿主的输出 schema 加到模型指令中。使用 `json_schema` 模式时，适配器在请求参数中提交 schema 供端点约束。两种模式的最终输出均由 Runtime 按同一 schema 校验。
 
@@ -1406,6 +1415,8 @@ Preview 使用 `HUXERUI_AGENTKIT_BASE_URL` 和 `HUXERUI_AGENTKIT_MODEL`。基础
 `HUXERUI_AGENTKIT_PROVIDER` 在 Chat Completions 下可选 `openai`、`deepseek`、`gemini`、`glm` 或 `compatible`，Responses 可选 `openai`、`deepseek` 或 `glm`，Messages 可选 `anthropic`、`deepseek` 或 `glm`，GenerateContent 和 Interactions 接收 `gemini`。Messages 缺省为 `anthropic`，两个 Gemini 原生协议缺省为 `gemini`，其余协议缺省为 `openai`。Messages 可通过 `HUXERUI_AGENTKIT_ANTHROPIC_VERSION` 指定 API 版本，缺省为 `2023-06-01`。需要鉴权的端点使用 `HUXERUI_AGENTKIT_API_KEY`。凭据由宿主回调持有，模型注册标识包含协议和适用的 API 版本，实际模型与修订随 Run 固定。
 
 Interactions 和 GLM Responses 默认关闭服务器续轮状态。宿主可用 `HUXERUI_AGENTKIT_ALLOW_SERVER_STATE=1` 启用，运行时仍按实际 Run 的上下文授权决定是否使用服务器引用。Interactions 和各 Responses 变体可用 `HUXERUI_AGENTKIT_PERSIST_RESUME_STATE=1` 启用私有数据落盘。
+
+内置 HTTP 模型适配器分别限制首个有效模型事件、事件间空闲时间和请求总时长，默认为 120 秒、60 秒和 10 分钟。宿主可用 `stream_timeouts` 和 `timeout` 配置，Run 的截止时间仍然生效。SSE 保活包不刷新事件时限。模型输出上限和上下文超限使用不同的 `AgentError::provider_code`，可查询中断的正文和 Run 失败原因。
 
 Web Preview 启动时从入口页面同目录读取公开的 `agentkit-models.json`。按 `profiles` 顺序登记可选配置，首项作为默认模型。`id` 在目录内唯一，由 1 到 32 个大写英文字母、数字或下划线组成。`base_url` 可以是相对页面的路径或绝对 HTTP(S) API 根地址。协议、提供商及默认值与进程配置一致。可选字段 `anthropic_version`、`allow_server_state`、`persist_resume_state` 分别接收版本字符串和布尔开关。独立模型审查使用可选的 `reviewer` 对象，字段与模型配置相同，省略 `id`。
 

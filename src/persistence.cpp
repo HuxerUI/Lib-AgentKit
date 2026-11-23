@@ -190,6 +190,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(SkillActivation, skill, trigger)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(RunSteerSnapshot, message, state, reason)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(RunTiming, started_at, ended_at, waiting_for_input, input_wait_started_at)
 
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(ModelContextUsage, estimated_input_tokens, input_budget_tokens, before_compaction_tokens)
+
 void to_json(nlohmann::json& wire, const RunSnapshot& run) {
   wire["id"] = run.id;
   wire["session"] = run.session;
@@ -213,6 +215,7 @@ void to_json(nlohmann::json& wire, const RunSnapshot& run) {
   wire["timing"] = run.timing;
   wire["reasoning_summary"] = run.reasoning_summary;
   wire["model_active"] = run.model_active;
+  if (run.context_usage) wire["context_usage"] = *run.context_usage;
 }
 
 void from_json(const nlohmann::json& wire, RunSnapshot& run) {
@@ -238,6 +241,7 @@ void from_json(const nlohmann::json& wire, RunSnapshot& run) {
   run.timing = wire.value("timing", std::optional<RunTiming>{});
   run.reasoning_summary = wire.value("reasoning_summary", std::string{});
   run.model_active = wire.value("model_active", false);
+  run.context_usage = wire.value("context_usage", std::optional<ModelContextUsage>{});
 }
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(FormRequest, title, schema, presentation, expires_at)
@@ -360,10 +364,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(StoredArtifact, record, handle)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(StoredCollaboration, record, auto_start, scope, steer_message, goal)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DelegatedRun, budget, expected_result, started)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(HostedModelStep, input_index, allowed_tools, published)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ModelHistory, messages, summarized, summary, edited)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(StoredRun, view, principal, input, deadline, prepared_tool,
     tool_approval, tool_plans, items, pending_steers, continuation, continuation_missing, pending_calls, model_boundary,
     checkpoint, form_requests, tool_requests, separate_inherited_history, model_skill_resources, host_skill_input, artifact_action,
-    delegate, delegations, host_model_step)
+    delegate, delegations, host_model_step, model_history)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(StoredCommand, principal, record)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GoalVerification, command, actor, revision, dependencies)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(StoredGoal, view, owner, enabled_at, definitions, retired, verification)
@@ -914,6 +919,7 @@ Task<void> SettleInterrupted(StoredSession& stored, RuntimeState& runtime) {
     run.view.waits.clear();
     run.tool_plans.clear();
     run.items.clear();
+    run.model_history.messages.clear();
     run.pending_steers.clear();
     run.continuation.reset();
     run.pending_calls.clear();
@@ -962,7 +968,8 @@ StoredSession RuntimeState::Capture(const SessionData& session) const {
         .continuation_missing = !keep_resume && run.continuation.has_value(), .pending_calls = run.pending_calls,
         .model_boundary = run.model_boundary, .checkpoint = run.checkpoint, .form_requests = run.form_requests,
         .tool_requests = run.tool_requests, .model_skill_resources = run.model_skill_resources, .host_model_step = run.host_model_step,
-        .artifact_action = run.artifact_action, .delegate = run.delegate, .delegations = run.delegations});
+        .artifact_action = run.artifact_action, .delegate = run.delegate, .delegations = run.delegations,
+        .model_history = run.model_history});
   }
   for (const auto& [key, record] : commands) {
     if (record.progress.accepted.session == session.summary.id) image.commands.push_back({key.first, record});
@@ -1414,7 +1421,8 @@ Async<void> RuntimeState::LoadStored() {
           .checkpoint = std::move(entry.checkpoint), .form_requests = std::move(entry.form_requests),
           .tool_requests = std::move(entry.tool_requests),
           .restoring = restoring, .host_model_step = std::move(entry.host_model_step),
-          .delegate = std::move(entry.delegate), .delegations = std::move(entry.delegations)});
+          .delegate = std::move(entry.delegate), .delegations = std::move(entry.delegations),
+          .model_history = std::move(entry.model_history)});
     }
     for (auto& entry : image.commands) {
       auto key = std::pair(std::move(entry.principal), entry.record.progress.accepted.command);

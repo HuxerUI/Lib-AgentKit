@@ -58,7 +58,7 @@ huxerui_use_library(ganwork
 if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     target_link_libraries(ganwork PRIVATE nlohmann_json::nlohmann_json)
     if (WIN32)
-        target_link_libraries(ganwork PRIVATE crypt32)
+        target_link_libraries(ganwork PRIVATE crypt32 winhttp)
     endif ()
     include(cmake/LinkNavigation.cmake)
     agentkit_preview_link_navigation(ganwork)

@@ -178,6 +178,9 @@ RunExecution& RuntimeState::RecordRun(SessionData& session, PrincipalId user, Se
         })
       : session.messages.end();
   std::vector<ModelItem> items;
+  ModelHistory history;
+  const auto* model = ResolveModel(start.model);
+  const bool tracks_history = model && (model->context_limits.context_window || model->context_limits.max_input_tokens);
   for (auto it = session.messages.begin(); it != boundary; ++it) {
     const auto& message = *it;
     if (message.ref.session != summary.id || message.state != MessageState::Complete ||
@@ -189,12 +192,14 @@ RunExecution& RuntimeState::RecordRun(SessionData& session, PrincipalId user, Se
             return steer.message == message.ref.message && steer.state != SteerState::Applied;
           })) continue;
     }
+    const auto before = items.size();
     for (const auto& block : message.blocks) {
       if (const auto* text = std::get_if<TextBlock>(&block.body)) {
         items.push_back(ModelContent{message.author == MessageAuthor::User || message.author == MessageAuthor::Collaboration
             ? ModelContent::Role::User : ModelContent::Role::Assistant, text->text});
       }
     }
+    if (tracks_history && items.size() != before) history.messages.emplace_back(message.ref, items.size());
   }
   if (!input.text.empty()) items.push_back(ModelContent{ModelContent::Role::User, input.text});
   for (const auto& ref : input.attachments) items.push_back(ModelContent{ModelContent::Role::User, ref});
@@ -206,7 +211,8 @@ RunExecution& RuntimeState::RecordRun(SessionData& session, PrincipalId user, Se
   auto& run = runs.emplace(id, RunExecution{.view = std::move(view), .principal = std::move(user),
       .input = std::move(input), .items = std::move(items),
       .model_boundary = true,
-      .deadline = deadline ? std::optional<TimePoint>(Now() + *deadline) : std::nullopt}).first->second;
+      .deadline = deadline ? std::optional<TimePoint>(Now() + *deadline) : std::nullopt,
+      .model_history = std::move(history)}).first->second;
   summary.active_run = id;
   summary.run_state = RunState::Running;
   session.runs.push_back(id);

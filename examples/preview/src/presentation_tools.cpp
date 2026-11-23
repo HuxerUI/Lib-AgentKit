@@ -171,7 +171,19 @@ kit::AgentResult<StagedSlides> ReadStagedSlides(File file, const std::vector<kit
       pages.push_back(*page);
     }
   }
+  std::optional<PresentationOutline> plan;
+  auto index = archive.Value().ReadEntry("ppt/ganwork/plan.json");
+  if (index.Succeeded()) {
+    auto parsed = ReadPackedPresentationPlan(index.Value());
+    if (!parsed.Succeeded() || parsed.Value().slides.size() != count)
+      return Fail<StagedSlides>(kit::ErrorCode::InvalidState, "The staged presentation layout does not match its slides");
+    plan = std::move(parsed).Value();
+  }
   StagedSlides result;
+  if (plan) {
+    result.outline.title = plan->title;
+    result.outline.supplied_data = plan->supplied_data;
+  }
   for (const auto page : pages) {
     const auto stem = "slide" + std::to_string(page) + ".xml";
     auto entry = archive.Value().ReadEntry("ppt/slides/" + stem);
@@ -179,21 +191,33 @@ kit::AgentResult<StagedSlides> ReadStagedSlides(File file, const std::vector<kit
       return Fail<StagedSlides>(kit::ErrorCode::NotFound, "The selected slide is missing from the PowerPoint package");
     auto xml = Xml(entry.Value());
     result.screenshots.push_back(HasSlideScreenshot(archive.Value(), stem, xml));
+    const auto named = xml.find("name=\"GanWork text 0\"") != xml.npos;
     std::vector<std::string> paragraphs;
-    for (auto begin = xml.find("<a:t>"); begin != xml.npos; begin = xml.find("<a:t>")) {
-      xml.remove_prefix(begin + 5);
-      const auto end = xml.find("</a:t>");
-      auto decoded = end == xml.npos ? std::nullopt : DecodeSlideText(xml.substr(0, end));
+    std::size_t offset = 0;
+    for (auto begin = xml.find("<a:t>"); begin != xml.npos; begin = xml.find("<a:t>", offset)) {
+      const auto end = xml.find("</a:t>", begin + 5);
+      if (end == xml.npos)
+        return Fail<StagedSlides>(kit::ErrorCode::Unsupported, "This slide has malformed text");
+      offset = end + 6;
+      if (named) {
+        const auto shape = xml.rfind("<p:sp>", begin);
+        if (shape == xml.npos) continue;
+        const auto name = xml.find("name=\"GanWork text ", shape);
+        if (name == xml.npos || name > begin) continue;
+      }
+      auto decoded = DecodeSlideText(xml.substr(begin + 5, end - begin - 5));
       if (!decoded || paragraphs.size() >= 8)
         return Fail<StagedSlides>(kit::ErrorCode::Unsupported, "This slide does not use the Preview text layout");
       paragraphs.push_back(std::move(*decoded));
-      xml.remove_prefix(end + 6);
     }
-    if (paragraphs.size() < 2)
+    const std::size_t title_index = named ? 0 : 1;
+    if (paragraphs.size() <= title_index || (named && !plan))
       return Fail<StagedSlides>(kit::ErrorCode::Unsupported, "This slide does not use the Preview text layout");
-    if (result.outline.slides.empty()) result.outline.title = paragraphs.front();
-    SlideOutline slide{.title = std::move(paragraphs[1])};
-    for (std::size_t i = 2; i < paragraphs.size(); ++i) slide.bullets.push_back(std::move(paragraphs[i]));
+    if (!plan && result.outline.slides.empty()) result.outline.title = paragraphs.front();
+    auto slide = plan ? plan->slides[page - 1] : SlideOutline{};
+    slide.title = std::move(paragraphs[title_index]);
+    slide.bullets.clear();
+    for (std::size_t i = title_index + 1; i < paragraphs.size(); ++i) slide.bullets.push_back(std::move(paragraphs[i]));
     result.outline.slides.push_back(std::move(slide));
   }
   const auto checked = ReadPresentationOutline(WritePresentationOutline(result.outline));
@@ -201,7 +225,7 @@ kit::AgentResult<StagedSlides> ReadStagedSlides(File file, const std::vector<kit
   return kit::AgentResult<StagedSlides>::Success(std::move(result));
 }
 
-kit::AgentResult<ImageAsset> ReadPackageScreenshot(Bytes bytes, File scratch, std::size_t page) {
+kit::AgentResult<ImageAsset> ReadPackagePicture(Bytes bytes, File scratch, std::size_t page, bool generated) {
   auto output = scratch.OpenRandomAccess(FileAccessMode::WriteOnly, FileOpenMode::CreateNew);
   if (!output.Succeeded()) return Fail<ImageAsset>(kit::ErrorCode::ProviderFailure, "Could not open the presentation for review");
   const auto remove = [](const File* file) { static_cast<void>(file->Delete()); };
@@ -212,6 +236,17 @@ kit::AgentResult<ImageAsset> ReadPackageScreenshot(Bytes bytes, File scratch, st
     return Fail<ImageAsset>(kit::ErrorCode::ProviderFailure, "Could not open the presentation for review");
   auto package = archive::ArchiveReader::Open(scratch, {.max_entries = 256, .max_output_bytes = 8 * 1024 * 1024});
   if (!package.Succeeded()) return Fail<ImageAsset>(kit::ErrorCode::InvalidState, "The staged PowerPoint package could not be read");
+  if (generated) {
+    const auto path = "ppt/media/slide-" + std::to_string(page);
+    auto image = package.Value().ReadEntry(path + ".jpg");
+    if (!image.Succeeded()) image = package.Value().ReadEntry(path + ".png");
+    if (!image.Succeeded()) return Fail<ImageAsset>(kit::ErrorCode::NotFound, "The slide illustration is unavailable");
+    try {
+      return kit::AgentResult<ImageAsset>::Success(ImageAsset::FromEncoded(std::move(image).Value()));
+    } catch (const std::exception&) {
+      return Fail<ImageAsset>(kit::ErrorCode::Unsupported, "The slide illustration is invalid");
+    }
+  }
   const auto stem = "slide" + std::to_string(page) + ".xml";
   const auto slide = package.Value().ReadEntry("ppt/slides/" + stem);
   if (!slide.Succeeded() || !HasSlideScreenshot(package.Value(), stem, Xml(slide.Value())))
@@ -613,13 +648,26 @@ kit::Async<PresentationScreenshot> LoadPresentationScreenshot(std::shared_ptr<ki
   auto archive = co_await ReadPresentationBytes(runtime, version, 9 * 1024 * 1024);
   if (!archive.Succeeded()) co_return Result::Failure(archive.Error());
   const auto scratch = temporary.Child("ppt-review-" + kit::NewCommandId().value + ".pptx");
-  auto image = co_await ReadPackageAsync(ReadPackageScreenshot, std::move(archive).Value(), scratch, page);
+  auto image = co_await ReadPackageAsync(ReadPackagePicture, std::move(archive).Value(), scratch, page, false);
   if (!image.Succeeded()) co_return Result::Failure(image.Error());
   auto current = co_await runtime->Artifacts().ReadAsync(version);
   if (!current.Succeeded()) co_return Result::Failure(current.Error());
   const auto& parts = current.Value().parts;
   const auto selectable = std::ranges::find(parts, PresentationScreenshotPart(page), &kit::ArtifactPart::id) != parts.end();
   co_return Result::Success({std::move(image).Value(), selectable});
+}
+
+kit::Async<ImageAsset> LoadPresentationIllustration(std::shared_ptr<kit::AgentRuntime> runtime,
+    kit::ArtifactRef version, std::size_t page, File temporary) {
+  using Result = kit::AgentResult<ImageAsset>;
+  auto archive = co_await ReadPresentationBytes(runtime, version, 64 * 1024 * 1024);
+  if (!archive.Succeeded()) co_return Result::Failure(archive.Error());
+  const auto scratch = temporary.Child("ppt-review-" + kit::NewCommandId().value + ".pptx");
+  auto image = co_await ReadPackageAsync(ReadPackagePicture, std::move(archive).Value(), scratch, page, true);
+  if (!image.Succeeded()) co_return Result::Failure(image.Error());
+  auto current = co_await runtime->Artifacts().ReadAsync(version);
+  if (!current.Succeeded()) co_return Result::Failure(current.Error());
+  co_return image;
 }
 
 kit::TargetBaseline PresentationTargetBaseline(const kit::ArtifactRef& version) {
@@ -866,10 +914,10 @@ kit::ToolResourceResolver PresentationResources(PresentationFiles files,
 }
 
 kit::AgentResult<void> RegisterPresentationTools(
-    const std::shared_ptr<kit::AgentRuntime>& runtime, PresentationFiles files) {
+    const std::shared_ptr<kit::AgentRuntime>& runtime, PresentationFiles files, PresentationImageProvider image_provider) {
   auto generation = runtime->RegisterTool({
       .id = GeneratePresentation, .version = 1, .description = "Stage a presentation from its confirmed outline",
-      .input_schema = PresentationOutlineSchema(), .effect = kit::ToolEffect::StageArtifact,
+      .input_schema = PresentationOutlineSchema(SlideLayoutField::Optional, true), .effect = kit::ToolEffect::StageArtifact,
       .prepare = [](kit::ToolPrepareContext context, kit::ToolRequest request) -> kit::Async<kit::PreparedChange> {
         auto outline = ReadPresentationOutline(request.arguments);
         if (!outline.Succeeded()) co_return kit::AgentResult<kit::PreparedChange>::Failure(outline.Error());
@@ -878,7 +926,7 @@ kit::AgentResult<void> RegisterPresentationTools(
             .inputs = std::move(context.sources),
             .execution_data = std::move(request.arguments), .undo_support = kit::UndoSupport::None});
       },
-      .execute = [files, weak = std::weak_ptr<kit::AgentRuntime>(runtime)](
+      .execute = [files, image_provider = std::move(image_provider), weak = std::weak_ptr<kit::AgentRuntime>(runtime)](
                      kit::ToolContext context, kit::PreparedToolCall call) -> kit::Async<kit::ToolExecutionResult> {
         using Result = kit::AgentResult<kit::ToolExecutionResult>;
         auto outline = ReadPresentationOutline(call.change.execution_data);
@@ -903,15 +951,38 @@ kit::AgentResult<void> RegisterPresentationTools(
           if (!image.Succeeded()) co_return Result::Failure(image.Error());
           screenshot = std::move(image).Value();
         }
+        std::optional<PresentationImageModel> model;
+        std::map<std::size_t, ImageAsset> illustrations;
+        for (std::size_t page = 0; page < outline.Value().slides.size(); ++page) {
+          const auto& slide = outline.Value().slides[page];
+          const auto layout = ResolveSlideLayout(outline.Value(), page, screenshot && page + 1 == outline.Value().slides.size());
+          if (layout != SlideLayout::Image) continue;
+          if (!slide.media || slide.media->empty())
+            co_return Fail<kit::ToolExecutionResult>(kit::ErrorCode::InvalidArgument, "An illustrated slide needs an image prompt");
+          if (!model) {
+            if (!image_provider)
+              co_return Fail<kit::ToolExecutionResult>(kit::ErrorCode::InvalidState, "Configure a presentation image model in Settings");
+            auto configured = co_await image_provider();
+            if (!configured.Succeeded()) co_return Result::Failure(configured.Error());
+            model = std::move(configured).Value();
+          }
+          static_cast<void>(context.ReportProgress("Generating illustration for slide " + std::to_string(page + 1)));
+          auto image = co_await GeneratePresentationImage(*model, *slide.media +
+              "\nPresentation art only. Editorial illustration, full bleed, no text, no logos or watermarks.",
+              page + 1 != outline.Value().slides.size() || page == 0, context.StopToken());
+          if (!image.Succeeded()) co_return Result::Failure(image.Error());
+          illustrations.emplace(page, std::move(image).Value());
+        }
         auto destination = PptxFile(files, id);
         if (!co_await files.staging.CreateDirectoriesAsync()) {
           co_return Fail<kit::ToolExecutionResult>(kit::ErrorCode::ProviderFailure, "Could not create presentation staging directory");
         }
         static_cast<void>(context.ReportProgress("Packaging PowerPoint slides"));
         const bool includes_screenshot = screenshot.has_value();
-        auto build = [deck = outline.Value(), stop = context.StopToken(), screenshot = std::move(screenshot)](File output) {
+        auto build = [deck = outline.Value(), stop = context.StopToken(), screenshot = std::move(screenshot),
+                      illustrations = std::move(illustrations)](File output) {
           if (stop.stop_requested()) return Fail<void>(kit::ErrorCode::AlreadyClosed, "Presentation generation cancelled");
-          return CreatePptx(deck, output, screenshot);
+          return CreatePptx(deck, output, screenshot, illustrations);
         };
         auto created = co_await WritePackageAsync(files, destination, context.StopToken(), std::move(build));
         if (!created.Succeeded()) co_return kit::AgentResult<kit::ToolExecutionResult>::Failure(created.Error());
@@ -934,8 +1005,18 @@ kit::AgentResult<void> RegisterPresentationTools(
         }
         if (includes_screenshot)
           draft.parts.push_back({PresentationScreenshotPart(outline.Value().slides.size()), std::string(PresentationScreenshotLabel)});
-        kit::ToolExecutionResult result{.outcome = kit::ToolOutcome::Succeeded,
-                                       .model_value = std::move(call.change.execution_data)};
+        auto preview = std::move(call.change.execution_data);
+        if (std::ranges::any_of(outline.Value().slides, [](const auto& slide) {
+              return slide.layout && UsesSlideScene(*slide.layout, slide);
+            })) {
+          auto read = co_await ReadPackageAsync(ReadStagedSlides, destination, std::vector<kit::PartId>{});
+          if (!read.Succeeded()) {
+            static_cast<void>(co_await destination.DeleteAsync());
+            co_return Result::Failure(read.Error());
+          }
+          preview = WritePresentationOutline(read.Value().outline);
+        }
+        kit::ToolExecutionResult result{.outcome = kit::ToolOutcome::Succeeded, .model_value = std::move(preview)};
         result.blocks.push_back({kit::BlockId{kit::NewCommandId().value},
             kit::TextBlock{"Staged " + draft.name, false}});
         result.new_artifacts.push_back(std::move(draft));

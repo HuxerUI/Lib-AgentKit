@@ -242,6 +242,7 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HU
             examples/preview/src/general_workflow.cpp
             examples/preview/src/link_navigation.cpp
             examples/preview/src/local_files.cpp
+            examples/preview/src/host_tools.cpp
             examples/preview/src/markdown_images.cpp
             examples/preview/src/release_skill.cpp
             examples/preview/src/report_chart.cpp
@@ -253,6 +254,8 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HU
             examples/preview/src/workspace_evidence.cpp
             examples/preview/src/worktree.cpp
             examples/preview/src/presentation.cpp
+            examples/preview/src/presentation_scene.cpp
+            examples/preview/src/presentation_images.cpp
             examples/preview/src/presentation_tools.cpp
             examples/preview/src/presentation_view.cpp
             examples/preview/src/presentation_workflow.cpp
@@ -281,7 +284,7 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HU
     endif ()
     target_link_libraries(huxerui_agentkit_preview_tests PRIVATE HuxerUI::testing nlohmann_json::nlohmann_json)
     if (WIN32)
-        target_link_libraries(huxerui_agentkit_preview_tests PRIVATE crypt32)
+        target_link_libraries(huxerui_agentkit_preview_tests PRIVATE crypt32 winhttp)
     endif ()
     include(examples/preview/cmake/LinkNavigation.cmake)
     agentkit_preview_link_navigation(huxerui_agentkit_preview_tests)
@@ -317,6 +320,8 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HU
         if (WIN32)
             add_test(NAME huxerui_agentkit_model_editing_tests COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/model_editing_server.py" $<TARGET_FILE:huxerui_agentkit_preview_tests>)
+            add_test(NAME huxerui_agentkit_host_tools_tests COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/host_tools_server.py" $<TARGET_FILE:huxerui_agentkit_preview_tests>)
         endif ()
     endif ()
     add_test(NAME huxerui_agentkit_domain_review_tests COMMAND huxerui_agentkit_preview_tests --domain-review-windows)
@@ -353,9 +358,10 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HU
     add_executable(huxerui_agentkit_presentation_tests
             tests/presentation_test.cpp
             examples/preview/src/presentation.cpp
+            examples/preview/src/presentation_scene.cpp
     )
     target_include_directories(huxerui_agentkit_presentation_tests PRIVATE examples/preview/src)
-    target_link_libraries(huxerui_agentkit_presentation_tests PRIVATE HuxerUI::AgentKit HuxerUI::testing)
+    target_link_libraries(huxerui_agentkit_presentation_tests PRIVATE HuxerUI::AgentKit HuxerUI::testing nlohmann_json::nlohmann_json)
     agentkit_preview_link_archive(huxerui_agentkit_presentation_tests)
     add_test(NAME huxerui_agentkit_presentation_tests COMMAND huxerui_agentkit_presentation_tests)
 endif ()

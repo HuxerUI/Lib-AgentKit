@@ -54,6 +54,9 @@ const std::array tools{
 constexpr std::size_t max_text = 512 * 1024;
 constexpr std::size_t max_entries = 2048;
 constexpr std::size_t max_matches = 100;
+constexpr std::string_view page_prefix = "ganwork-html:";
+constexpr std::string_view page_type = "preview.local.html";
+constexpr std::string_view page_output_prefix = "local-page-publication/";
 const kit::ToolId choose_directory{"choose_directory"};
 const kit::ToolId task_directory{"task_directory"};
 
@@ -190,6 +193,26 @@ std::string ReadText(const fs::path& path) {
   try { static_cast<void>(Json(text).dump()); }
   catch (const Json::exception&) { throw std::runtime_error("Use a UTF-8 text file"); }
   return text;
+}
+
+bool HtmlFile(const fs::path& path) {
+  auto extension = TextPath(path.extension());
+  for (auto& ch : extension) if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+  return extension == ".html" || extension == ".htm";
+}
+
+std::optional<fs::path> CurrentPage(const kit::ResourceRef& source) {
+  auto path = ResolvePath(source.id.value);
+  if (!path.Succeeded() || TextPath(path.Value()) != source.id.value || !HtmlFile(path.Value())) return {};
+  std::error_code error;
+  if (!fs::is_regular_file(path.Value(), error) || error || FileVersion(path.Value(), source.id, error) != source || error) return {};
+  return std::move(path).Value();
+}
+
+std::optional<File> PageSnapshot(const File& pages, const kit::ArtifactRef& ref) {
+  if (!IsLocalPageArtifact(ref)) return {};
+  const auto path = ResolvePath(pages.Child(ref.id.value.substr(page_prefix.size()) + ".html").Path());
+  return path.Succeeded() ? std::optional{File(path.Value().u8string())} : std::nullopt;
 }
 
 Json FindEntries(Operation operation, const fs::path& directory, const Json& args,
@@ -343,7 +366,7 @@ bool WriteNewText(const fs::path& path, std::string_view text, bool overwrite, s
 }
 
 kit::AgentResult<kit::ToolExecutionResult> Execute(FileTool tool, kit::PreparedToolCall call,
-    std::vector<kit::ResourceAccess> grants, std::stop_token stop, const std::shared_ptr<LocalFileAccess>& access) {
+    std::vector<kit::ResourceAccess> grants, std::stop_token stop, const std::shared_ptr<LocalFileAccess>& access, File pages) {
   using Result = kit::AgentResult<kit::ToolExecutionResult>;
   const auto failure = [](kit::ErrorCode code, const std::string& message) {
     return Result::Success({.outcome = kit::ToolOutcome::Failed, .reason = kit::AgentError{.code = code, .message = message}});
@@ -428,6 +451,29 @@ kit::AgentResult<kit::ToolExecutionResult> Execute(FileTool tool, kit::PreparedT
         result.effects.push_back({grant.resource, kit::ResourceEffectState::Applied, grant.current, after});
       }
     }
+    if (result.outcome == kit::ToolOutcome::Succeeded && !interrupted() && HtmlFile(destination.empty() ? source : destination)) {
+      const auto output = kit::ResourceId{TextPath(destination.empty() ? source : destination)};
+      const auto effect = std::ranges::find(result.effects, output, &kit::ResourceEffect::resource);
+      if (effect != result.effects.end() && effect->after) {
+        const kit::ArtifactRef ref{{std::string(page_prefix) + call.call.value}, 1};
+        const auto saved = PageSnapshot(pages, ref);
+        try {
+          if (const auto path = CurrentPage(*effect->after); path && saved && pages.CreateDirectories()) {
+            const auto text = ReadText(*path);
+            if (CurrentPage(*effect->after) && !interrupted() &&
+                WriteNewText(fs::u8path(saved->Path()), text, false, error)) {
+              result.new_artifacts.push_back({.id = ref.id, .type = std::string(page_type),
+                  .name = TextPath(path->filename()),
+                  .storage_handle = Json{{"path", output.value}, {"version", effect->after->version}}.dump(),
+                  .size_bytes = text.size()});
+              result.blocks.front().id.value = std::string(page_output_prefix) + call.call.value;
+            }
+          }
+        } catch (const std::runtime_error&) {
+          // A file operation that already completed remains recorded even if the page cannot be staged.
+        }
+      }
+    }
     return Result::Success(std::move(result));
   } catch (const std::runtime_error& error) {
     return failure(kit::ErrorCode::ProviderFailure, error.what());
@@ -457,6 +503,12 @@ std::shared_ptr<huxerui::FilePicker> LocalFileAccess::DirectoryPicker() const {
 
 File LocalFileAccess::TaskDirectory(const kit::RunId& run) const {
   return task_files_.Child(run.value);
+}
+
+kit::AgentResult<std::string> LocalFileAccess::ResolveTaskDirectory(const kit::RunId& run) const {
+  auto path = ResolvePath(TaskDirectory(run).Path());
+  if (!path.Succeeded()) return kit::AgentResult<std::string>::Failure(path.Error());
+  return kit::AgentResult<std::string>::Success(TextPath(path.Value()));
 }
 
 kit::PolicyDecision LocalFileAccess::Decide(const kit::PolicyRequest& request) const {
@@ -518,6 +570,85 @@ kit::AgentResult<std::string> LocalDirectory(const File& directory) {
   return kit::AgentResult<std::string>::Success(TextPath(resolved.Value()));
 }
 
+bool IsLocalPageArtifact(const kit::ArtifactRef& artifact) {
+  if (artifact.version != 1 || !artifact.id.value.starts_with(page_prefix)) return false;
+  const auto key = std::string_view(artifact.id.value).substr(page_prefix.size());
+  return !key.empty() && key.size() <= 96 && std::ranges::all_of(key, [](char ch) {
+    return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '-';
+  });
+}
+
+bool HasLocalPagePublication(const kit::Message& output) {
+  return std::ranges::any_of(output.blocks, [](const auto& block) { return block.id.value.starts_with(page_output_prefix); });
+}
+
+std::optional<kit::ResourceRef> LocalPageOutput(const kit::ToolCallSnapshot& call) {
+  const auto* tool = FindTool(call.tool.id);
+  if (!tool || !Writes(tool->operation) || call.state != kit::ToolCallState::Succeeded) return {};
+  for (const auto& effect : call.effects) {
+    if (effect.state == kit::ResourceEffectState::Applied && effect.after && effect.after->id == effect.resource &&
+        effect.after->version.starts_with("local:") && HtmlFile(fs::u8path(effect.resource.value))) return effect.after;
+  }
+  return {};
+}
+
+kit::ArtifactStore WithLocalPages(kit::ArtifactStore store, File pages) {
+  store.preview = [fallback = std::move(store.preview), pages](kit::ArtifactResolveRequest request)
+      -> kit::Async<kit::ArtifactPreview> {
+    if (!IsLocalPageArtifact(request.artifact) && fallback) co_return co_await fallback(std::move(request));
+    const auto file = PageSnapshot(pages, request.artifact);
+    if (file) {
+      const auto stat = co_await file->StatAsync();
+      const auto source = Json::parse(request.storage_handle, nullptr, false);
+      if (stat.Succeeded() && stat.Value().type == huxerui::FileType::File && stat.Value().size <= max_text &&
+          source.is_object() && source.contains("path") && source.at("path").is_string() &&
+          source.contains("version") && source.at("version").is_string()) {
+        co_return kit::AgentResult<kit::ArtifactPreview>::Success({
+            .artifact = request.artifact, .structured = DecodeJson(source), .type = std::string(page_type)});
+      }
+    }
+    co_return Fail<kit::ArtifactPreview>(kit::ErrorCode::NotFound, "The saved HTML page is unavailable");
+  };
+  store.open = [fallback = std::move(store.open), pages](kit::ArtifactResolveRequest request)
+      -> kit::Async<huxerui::AsyncInputStream> {
+    if (!IsLocalPageArtifact(request.artifact) && fallback) co_return co_await fallback(std::move(request));
+    if (const auto file = PageSnapshot(pages, request.artifact)) {
+      auto stream = co_await file->OpenReadAsync();
+      if (stream.Succeeded()) co_return kit::AgentResult<huxerui::AsyncInputStream>::Success(std::move(stream).Value());
+    }
+    co_return Fail<huxerui::AsyncInputStream>(kit::ErrorCode::NotFound, "The saved HTML page is unavailable");
+  };
+  return store;
+}
+
+kit::AgentResult<File> ResolveLocalPage(File pages, std::optional<kit::ArtifactPreview> artifact,
+    std::optional<kit::ResourceRef> legacy) {
+  using Result = kit::AgentResult<File>;
+  if (legacy) {
+    if (const auto original = CurrentPage(*legacy)) return Result::Success(File(original->u8string()));
+    return Fail<File>(kit::ErrorCode::NotFound, "The original HTML file changed or is no longer there");
+  }
+  if (artifact && artifact->structured) {
+    const auto snapshot = PageSnapshot(pages, artifact->artifact);
+    if (snapshot) {
+      try {
+        const auto bytes = ReadText(fs::u8path(snapshot->Path()));
+        const auto source = EncodeJson(*artifact->structured);
+        const kit::ResourceRef original{{source.at("path").get<std::string>()}, source.at("version").get<std::string>()};
+        if (const auto current = CurrentPage(original)) {
+          try {
+            if (ReadText(*current) == bytes) return Result::Success(File(current->u8string()));
+          } catch (const std::runtime_error&) {
+          }
+        }
+        return Result::Success(*snapshot);
+      } catch (const std::exception&) {
+      }
+    }
+  }
+  return Fail<File>(kit::ErrorCode::NotFound, "The saved HTML page is unavailable");
+}
+
 kit::ToolResourceResolver LocalFileResources(std::shared_ptr<CodeWorkspaces> workspaces) {
   return [workspaces = std::move(workspaces)](kit::ToolInvocation invocation) -> kit::Async<std::vector<kit::ResourceAccess>> {
     using Grants = std::vector<kit::ResourceAccess>;
@@ -551,15 +682,16 @@ kit::ToolResourceResolver LocalFileResources(std::shared_ptr<CodeWorkspaces> wor
   };
 }
 
-kit::AgentResult<void> RegisterLocalFileTools(const std::shared_ptr<kit::AgentRuntime>& runtime, std::shared_ptr<LocalFileAccess> access) {
+kit::AgentResult<void> RegisterLocalFileTools(const std::shared_ptr<kit::AgentRuntime>& runtime,
+    std::shared_ptr<LocalFileAccess> access, File pages) {
   for (const auto& tool : tools) {
     auto result = runtime->RegisterTool({.id = {tool.name}, .version = 1, .description = tool.description,
         .input_schema = InputSchema(tool.operation), .effect = Writes(tool.operation) ? kit::ToolEffect::WriteResource : kit::ToolEffect::Read,
         .prepare = [tool, access](kit::ToolPrepareContext context, kit::ToolRequest request) -> kit::Async<kit::PreparedChange> {
           co_return Prepare(tool, context, EncodeJson(request.arguments), *access->Current());
         },
-        .execute = [tool, access](kit::ToolContext context, kit::PreparedToolCall call) -> kit::Async<kit::ToolExecutionResult> {
-          co_return co_await huxerui::RunWorker(Execute, tool, std::move(call), context.Resources(), context.StopToken(), access);
+        .execute = [tool, access, pages](kit::ToolContext context, kit::PreparedToolCall call) -> kit::Async<kit::ToolExecutionResult> {
+          co_return co_await huxerui::RunWorker(Execute, tool, std::move(call), context.Resources(), context.StopToken(), access, pages);
         }});
     if (!result.Succeeded()) return result;
   }
@@ -613,13 +745,14 @@ kit::AgentResult<void> RegisterLocalFileTools(const std::shared_ptr<kit::AgentRu
       .execute = [access](kit::ToolContext context, kit::PreparedToolCall call) -> kit::Async<kit::ToolExecutionResult> {
         using Result = kit::AgentResult<kit::ToolExecutionResult>;
         if (context.StopToken().stop_requested()) co_return Result::Success({.outcome = kit::ToolOutcome::Cancelled});
-        const auto scratch = access->TaskDirectory({std::get<std::string>(call.change.execution_data.value)});
-        auto safe = ResolvePath(scratch.Path());
+        const kit::RunId run{std::get<std::string>(call.change.execution_data.value)};
+        const auto scratch = access->TaskDirectory(run);
+        auto safe = access->ResolveTaskDirectory(run);
         if (!safe.Succeeded()) co_return Result::Failure(safe.Error());
         if (!co_await scratch.CreateDirectoriesAsync())
           co_return Fail<kit::ToolExecutionResult>(kit::ErrorCode::ProviderFailure, "Could not open the temporary directory");
         co_return Result::Success({.outcome = kit::ToolOutcome::Succeeded,
-            .model_value = DecodeJson(Json{{"path", TextPath(safe.Value())}})});
+            .model_value = DecodeJson(Json{{"path", std::move(safe).Value()}})});
       }});
 }
 

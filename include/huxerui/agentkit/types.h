@@ -215,6 +215,8 @@ struct AgentError {
   /// Optional retry delay supplied by a host adapter. Built-in HTTP adapters currently leave it empty.
   std::optional<Duration> retry_after;
   /// Optional provider or protocol-specific diagnostic code.
+  /// Built-in model adapters use first_response_timeout, stream_idle_timeout, request_deadline,
+  /// output_token_limit and context_window_exceeded for typed model turn failures.
   std::optional<std::string> provider_code;
   /// Proposed scope for a ScopeExpansionRequired result.
   std::optional<ScopeExpansion> proposed_scope;

@@ -837,7 +837,8 @@ View WorkspaceChangeActivity(std::shared_ptr<kit::Conversation> conversation, st
     }
     const bool applied = effect.state == kit::ResourceEffectState::Applied;
     const bool expanded = resource && resource == effect.after;
-    const auto status = applied ? ::app::strings::ui_workspace_file_applied :
+    const bool skipped = effect.state == kit::ResourceEffectState::Unchanged && call.state == kit::ToolCallState::PartiallyApplied;
+    const auto status = applied ? ::app::strings::ui_workspace_file_applied : skipped ? ::app::strings::ui_workspace_file_skipped :
         effect.state == kit::ResourceEffectState::Unchanged ? ::app::strings::ui_workspace_file_unchanged :
         ::app::strings::ui_workspace_file_unverified;
     std::vector<View> cells {

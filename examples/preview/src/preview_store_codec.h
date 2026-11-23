@@ -42,6 +42,8 @@ inline kit::AgentResult<NavigationPreferences> DecodeNavigation(const nlohmann::
       if (id.empty() || std::ranges::find(navigation.groups, group, &ConversationGroup::id) == navigation.groups.end()) return invalid();
       navigation.memberships.try_emplace(kit::SessionId{id}, group);
     }
+    navigation.last_assistant.value = document.value("last_assistant", std::string{});
+    navigation.auto_review_new_conversations = document.value("auto_review_new_conversations", false);
   } catch (const nlohmann::json::exception&) {
     return invalid();
   }
@@ -57,6 +59,7 @@ inline nlohmann::json EncodeNavigation(const NavigationPreferences& navigation) 
   }
   auto sessions = nlohmann::json::object();
   for (const auto& [id, group] : navigation.memberships) sessions[id.value] = group;
-  return {{"groups", std::move(groups)}, {"sessions", std::move(sessions)}};
+  return {{"groups", std::move(groups)}, {"sessions", std::move(sessions)},
+      {"last_assistant", navigation.last_assistant.value}, {"auto_review_new_conversations", navigation.auto_review_new_conversations}};
 }
 } // namespace agentkit_preview::storage

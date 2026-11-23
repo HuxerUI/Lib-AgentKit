@@ -16,6 +16,6 @@ struct PresentationSkillEvidence {
 huxerui::agentkit::Async<huxerui::agentkit::RunCompletion> RunPresentation(
     huxerui::agentkit::RunContext context, huxerui::agentkit::RunInput input,
     std::optional<huxerui::agentkit::RunCheckpoint> checkpoint, std::string export_directory,
-    std::optional<PresentationSkillEvidence> skill = {});
+    std::optional<PresentationSkillEvidence> skill = {}, bool image_generation = false);
 
 } // namespace agentkit_preview

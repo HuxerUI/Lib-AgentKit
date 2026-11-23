@@ -884,6 +884,16 @@ struct RunTiming {
   std::optional<TimePoint> input_wait_started_at;
 };
 
+/// @brief Estimated input occupancy of a model turn with a known context budget.
+struct ModelContextUsage {
+  /// Input tokens estimated for the latest assembled request, including model instructions and tools.
+  std::uint64_t estimated_input_tokens = 0;
+  /// Input tokens available after reserving space for this turn's work.
+  std::uint64_t input_budget_tokens = 0;
+  /// Initial estimate for this request if compaction reduced it.
+  std::optional<std::uint64_t> before_compaction_tokens;
+};
+
 /// @brief Authorized, durable state of one Run.
 struct RunSnapshot {
   /// Execution attempt ID.
@@ -931,6 +941,8 @@ struct RunSnapshot {
   std::string reasoning_summary;
   /// Whether the runtime is requesting or consuming a model turn.
   bool model_active = false;
+  /// Occupancy of the latest model request with a known input budget, when available.
+  std::optional<ModelContextUsage> context_usage;
 };
 
 /// @brief Versioned interaction payload requesting user data.

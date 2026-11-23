@@ -23,13 +23,7 @@ struct ComposerDraft {
   bool saving_preference = false;
 };
 
-struct ModelLimits {
-  std::optional<std::uint64_t> context_window;
-  std::optional<std::uint64_t> max_input_tokens;
-  std::optional<std::uint64_t> max_output_tokens;
-
-  bool operator==(const ModelLimits&) const = default;
-};
+using ModelLimits = huxerui::agentkit::ModelContextLimits;
 
 struct ModelChoice {
   huxerui::agentkit::ModelProviderRef ref;
@@ -96,7 +90,7 @@ public:
 
   huxerui::agentkit::ExecutionProfileRef GrantFullAccess(huxerui::agentkit::WorkspaceId workspace);
   huxerui::agentkit::AgentResult<huxerui::agentkit::PolicyDecision> Decide(
-      const huxerui::agentkit::PolicyRequest& request, bool needs_confirmation, bool workspace_available) const;
+      const huxerui::agentkit::PolicyRequest& request, bool needs_confirmation, bool workspace_available, bool full_local_access) const;
 
 private:
   std::vector<ModelChoice> models_;
@@ -113,6 +107,7 @@ huxerui::View RunSettingsControls(std::shared_ptr<RunSettings> settings,
     huxerui::State<huxerui::agentkit::UserRunOptions> next, huxerui::agentkit::AgentId agent,
     std::optional<huxerui::agentkit::WorkspaceId> workspace, std::optional<huxerui::File> workspace_root,
     std::function<void()> changed = {},
-    std::optional<huxerui::View> extra_action = {}, AddModelProfile add_model = {}, bool show_permissions = true);
+    std::optional<huxerui::View> extra_action = {}, AddModelProfile add_model = {}, bool show_permissions = true,
+    bool full_local_access = false, huxerui::agentkit::ExecutionProfileRef default_profile = AskProfile);
 
 } // namespace agentkit_preview

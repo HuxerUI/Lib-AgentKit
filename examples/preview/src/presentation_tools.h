@@ -3,6 +3,7 @@
 #include <huxerui/agentkit/runtime.h>
 
 #include "presentation.h"
+#include "presentation_images.h"
 
 namespace agentkit_preview {
 
@@ -53,13 +54,16 @@ struct PresentationScreenshot {
 huxerui::agentkit::Async<PresentationScreenshot> LoadPresentationScreenshot(
     std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime, huxerui::agentkit::ArtifactRef version,
     std::size_t page, huxerui::File temporary);
+huxerui::agentkit::Async<huxerui::ImageAsset> LoadPresentationIllustration(
+    std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime, huxerui::agentkit::ArtifactRef version,
+    std::size_t page, huxerui::File temporary);
 huxerui::agentkit::ToolResourceResolver PresentationResources(PresentationFiles files,
     std::shared_ptr<std::weak_ptr<huxerui::agentkit::AgentRuntime>> runtime);
 huxerui::agentkit::Async<huxerui::Bytes> ReadPresentationBytes(
     const std::shared_ptr<huxerui::agentkit::AgentRuntime>& runtime, huxerui::agentkit::ArtifactRef version,
     std::optional<std::size_t> byte_limit = {});
 huxerui::agentkit::AgentResult<void> RegisterPresentationTools(
-    const std::shared_ptr<huxerui::agentkit::AgentRuntime>& runtime, PresentationFiles files);
+    const std::shared_ptr<huxerui::agentkit::AgentRuntime>& runtime, PresentationFiles files, PresentationImageProvider image_provider = {});
 huxerui::agentkit::AgentResult<void> ValidatePresentationFilename(std::string_view name);
 huxerui::agentkit::AgentResult<void> VerifyPresentationExport(
     const PresentationFiles& files, const huxerui::Bytes& source, const huxerui::agentkit::ResourceId& target,

@@ -3,6 +3,7 @@
 #include <huxerui/data.h>
 
 #if defined(_WIN32)
+#include <filesystem>
 #include <windows.h>
 #include <shellapi.h>
 #elif defined(__linux__) && !defined(__ANDROID__)
@@ -68,6 +69,41 @@ std::shared_ptr<kit::AgentChatLinkHandler> MakePreviewLinkHandler() {
       .open = OpenWebLink});
 #else
   return {};
+#endif
+}
+
+bool CanOpenLocalPages() {
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__) && !defined(__EMSCRIPTEN__))
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool OpenLocalPage(const huxerui::File& file) {
+#if defined(_WIN32)
+  namespace fs = std::filesystem;
+  const auto path = fs::u8path(file.Path());
+  if (!path.is_absolute() || path.native().find(L'"') != std::wstring::npos) return false;
+  constexpr auto app_path = L"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe";
+  const auto argument = L"\"" + path.native() + L"\"";
+  for (const auto registry : {HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE}) {
+    std::wstring executable(32768, L'\0');
+    DWORD bytes = static_cast<DWORD>(executable.size() * sizeof(wchar_t));
+    if (RegGetValueW(registry, app_path, nullptr, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, nullptr, executable.data(), &bytes)
+        != ERROR_SUCCESS) continue;
+    executable.resize(std::char_traits<wchar_t>::length(executable.c_str()));
+    const fs::path chrome(executable);
+    if (chrome.is_absolute() && _wcsicmp(chrome.filename().c_str(), L"chrome.exe") == 0 &&
+        reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", chrome.c_str(), argument.c_str(), nullptr, SW_SHOWNORMAL)) > 32)
+      return true;
+  }
+  return reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32;
+#elif defined(__linux__) && !defined(__ANDROID__) && !defined(__EMSCRIPTEN__)
+  return g_app_info_launch_default_for_uri(file.ToUri().ToString().c_str(), nullptr, nullptr);
+#else
+  static_cast<void>(file);
+  return false;
 #endif
 }
 

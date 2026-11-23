@@ -8,8 +8,10 @@
 #include "runtime_internal.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
+#include <numbers>
 #include <nlohmann/json.hpp>
 #include <ranges>
 #include <set>
@@ -160,6 +162,11 @@ std::optional<AgentChatCitation> LastCompletedReply(const std::vector<Message>& 
   return {};
 }
 
+TextStyle ChatBodyStyle(const ThemeSpec& theme, bool bubbles) {
+  const auto size = bubbles ? theme.typography.body_large : theme.typography.body_medium;
+  return {Font::FromFamily(theme.typography.family, size), theme.colors.on_surface};
+}
+
 [[huxerui::composable]]
 View SelectableText(SourceRef source, std::variant<BlockId, PartId> leaf, std::string text,
                     State<std::optional<SelectedText>> selection, std::string key,
@@ -167,7 +174,7 @@ View SelectableText(SourceRef source, std::variant<BlockId, PartId> leaf, std::s
   const auto local_target = UseViewHandle();
   const auto anchor = target.value_or(local_target);
   const auto theme = UseTheme();
-  const TextStyle style{Font::System(14.0F), theme.colors.on_surface};
+  const auto style = ChatBodyStyle(theme, UseEnvironment<AgentChatLayoutStyle>().chat_bubbles);
   const TextShapingOptions shaping{.locale = std::string(UseEnvironment<Locale>().LanguageTag())};
   Frame frame;
   if (fit_content) {
@@ -208,14 +215,14 @@ StringVariant AuthorLabel(MessageAuthor author, std::string_view agent) {
   return {};
 }
 
-TextFieldStyle ChatFieldStyle(TextFieldStyle style, const ThemeSpec& theme) {
+TextFieldStyle ChatFieldStyle(TextFieldStyle style, const TextStyle& text, Color placeholder) {
   style.show_label = false;
   style.standard.border = Color::Transparent();
   style.standard.hovered_border = Color::Transparent();
   style.standard.focused_border = Color::Transparent();
   style.standard.minimum_height = 0.0F;
-  style.text_style = {Font::System(14.0F), theme.colors.on_surface};
-  style.placeholder_style = {Font::System(14.0F), theme.colors.on_surface_variant};
+  style.text_style = text;
+  style.placeholder_style = {text.font, placeholder};
   style.padding = {};
   return style;
 }
@@ -259,11 +266,8 @@ View ChatComposerInput(State<TextEditingValue> draft, ViewHandle focus, State<bo
                        StringVariant placeholder, const char* key, std::function<void()> submit,
                        bool enabled = true, bool dense = false) {
   const auto bubbles = UseEnvironment<AgentChatLayoutStyle>().chat_bubbles;
-  auto style = ChatFieldStyle(UseEnvironment<TextFieldStyle>(), UseTheme());
-  if (bubbles) {
-    style.text_style.font = Font::System(15.0F);
-    style.placeholder_style.font = Font::System(15.0F);
-  }
+  const auto theme = UseTheme();
+  auto style = ChatFieldStyle(UseEnvironment<TextFieldStyle>(), ChatBodyStyle(theme, bubbles), theme.colors.on_surface_variant);
   return ProvideEnvironment(style, Row{
       TextField(draft).Placeholder(std::move(placeholder)).Label(huxerui_agentkit::strings::ui_message)
           .LineLimits(TextFieldLineLimits::MultiLine(dense ? 1 : 2, 5)).Variant(TextFieldVariant::Standard)
@@ -271,17 +275,52 @@ View ChatComposerInput(State<TextEditingValue> draft, ViewHandle focus, State<bo
           .On<ViewEvents::FocusChanged>([focused](bool value) { focused = value; })
           .On<ViewEvents::KeyIntercept>([draft, submit](const KeyEvent& event) { return SubmitOnEnter(event, draft.Get(), submit); })
           .OnSubmitted(submit).With(focus, Grow(), Enabled(enabled)).Key(key),
-  }.With(Frame{.min_height = dense ? 38.0F : bubbles ? 54.0F : 59.0F},
+  }.With(Frame{.min_height = dense ? 38.0F : bubbles ? 46.0F : 59.0F},
          Padding(EdgeInsets{.top = 4.0F, .right = 4.0F, .left = 4.0F})).Key("message-input"));
 }
 
 [[huxerui::composable]]
 View ChatComposerPanel(std::vector<View> content, State<bool> focused, bool bubbles, const ColorScheme& colors) {
   return Column(std::move(content)).With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Stretch),
-      Padding(bubbles ? 11.0F : 8.0F), CornerRadius(bubbles ? 17.0F : 11.0F),
+      Padding(bubbles ? 10.0F : 8.0F), CornerRadius(bubbles ? 15.0F : 11.0F),
       Background(bubbles ? colors.surface_container : colors.surface),
       Shadow{.color = Color::Rgb(34, 25, 55, 0.11F), .offset = {0.0F, 3.0F}, .blur_radius = 9.0F, .spread = -5.0F},
       Border{focused.Get() ? colors.on_primary_container : colors.outline}).Key("agent-chat-composer");
+}
+
+std::optional<ModelContextUsage> ComposerContextUsage(const SessionSnapshot& snapshot,
+    std::optional<ModelProviderRef> selected_model) {
+  if (snapshot.summary.active_run) {
+    const auto active = std::ranges::find(snapshot.runs, *snapshot.summary.active_run, &RunSnapshot::id);
+    return active == snapshot.runs.end() ? std::nullopt : active->context_usage;
+  }
+  const auto last = std::ranges::find_if(snapshot.runs.rbegin(), snapshot.runs.rend(),
+      [](const auto& run) { return !run.parent; });
+  if (last == snapshot.runs.rend() || (selected_model && last->model != *selected_model)) return {};
+  return last->context_usage;
+}
+
+View ComposerContextIndicator(ModelContextUsage usage, const ColorScheme& colors) {
+  const auto label = huxerui_agentkit::strings::ui_composer_context;
+  const auto ratio = usage.input_budget_tokens ?
+      std::min(1.0, static_cast<double>(usage.estimated_input_tokens) / usage.input_budget_tokens) : 1.0;
+  const auto percent = static_cast<unsigned>(std::floor(ratio * 100.0));
+  const auto details = usage.before_compaction_tokens
+      ? StringVariant::Format(huxerui_agentkit::strings::ui_composer_context_compacted,
+            percent, usage.estimated_input_tokens, usage.input_budget_tokens, *usage.before_compaction_tokens)
+      : StringVariant::Format(huxerui_agentkit::strings::ui_composer_context_usage,
+            percent, usage.estimated_input_tokens, usage.input_budget_tokens);
+  const auto ink = ratio >= 0.9 ? colors.primary : colors.on_surface_variant;
+  return Canvas([ratio, track = colors.outline, ink](PaintContext& context, Size size) {
+    constexpr auto circle = 2.0F * std::numbers::pi_v<float>;
+    const Point center{size.width / 2, size.height / 2};
+    const StrokeStyle stroke{.width = 1.5F, .cap = StrokeCap::Round};
+    context.DrawArc(center, 6.5F, 0, circle, track, stroke);
+    if (ratio > 0) context.DrawArc(center, 6.5F, -circle / 4, static_cast<float>(ratio) * circle, ink, stroke);
+  }).With(Frame{.width = 28.0F, .height = 32.0F}, Focusable(true), Tooltip(details),
+      Semantics{.role = SemanticRole::ProgressIndicator, .label = label, .value = details,
+          .range = SemanticRange{.maximum = 100, .current = static_cast<double>(percent)}})
+      .Key("composer-context");
 }
 
 [[huxerui::composable]]
@@ -387,18 +426,28 @@ std::string ActivityToolLabel(const ToolRef& tool, const std::function<std::stri
   return label.empty() ? tool.id.value : std::move(label);
 }
 
+struct ChatWorkLocation {
+  std::size_t row;
+  ToolCallId group;
+  ToolCallId call;
+};
+
 struct ChatTurnActivity {
   RunSnapshot run;
   std::vector<RunSnapshot> delegates;
   std::optional<MessageId> last_message;
-  std::optional<std::pair<std::size_t, ToolCallId>> first_change;
+  std::optional<ChatWorkLocation> first_change;
   bool waits_for_approval = false;
+};
+
+struct ChatToolGroup {
+  std::vector<ToolCallSnapshot> calls;
 };
 
 struct ChatActivityRows {
   std::map<RunId, ChatTurnActivity> turns;
   std::map<MessageId, RunId> footers;
-  std::map<MessageId, std::vector<ToolCallSnapshot>> steps;
+  std::map<MessageId, std::vector<ChatToolGroup>> groups;
   std::map<ToolCallId, const InteractionSnapshot*> approvals;
   std::set<MessageId> outputs;
   std::vector<std::size_t> history;
@@ -418,7 +467,7 @@ const ToolApproval* InlineToolApproval(const InteractionSnapshot& interaction) {
       ? approval : nullptr;
 }
 
-ChatActivityRows ActivityRows(const SessionSnapshot& snapshot, const ChatActivityFeed* feed) {
+ChatActivityRows ActivityRows(const SessionSnapshot& snapshot, const ChatActivityFeed* feed, bool group_tools) {
   ChatActivityRows rows;
   std::map<RunId, RunId> roots;
   for (const auto& visible : snapshot.runs) {
@@ -446,9 +495,29 @@ ChatActivityRows ActivityRows(const SessionSnapshot& snapshot, const ChatActivit
     const auto root = roots.find(*message.run);
     if (root != roots.end()) first_rows.try_emplace(root->second, index);
   }
+  for (const auto& tool : snapshot.tools) {
+    const auto root = roots.find(tool.run);
+    if (tool.registered_sequence && tool.output_message && root != roots.end() && first_rows.contains(root->second))
+      rows.outputs.insert(tool.output_message->message);
+  }
+  const auto visible_message = [&](const Message& message) {
+    return !rows.outputs.contains(message.ref.message) || std::ranges::any_of(message.blocks, ShowsToolOutputInHistory);
+  };
+  std::vector<std::size_t> visible_anchors;
+  if (group_tools) {
+    visible_anchors.reserve(snapshot.messages.size());
+    std::size_t anchor = 0;
+    for (std::size_t index = 0; index < snapshot.messages.size(); ++index) {
+      if (visible_message(snapshot.messages[index])) anchor = index;
+      visible_anchors.push_back(anchor);
+    }
+  }
   std::set<ToolCallId> placed;
-  for (const auto& visible : snapshot.tools) {
-    if (!visible.registered_sequence) continue;
+  std::vector<const ToolCallSnapshot*> ordered_tools;
+  for (const auto& tool : snapshot.tools) if (tool.registered_sequence) ordered_tools.push_back(&tool);
+  std::ranges::stable_sort(ordered_tools, {}, [](const auto* tool) { return *tool->registered_sequence; });
+  for (const auto* entry : ordered_tools) {
+    const auto& visible = *entry;
     const auto root = roots.find(visible.run);
     if (root == roots.end()) continue;
     const auto first = first_rows.find(root->second);
@@ -460,13 +529,16 @@ ChatActivityRows ActivityRows(const SessionSnapshot& snapshot, const ChatActivit
     auto index = first->second;
     const auto next = std::ranges::upper_bound(snapshot.messages, *tool.registered_sequence, {}, &Message::sequence);
     if (next != snapshot.messages.begin()) index = static_cast<std::size_t>(next - snapshot.messages.begin() - 1);
+    if (group_tools && visible_anchors[index] >= first->second) index = visible_anchors[index];
     const auto& anchor = snapshot.messages[index].ref.message;
-    rows.steps[anchor].push_back(tool);
+    auto& groups = rows.groups[anchor];
+    if (!group_tools || groups.empty() || groups.back().calls.front().run != tool.run) groups.emplace_back();
+    auto& calls = groups.back().calls;
+    calls.push_back(tool);
     placed.insert(tool.id);
-    if (tool.output_message) rows.outputs.insert(tool.output_message->message);
     if (std::ranges::any_of(tool.effects, [](const auto& effect) { return effect.state == ResourceEffectState::Applied; })) {
       auto& first_change = rows.turns.at(root->second).first_change;
-      if (!first_change || index < first_change->first) first_change = {index, tool.id};
+      if (!first_change || index < first_change->row) first_change = ChatWorkLocation{index, calls.front().id, tool.id};
     }
   }
   for (const auto& interaction : snapshot.interactions) {
@@ -475,8 +547,7 @@ ChatActivityRows ActivityRows(const SessionSnapshot& snapshot, const ChatActivit
   }
   for (std::size_t index = 0; index < snapshot.messages.size(); ++index) {
     const auto& message = snapshot.messages[index];
-    if (rows.outputs.contains(message.ref.message) && !rows.steps.contains(message.ref.message) &&
-        !std::ranges::any_of(message.blocks, ShowsToolOutputInHistory)) continue;
+    if (!visible_message(message) && !rows.groups.contains(message.ref.message)) continue;
     rows.history.push_back(index);
     if (!message.run) continue;
     const auto root = roots.find(*message.run);
@@ -493,14 +564,13 @@ ChatActivityRows ActivityRows(const SessionSnapshot& snapshot, const ChatActivit
   };
   for (const auto index : rows.history) {
     const auto& message = snapshot.messages[index];
-    if (message.author == MessageAuthor::Agent || (message.author == MessageAuthor::Tool && message.run &&
-        (!rows.outputs.contains(message.ref.message) || std::ranges::any_of(message.blocks, ShowsToolOutputInHistory)))) {
+    if (message.author == MessageAuthor::Agent || (message.author == MessageAuthor::Tool && message.run && visible_message(message))) {
       begin_assistant(message.run, message.ref.message);
     } else if (message.author != MessageAuthor::Tool) {
       assistant_run.reset();
     }
-    if (const auto steps = rows.steps.find(message.ref.message); steps != rows.steps.end()) {
-      for (const auto& tool : steps->second) begin_assistant(tool.run, tool.id);
+    if (const auto groups = rows.groups.find(message.ref.message); groups != rows.groups.end()) {
+      for (const auto& group : groups->second) begin_assistant(group.calls.front().run, group.calls.front().id);
     }
     if (const auto footer = rows.footers.find(message.ref.message); footer != rows.footers.end())
       begin_assistant(footer->second, footer->second);
@@ -527,7 +597,9 @@ Indication ActivityDisclosureIndication(const ThemeSpec& theme) {
 [[huxerui::composable]]
 View ChatActivityHeader(StringVariant status, std::optional<StringVariant> time = {},
                         bool active = true, std::optional<View> details = {}) {
-  const auto colors = UseTheme().colors;
+  const auto theme = UseTheme();
+  const auto& colors = theme.colors;
+  const auto label = Font::FromFamily(theme.typography.family, theme.typography.body_small);
   const auto dot = active ? colors.primary : colors.on_surface_variant;
   std::vector<View> labels{
       Canvas([dot](PaintContext& context, Size size) { context.DrawRect({0, 0, size.width, size.height}, dot); })
@@ -535,11 +607,11 @@ View ChatActivityHeader(StringVariant status, std::optional<StringVariant> time 
   };
   if (!UseEnvironment<AgentChatLayoutStyle>().chat_bubbles)
     labels.push_back(Text(huxerui_agentkit::strings::ui_assistant, TextRole::Label)
-        .Style({Font::System(12.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}));
+        .Style({label.WithWeight(FontWeight::SemiBold), colors.on_surface}));
   labels.push_back(Text(std::move(status), TextRole::Label)
-      .Style({Font::System(12.0F), colors.on_surface_variant}).Key("chat-assistant-status"));
+      .Style({label, colors.on_surface_variant}).Key("chat-assistant-status"));
   if (time) labels.push_back(Text(std::move(*time), TextRole::Label)
-      .Style({Font::Monospace(11.0F), colors.on_surface_variant}).Key("chat-run-time"));
+      .Style({label, colors.on_surface_variant}).Key("chat-run-time"));
   if (details) labels.push_back(std::move(*details));
   return Flow(std::move(labels)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
 }
@@ -647,6 +719,8 @@ View MarkdownMessageBlock(MessageRef message, BlockId block, std::string source,
                           State<std::optional<SelectedText>> selection,
                           std::shared_ptr<const AgentChatLinkHandler> links, bool fill_width) {
   const auto theme = UseTheme();
+  const bool bubbles = UseEnvironment<AgentChatLayoutStyle>().chat_bubbles;
+  const auto body_style = ChatBodyStyle(theme, bubbles);
   const auto parser = UseState(std::make_shared<markdown::MarkdownParseSession>(detail::MarkdownSelectionParseOptions()));
   const auto link_error = UseState(std::string{});
   const auto images = OptionalChatService<AgentChatImageLoader>();
@@ -670,15 +744,17 @@ View MarkdownMessageBlock(MessageRef message, BlockId block, std::string source,
   };
   if (!document || detail::IsPlainMarkdown(*document, source)) {
     if (can_select) return source_field();
-    return Text(source).Style({Font::System(14.0F), theme.colors.on_surface});
+    return Text(source).Style(body_style);
   }
 
   auto style = markdown::MarkdownStyle::FromTheme(theme);
-  style.body = {Font::FromFamily(theme.typography.family, 15.0F), theme.colors.on_surface};
+  style.body = body_style;
+  if (!bubbles) style.body.font = body_style.font.WithSize(15.0F);
   style.code = {Font::Monospace(13.0F), theme.colors.on_surface};
-  style.heading_sizes = {27.0F, 23.0F, 21.0F, 19.0F, 18.0F, 17.0F};
+  style.heading_sizes = bubbles ? std::array{24.0F, 21.0F, 18.0F, 17.0F, 16.0F, 15.0F}
+                                : std::array{27.0F, 23.0F, 21.0F, 19.0F, 18.0F, 17.0F};
   style.block_spacing = 12.0F;
-  style.list_spacing = 6.0F;
+  style.list_spacing = bubbles ? 4.0F : 6.0F;
   style.indent = 19.0F;
   style.code_background = theme.colors.surface_container_low;
   style.quote_background = theme.colors.surface_container_low;
@@ -860,8 +936,10 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
   const bool user = message.author == MessageAuthor::User;
   const bool agent_reply = message.author == MessageAuthor::Agent;
   const bool bubble = bubbles && (user || agent_reply);
+  const bool artifact_delivery = bubbles && message.author == MessageAuthor::Tool && !message.blocks.empty() &&
+      std::ranges::all_of(message.blocks, [](const ContentBlock& block) { return std::holds_alternative<ArtifactBlock>(block.body); });
   std::vector<View> content;
-  if (!bubble) content.push_back(Text(AuthorLabel(message.author, agent))
+  if (!bubble && !artifact_delivery) content.push_back(Text(AuthorLabel(message.author, agent))
       .Style({Font::System(12.0F).WithWeight(FontWeight::SemiBold), colors.on_surface_variant}));
   if (steer) {
     auto status = Text(*steer == SteerState::Pending ? huxerui_agentkit::strings::ui_waiting_to_apply :
@@ -883,7 +961,7 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
       } else if (selectable && message.state == MessageState::Complete && !text->text.empty()) {
         content.push_back(SelectableText(message.ref, block.id, text->text, selection, block.id.value, {}, bubble && user));
       } else {
-        content.push_back(Text(text->text).Style({Font::System(14.0F), colors.on_surface}).Key(block.id.value));
+        content.push_back(Text(text->text).Style(ChatBodyStyle(theme, bubbles)).Key(block.id.value));
       }
       if (selected && selected->source.text_range &&
           selected->source.text_range->leaf == std::variant<BlockId, PartId>{block.id}) {
@@ -1038,19 +1116,66 @@ View ReviewedApproval(const SessionSnapshot& snapshot, ArtifactRef artifact, Age
   }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
+struct ChatDisclosureAnchor {
+  detail::ChatReadingPosition position;
+  float top;
+};
+
+using ChatDisclosureRequest = std::shared_ptr<std::optional<ChatDisclosureAnchor>>;
+
+struct ChatDisclosureGeometry {
+  class Extension;
+  std::shared_ptr<std::optional<float>> top;
+};
+
+class ChatDisclosureGeometry::Extension final : public NodeExtension {
+public:
+  Extension(ViewNode&, const ChatDisclosureGeometry& config) : top_(config.top) {}
+
+  void Update(ViewNode&, const ChatDisclosureGeometry& config) { top_ = config.top; }
+
+  PaintInvalidation PrepareGeometry(ViewNode& node, TextMeasurer&) override {
+    const auto bounds = node.PresentationBounds();
+    if (bounds.IsEmpty()) top_->reset();
+    else *top_ = bounds.y;
+    return PaintInvalidation::None;
+  }
+
+private:
+  std::shared_ptr<std::optional<float>> top_;
+};
+
+View WorkDisclosure(View heading, std::string key, std::function<void()> toggle,
+                   std::function<void()> keep_reading, ChatDisclosureRequest request) {
+  auto top = std::make_shared<std::optional<float>>();
+  const detail::ChatReadingPosition anchor{key};
+  const auto activate = [request, top, anchor, keep_reading = std::move(keep_reading), toggle = std::move(toggle)] {
+    keep_reading();
+    if (*top) *request = ChatDisclosureAnchor{anchor, **top};
+    toggle();
+  };
+  return std::move(heading).OnClick(activate).On<ViewEvents::KeyDown>([activate](const KeyEvent& event) {
+    if (event.key != Key::Enter && event.key != Key::Space) return false;
+    if (!event.repeat) activate();
+    return true;
+  }).With(ChatDisclosureGeometry{std::move(top)}, Focusable{}, PointerCursor(PointerCursorKind::Hand))
+      .LayoutValue<detail::ChatReadingPositionKey>(anchor).Key(std::move(key));
+}
+
 [[huxerui::composable]]
 View ChatToolStep(ToolCallSnapshot call, std::string label, std::shared_ptr<const Message> anchor,
                   std::shared_ptr<const Message> output,
                   std::shared_ptr<Conversation> conversation, decltype(AgentChatOptions::render_block) render,
-                  State<std::set<ToolCallId>> opened, std::function<void()> keep_reading, std::optional<View> approval) {
+                  State<std::set<ToolCallId>> opened, std::function<void()> keep_reading, ChatDisclosureRequest disclosure,
+                  std::optional<View> approval, bool grouped) {
   const auto theme = UseTheme();
   const auto& colors = theme.colors;
+  const auto label_font = Font::FromFamily(theme.typography.family, theme.typography.body_small);
   const auto status = UseString(ActivityToolStateLabel(call.state));
   const auto text = label + " · " + status;
   const bool expanded = opened->contains(call.id);
   const bool can_expand = output || !call.effects.empty() || call.reason || !call.progress.empty();
-  const auto toggle = [opened, keep_reading = std::move(keep_reading), id = call.id] {
-    keep_reading();
+  const auto toggle = [opened, id = call.id] {
     auto next = opened.Get();
     if (!next.erase(id)) next.insert(id);
     opened = std::move(next);
@@ -1065,23 +1190,21 @@ View ChatToolStep(ToolCallSnapshot call, std::string label, std::shared_ptr<cons
   } else {
     header.push_back(Spacer().With(Frame{.width = 12.0F}, Grow(0.0F)));
   }
-  header.push_back(Text(text, TextRole::Label).Style({Font::System(12.0F), colors.on_surface_variant}));
-  if (summary) header.push_back(Text(summary->text, TextRole::Label)
-      .Style({Font::System(12.0F), colors.on_surface_variant}).With(Grow()));
+  header.push_back(Text(text, TextRole::Label).Style({label_font, colors.on_surface_variant}));
+  if (summary && !grouped) header.push_back(Text(summary->text, TextRole::Label)
+      .Style({label_font, colors.on_surface_variant}).With(Grow()));
   const auto applied = std::ranges::count(call.effects, ResourceEffectState::Applied, &ResourceEffect::state);
   if (applied) header.push_back(Text(StringVariant::Format(huxerui_agentkit::strings::ui_tool_changes_applied, applied),
-      TextRole::Label).Style({Font::System(12.0F), colors.on_surface_variant}));
+      TextRole::Label).Style({label_font, colors.on_surface_variant}));
   View heading = Flow(std::move(header)).With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Center),
       Frame{.min_height = 22.0F}, Padding(EdgeInsets::Symmetric(0.0F, 1.0F)));
+  const auto key = "chat-tool-toggle/" + call.id.value;
   if (can_expand && !approval) {
-    heading = std::move(heading).OnClick(toggle).On<ViewEvents::KeyDown>([toggle](const KeyEvent& event) {
-      if (event.key != Key::Enter && event.key != Key::Space) return false;
-      if (!event.repeat) toggle();
-      return true;
-    }).With(ActivityDisclosureIndication(theme), Focusable{},
-        Semantics{.role = SemanticRole::Button, .label = text, .expanded = expanded});
+    heading = WorkDisclosure(std::move(heading).With(ActivityDisclosureIndication(theme),
+        Semantics{.role = SemanticRole::Button, .label = text, .expanded = expanded}), key, toggle,
+        std::move(keep_reading), std::move(disclosure));
   }
-  std::vector<View> body {std::move(heading).Key("chat-tool-toggle/" + call.id.value)};
+  std::vector<View> body {std::move(heading).Key(key)};
   if (approval) body.push_back(std::move(*approval));
   if (expanded) {
     std::vector<View> details;
@@ -1103,15 +1226,90 @@ View ChatToolStep(ToolCallSnapshot call, std::string label, std::shared_ptr<cons
       }
     }
     if (call.reason && (!summary || call.reason->message != summary->text))
-      details.push_back(Text(call.reason->message, TextRole::Label).Style({Font::System(12.0F), colors.error}));
+      details.push_back(Text(call.reason->message, TextRole::Label).Style({label_font, colors.error}));
     else if (!call.progress.empty())
-      details.push_back(Text(call.progress, TextRole::Label).Style({Font::System(12.0F), colors.on_surface_variant}));
+      details.push_back(Text(call.progress, TextRole::Label).Style({label_font, colors.on_surface_variant}));
     if (!details.empty()) body.push_back(Column(std::move(details)).With(Spacing(6.0F),
         Padding(EdgeInsets{.bottom = 6.0F, .left = 22.0F}), CrossAlign(CrossAxisAlignment::Stretch)));
   }
   return Column(std::move(body)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch),
       Padding(EdgeInsets{.bottom = 4.0F}))
       .Key("chat-tool/" + call.id.value);
+}
+
+[[huxerui::composable]]
+View ChatToolGroupView(ChatToolGroup group, std::function<std::string(const ToolRef&)> tool_label,
+    std::function<View(const ToolCallSnapshot&)> render_step, std::vector<View> approvals,
+    State<std::set<ToolCallId>> opened, std::function<void()> keep_reading, ChatDisclosureRequest disclosure) {
+  using namespace huxerui_agentkit::strings;
+  const auto theme = UseTheme();
+  const auto& colors = theme.colors;
+  const auto id = group.calls.front().id;
+  const bool expanded = opened->contains(id);
+  const auto count = group.calls.size();
+  const auto label = count == 1 ? UseString(ui_one_work_operation) : UseString(StringVariant::Format(ui_work_operations, count));
+  const auto active = std::ranges::find_if(group.calls.rbegin(), group.calls.rend(), [](const auto& call) {
+    return call.state == ToolCallState::Preparing || call.state == ToolCallState::Reviewing ||
+           call.state == ToolCallState::Ready || call.state == ToolCallState::Executing;
+  });
+  const bool running = active != group.calls.rend();
+  const bool waiting = std::ranges::any_of(group.calls, [](const auto& call) { return call.state == ToolCallState::AwaitingApproval; });
+  const bool needs_check = std::ranges::any_of(group.calls, [](const auto& call) {
+    return call.state == ToolCallState::ResultUnknown || call.state == ToolCallState::PartiallyApplied;
+  });
+  const auto failures = std::ranges::count_if(group.calls, [](const auto& call) {
+    return call.state == ToolCallState::Failed || call.state == ToolCallState::Denied || call.state == ToolCallState::Conflict;
+  });
+  const auto toggle = [opened, id] {
+    auto next = opened.Get();
+    if (!next.erase(id)) next.insert(id);
+    opened = std::move(next);
+  };
+  const auto font = Font::FromFamily(theme.typography.family, theme.typography.body_small);
+  std::vector<View> heading{
+      Image(expanded ? huxerui_agentkit::images::chevron_down : huxerui_agentkit::images::chevron_right)
+          .Tint(colors.on_surface_variant).With(Frame{.width = 12.0F, .height = 12.0F}),
+      Text(label).Style({font.WithWeight(FontWeight::Medium), colors.on_surface_variant}),
+  };
+  std::string status;
+  if (needs_check) status = UseString(ui_tool_result_unknown);
+  else if (waiting) status = UseString(ui_awaiting_approval);
+  else if (running) status = UseString(StringVariant::Format(ui_running_tool, ActivityToolLabel(active->tool, tool_label)));
+  auto accessible_label = label;
+  if (!status.empty()) {
+    accessible_label += " · " + status;
+    heading.push_back(Text("·").Style({font, colors.on_surface_variant}));
+    heading.push_back(Text(status).Style({font, needs_check ? colors.error : colors.on_surface_variant})
+        .LineLimit(1).Overflow(TextOverflow::Ellipsis));
+  }
+  if (failures) {
+    const auto failed = UseString(StringVariant::Format(ui_work_failures, failures));
+    accessible_label += " · " + failed;
+    heading.push_back(Text("·").Style({font, colors.on_surface_variant}));
+    heading.push_back(Text(failed).Style({font, colors.error}));
+  }
+  if (running) {
+    auto progress = UseEnvironment<ProgressCircleStyle>();
+    progress.size = 12.0F;
+    progress.stroke_width = 1.5F;
+    progress.indicator_color = colors.primary;
+    heading.push_back(ProvideEnvironment(progress, ProgressCircle().Key("chat-work-progress")));
+  }
+  auto header = Row(std::move(heading)).With(Spacing(7.0F), CrossAlign(CrossAxisAlignment::Center),
+      Frame{.min_height = 27.0F}, Padding(EdgeInsets::Symmetric(2.0F, 1.0F)), ActivityDisclosureIndication(theme),
+      Semantics{.role = SemanticRole::Button, .label = std::move(accessible_label), .expanded = expanded});
+  std::vector<View> rows{WorkDisclosure(std::move(header), "chat-work-toggle/" + id.value, toggle,
+      std::move(keep_reading), std::move(disclosure))};
+  if (expanded) {
+    std::vector<View> steps;
+    steps.reserve(group.calls.size());
+    for (const auto& call : group.calls) steps.push_back(render_step(call));
+    rows.push_back(Column(std::move(steps)).With(Padding(EdgeInsets{.left = 19.0F}),
+        Spacing(0.0F), CrossAlign(CrossAxisAlignment::Stretch)).Key("chat-work-steps"));
+  }
+  for (auto& approval : approvals) rows.push_back(std::move(approval));
+  return Column(std::move(rows)).With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Stretch),
+      Padding(EdgeInsets{.bottom = 6.0F})).Key("chat-work-group/" + id.value);
 }
 
 [[huxerui::composable]]
@@ -1600,6 +1798,7 @@ struct ChatHistoryScroll {
   ScrollController controller;
   TaskScope tasks;
   SessionId session;
+  ChatDisclosureRequest disclosure;
 };
 
 struct HistoryRowIndexKey {
@@ -1625,6 +1824,7 @@ public:
         activity.source == ScrollSource::Scrollbar || activity.source == ScrollSource::Momentum ||
         activity.source == ScrollSource::Accessibility;
     if (!direct) return;
+    config_.disclosure->reset();
     pending_->reset();
     reflow_ = Reflow::Idle;
     if (activity.delta > 0.0F && activity.metrics.maximum_offset - activity.metrics.offset <= 24.0F && config_.paused.Get())
@@ -1635,6 +1835,12 @@ public:
     const auto viewport = node.PresentationBounds();
     if (viewport.IsEmpty()) return PaintInvalidation::None;
     const auto metrics = config_.controller.Metrics();
+    if (const auto request = std::exchange(*config_.disclosure, std::nullopt)) {
+      if (const auto position = FindReadingPosition(node, viewport, request->position)) {
+        if (MoveTo(metrics, metrics.offset + viewport.y + position->top - request->top))
+          return PaintInvalidation::None;
+      }
+    }
     const bool resized = width_ > 0.0F && std::abs(width_ - viewport.width) > 0.25F;
     width_ = viewport.width;
     if (resized && at_end_) {
@@ -1769,6 +1975,9 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
   const auto snapshot = UseState(conversation ? conversation->Snapshot() : std::shared_ptr<const SessionSnapshot>{});
   const auto activity_feed = UseState(std::shared_ptr<const ChatActivityFeed>{});
   const auto opened_steps = UseState(std::set<ToolCallId>{});
+  const auto opened_groups = UseState(std::set<ToolCallId>{});
+  const auto disclosure_state = UseState(std::make_shared<std::optional<ChatDisclosureAnchor>>());
+  const auto disclosure = disclosure_state.Get();
   const auto history_owner = UseState(conversation);
   const auto history_window = UseState(std::optional<SessionHistoryWindow>{});
   const auto history_loading = UseState(false);
@@ -1887,8 +2096,10 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
       : history_owner.Get() == conversation ? history_window.Get() : std::nullopt;
   const auto activity_access = track_history && layout_style.show_run_activity && !review_only && snapshot.Get()
       ? std::optional{snapshot.Get()->access_revision} : std::nullopt;
-  Lifecycle([tasks, conversation, activity_feed, activity_access, opened_steps] {
+  Lifecycle([tasks, conversation, activity_feed, activity_access, opened_steps, opened_groups, disclosure] {
     opened_steps = std::set<ToolCallId>{};
+    opened_groups = std::set<ToolCallId>{};
+    disclosure->reset();
     if (!activity_access) return std::function<void()>{[] {}};
     return ObserveChatActivity(tasks, conversation, *activity_access, activity_feed);
   }, conversation, activity_access);
@@ -2229,7 +2440,8 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
   }
   const auto feed = activity_feed.Get();
   const auto activity = activity_access ? std::make_shared<const ChatActivityRows>(ActivityRows(*current,
-      feed && feed->conversation == conversation && feed->access == *activity_access ? feed.get() : nullptr)) : nullptr;
+      feed && feed->conversation == conversation && feed->access == *activity_access ? feed.get() : nullptr,
+      layout_style.chat_bubbles)) : nullptr;
   const auto count = (activity ? activity->history.size() : current->messages.size()) + earlier;
   const auto request = history_scroll.Get();
   std::optional<std::size_t> scroll_item;
@@ -2259,7 +2471,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
 
   auto history = VirtualList(count,
       [conversation, open_artifact, selection, selection_enabled, side_chat, current, snapshot, range_anchor, earlier,
-       opened_steps, tasks, error, history_controller, keep_reading, focused_request = focused_interaction.Get(),
+       opened_steps, opened_groups, disclosure, tasks, error, history_controller, keep_reading, focused_request = focused_interaction.Get(),
        attachment_label = options.review_attachment_label,
        history_loading, history_window, loading = history_loading.Get(), theme, action_style, restore,
        vacant, recovering,
@@ -2332,35 +2544,54 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
     } else {
       add_message(message);
     }
-    if (const auto steps = activity->steps.find(message.ref.message); steps != activity->steps.end()) {
-      for (const auto& tool : steps->second) {
+    if (const auto groups = activity->groups.find(message.ref.message); groups != activity->groups.end()) {
+      const auto render_step = [current, conversation, anchor = std::shared_ptr<const Message>(current, &message), render_block,
+                                opened_steps, keep_reading, disclosure, tool_label, bubbles](
+          const ToolCallSnapshot& tool, std::optional<View> approval) -> View {
         std::shared_ptr<const Message> output;
         if (tool.output_message) {
           const auto found = std::ranges::find(current->messages, *tool.output_message, &Message::ref);
           if (found != current->messages.end()) output = std::shared_ptr<const Message>(current, &*found);
         }
-        std::optional<View> approval;
+        return ChatToolStep(tool, ActivityToolLabel(tool.tool, tool_label), anchor, std::move(output), conversation,
+            render_block, opened_steps, keep_reading, disclosure, std::move(approval), bubbles);
+      };
+      const auto approval_view = [&](const ToolCallSnapshot& tool) -> std::optional<View> {
         if (const auto pending = activity->approvals.find(tool.id); !focused_request && pending != activity->approvals.end()) {
-          approval = PendingApprovalView(*pending->second, conversation, tasks, error, *current, open_artifact,
+          return PendingApprovalView(*pending->second, conversation, tasks, error, *current, open_artifact,
               action_style, theme.colors, attachment_label).Key(pending->second->id.value);
         }
-        auto step = ChatToolStep(tool, ActivityToolLabel(tool.tool, tool_label),
-            std::shared_ptr<const Message>(current, &message), std::move(output), conversation, render_block,
-            opened_steps, keep_reading, std::move(approval));
-        row.push_back(bubbles ? AssistantChatLine(std::move(step), assistant_avatar(tool.id, tool.run), narrow).Key(tool.id.value)
-                              : std::move(step));
+        return {};
+      };
+      for (const auto& group : groups->second) {
+        const auto& first = group.calls.front();
+        if (bubbles) {
+          std::vector<View> approvals;
+          for (const auto& tool : group.calls) {
+            if (auto view = approval_view(tool)) approvals.push_back(std::move(*view));
+          }
+          auto view = ChatToolGroupView(group, tool_label, [render_step](const ToolCallSnapshot& call) {
+            return render_step(call, std::nullopt);
+          }, std::move(approvals), opened_groups, keep_reading, disclosure);
+          row.push_back(AssistantChatLine(std::move(view), assistant_avatar(first.id, first.run), narrow).Key(first.id.value));
+        } else {
+          row.push_back(render_step(first, approval_view(first)));
+        }
       }
     }
     if (const auto footer = activity->footers.find(message.ref.message); footer != activity->footers.end()) {
       const auto& turn = activity->turns.at(footer->second);
       std::function<void()> show_changes;
       if (turn.first_change) {
-        if (const auto item = HistoryIndex(activity.get(), turn.first_change->first, ScrollAlignment::Start)) {
-          show_changes = [history_controller, keep_reading, opened_steps, id = turn.first_change->second, index = *item + earlier] {
+        if (const auto item = HistoryIndex(activity.get(), turn.first_change->row, ScrollAlignment::Start)) {
+          show_changes = [history_controller, keep_reading, opened_steps, opened_groups, location = *turn.first_change, index = *item + earlier] {
             keep_reading();
             auto next = opened_steps.Get();
-            next.insert(id);
+            next.insert(location.call);
             opened_steps = std::move(next);
+            auto groups = opened_groups.Get();
+            groups.insert(location.group);
+            opened_groups = std::move(groups);
             history_controller.ScrollToItem(index, ScrollAlignment::Start);
           };
         }
@@ -2375,7 +2606,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
         .Key("chat-history-row/" + message.ref.message.value);
   }).EstimatedItemExtent(76.0F).Controller(history_controller)
       .With(Grow(), ScrollBar(), CrossAlign(CrossAxisAlignment::Stretch),
-          ChatHistoryScroll{follow_paused, history_controller, tasks, current->summary.id})
+          ChatHistoryScroll{follow_paused, history_controller, tasks, current->summary.id, disclosure})
       .Key("agent-chat-history");
   auto history_view = ChatHistoryViewport(std::move(history), history_controller, count, follow_paused, selection,
       part == ChatPart::Messages && layout_style.chat_bubbles && !side_chat, UseEnvironment<IconButtonStyle>(), theme);
@@ -2534,8 +2765,20 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
     }
   }
   if (!active && last_root != current->runs.rend() && last_root->failure) {
-    notices.push_back(Text(last_root->failure->message, TextRole::Label)
-        .Style({Font::System(12.0F), theme.colors.error}));
+    const auto& failure = *last_root->failure;
+    using namespace huxerui_agentkit::strings;
+    StringVariant message(failure.message);
+    if (failure.provider_code == "first_response_timeout") message = ui_model_first_response_timeout;
+    else if (failure.provider_code == "stream_idle_timeout") message = ui_model_stream_idle_timeout;
+    else if (failure.provider_code == "request_deadline" || last_root->end_reason == RunEndReason::Deadline)
+      message = ui_model_request_deadline;
+    else if (failure.provider_code == "output_token_limit") message = ui_model_output_limit;
+    else if (failure.provider_code == "context_window_exceeded") message = ui_model_context_limit;
+    else if (failure.provider_code == "stream_interrupted" ||
+        (failure.code == ErrorCode::ProviderFailure && failure.message == "Model response body could not be read"))
+      message = ui_model_stream_interrupted;
+    notices.push_back(Text(std::move(message), TextRole::Label)
+        .Style({Font::System(12.0F), theme.colors.error}).Key("agent-chat-run-error"));
     const auto trigger = last_root->trigger;
     const bool retryable = trigger == RunTrigger::UserInput || trigger == RunTrigger::Retry || trigger == RunTrigger::Regenerate;
     if (last_root->state == RunState::Failed && retryable && current->summary.lifecycle == SessionLifecycle::Open) {
@@ -2680,6 +2923,9 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
           (*bring_back)(selected);
         }).Key(returning_selection ? "side-chat-return-selection" : "side-chat-return-reply")));
   }
+  const auto selected_model = options.run_controls ? options.run_controls->next->model : std::nullopt;
+  if (auto context = ComposerContextUsage(*current, selected_model))
+    actions.push_back(ComposerContextIndicator(*context, theme.colors));
   const auto& send_label = enqueue ? huxerui_agentkit::strings::ui_queue_message :
       send_as_new ? huxerui_agentkit::strings::ui_send_as_new_task : huxerui_agentkit::strings::ui_send;
   const auto send_key = enqueue ? "chat-send/Queue message" : send_as_new ? "chat-send/Send as new task" : "chat-send/Send";

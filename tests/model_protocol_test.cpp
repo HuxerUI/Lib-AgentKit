@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <iostream>
 #include <ranges>
+#include <source_location>
 
 namespace {
 using namespace std::chrono_literals;
@@ -56,9 +57,11 @@ T Take(kit::AgentResult<T> value) {
 }
 
 template<class T>
-void ErrorIs(const kit::AgentResult<T>& value, kit::ErrorCode expected) {
+void ErrorIs(const kit::AgentResult<T>& value, kit::ErrorCode expected,
+    std::source_location caller = std::source_location::current()) {
   if (value.Succeeded() || value.Error().code != expected) {
-    throw std::runtime_error(value.Succeeded() ? "Operation unexpectedly succeeded" : value.Error().message);
+    auto detail = value.Succeeded() ? "Operation unexpectedly succeeded" : value.Error().message;
+    throw std::runtime_error(detail + " at model_protocol_test.cpp:" + std::to_string(caller.line()));
   }
 }
 
@@ -69,11 +72,14 @@ struct Script {
   std::size_t fragment_bytes = 7;
   std::size_t read_calls = 0;
   bool hold = false;
+  bool hold_after_reply = false;
+  kit::Duration open_delay{};
   bool read_cancelled = false;
 
   kit::detail::ModelHttpOpen Open() {
     return [this](HttpRequest request) -> kit::Async<kit::detail::ModelHttpResponse> {
       ++requests;
+      if (open_delay > kit::Duration::zero()) co_await Delay(open_delay);
       const auto* begin = reinterpret_cast<const char*>(request.body.data());
       auto syntax = Json::parse(begin, begin + request.body.size());
       auto fixture = reply ? reply(request, syntax) : std::string{};
@@ -82,7 +88,7 @@ struct Script {
           .read = [this, fixture = std::move(fixture), pos = std::size_t{0}](std::size_t maximum) mutable
               -> Task<IoResult<Bytes>> {
             ++read_calls;
-            if (hold) {
+            if (hold || (hold_after_reply && pos == fixture.size())) {
               auto cancel = [this](CallbackCompletion<IoResult<Bytes>>) {
                 return [this] { read_cancelled = true; };
               };
@@ -345,7 +351,7 @@ Task<void> ErrorsAndCancellation(TaskScope tasks) {
   ErrorIs(co_await model.provider->StartTurnAsync(Request()), kit::ErrorCode::RateLimited);
   server.status = 200;
   server.reply = [](const auto&, const auto&) {
-    return Frame(Choice({{"content", "Partial output"}})) + Frame(Choice(Json::object(), "stop"));
+    return Frame(Choice({{"content", "Partial output"}}));
   };
   auto truncated = Take(co_await model.provider->StartTurnAsync(Request()));
   Check(std::holds_alternative<kit::ModelTextDelta>(*Take(co_await truncated->ReadAsync())), "partial reply was delivered");
@@ -356,6 +362,383 @@ Task<void> ErrorsAndCancellation(TaskScope tasks) {
   Check(server.requests == 2, "unsupported input failed before network access");
 
   co_await VerifyCancellation(tasks, server, *model.provider);
+}
+
+template<class T>
+void ModelFailureIs(const kit::AgentResult<T>& result, kit::ErrorCode code, std::string_view detail) {
+  ErrorIs(result, code);
+  Check(result.Error().provider_code == detail, "Unexpected model failure detail");
+}
+
+Task<std::size_t> ExerciseStreamRun(TaskScope tasks, kit::ModelRegistration model, std::string input,
+    std::optional<std::pair<kit::ErrorCode, std::string>> expected = {}) {
+  const auto id = model.ref.id;
+  auto runtime = Take(kit::AgentRuntime::Create({
+      .tasks = tasks,
+      .principal = [] { return kit::AgentResult<kit::PrincipalId>::Success({"stream-test"}); },
+      .access = [](kit::PolicyRequest) -> kit::Async<kit::PolicyDecision> {
+        co_return kit::AgentResult<kit::PolicyDecision>::Success({kit::AccessDecision::Allow, {}});
+      }}));
+  Take(runtime->RegisterModel(std::move(model)));
+  const kit::AgentId agent{"stream-test"};
+  Take(runtime->RegisterAgent({.definition = {.ref = {agent, 1}, .display_name = "Stream test", .model = id}}));
+  Take(co_await runtime->StartAsync());
+  auto created = Take(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
+      .options = {.agent = agent, .retention = kit::SessionRetention::Ephemeral}, .initial = kit::SendInput{.text = std::move(input)}}));
+  auto chat = Take(co_await runtime->Sessions().OpenAsync(std::get<kit::SessionCreated>(created.outcome).session));
+  std::shared_ptr<const kit::SessionSnapshot> snapshot;
+  auto watching = Take(co_await chat->ObserveAsync([&](auto change) { if (change.Succeeded()) snapshot = change.Value(); }));
+  const auto deadline = std::chrono::steady_clock::now() + 150s;
+  while ((!snapshot || snapshot->runs.empty() || snapshot->summary.active_run) && std::chrono::steady_clock::now() < deadline)
+    co_await Delay(20ms);
+  Check(snapshot && snapshot->runs.size() == 1 && !snapshot->summary.active_run, "The streaming run did not settle");
+  const auto& run = snapshot->runs.back();
+  if (expected) {
+    Check(run.state == kit::RunState::Failed && run.failure && run.failure->code == expected->first &&
+          run.failure->provider_code == (expected->second.empty() ? std::nullopt : std::optional{expected->second}),
+          run.failure ? run.failure->message.c_str() : "The interrupted run did not record its reason");
+  } else if (run.state != kit::RunState::Succeeded) {
+    throw std::runtime_error(run.failure ? run.failure->message : "The streaming run did not succeed");
+  }
+  const auto answer_state = expected ? kit::MessageState::Interrupted : kit::MessageState::Complete;
+  std::size_t bytes = 0;
+  for (const auto& message : snapshot->messages) {
+    if (message.author != kit::MessageAuthor::Agent) continue;
+    Check(message.state == answer_state, "The streamed answer has an incorrect completion state");
+    for (const auto& block : message.blocks) {
+      if (const auto* text = std::get_if<kit::TextBlock>(&block.body)) bytes += text->text.size();
+    }
+  }
+  Check(bytes > 0 && snapshot->tools.empty(), "The streamed answer was lost or executed an unexpected tool");
+  watching.Reset();
+  Take(co_await runtime->CloseAsync());
+  co_return bytes;
+}
+
+Task<void> StreamDeadlines(TaskScope tasks) {
+  using kit::ErrorCode;
+  Script server;
+  server.fragment_bytes = 32 * 1024;
+  auto options = Options();
+  options.timeout = 2s;
+  options.stream_timeouts = {.first_response = 60ms, .idle = 60ms};
+  auto model = Take(kit::detail::MakeChatCompletionsModel(options, tasks, server.Open()));
+  server.open_delay = 5s;
+  ModelFailureIs(co_await model.provider->StartTurnAsync(Request()), ErrorCode::DeadlineExceeded, "first_response_timeout");
+  server.open_delay = 0ms;
+  server.hold_after_reply = true;
+  server.reply = [](const auto&, const auto&) { return ": awaiting first token\n\nevent: ping\ndata: {}\n\n"; };
+  auto no_first_event = Take(co_await model.provider->StartTurnAsync(Request()));
+  ModelFailureIs(co_await no_first_event->ReadAsync(), ErrorCode::DeadlineExceeded, "first_response_timeout");
+  Check(server.read_cancelled, "The pending body read was not released on first-response timeout");
+
+  server.read_cancelled = false;
+  server.reply = [](const auto&, const auto&) { return Frame(Choice({{"content", "Partial answer"}})) + ": keep alive\n\n"; };
+  auto idle = Take(co_await model.provider->StartTurnAsync(Request()));
+  auto partial = Take(co_await idle->ReadAsync());
+  Check(partial && std::get<kit::ModelTextDelta>(*partial).utf8 == "Partial answer", "The first streamed delta was lost");
+  ModelFailureIs(co_await idle->ReadAsync(), ErrorCode::DeadlineExceeded, "stream_idle_timeout");
+  Check(server.read_cancelled, "The pending body read was not released on idle timeout");
+
+  options.timeout = 60ms;
+  options.stream_timeouts = {.first_response = 1s, .idle = 1s};
+  auto total = Take(kit::detail::MakeChatCompletionsModel(options, tasks, server.Open()));
+  auto timed = Take(co_await total.provider->StartTurnAsync(Request()));
+  Check(std::holds_alternative<kit::ModelTextDelta>(*Take(co_await timed->ReadAsync())), "The total deadline hid the initial delta");
+  ModelFailureIs(co_await timed->ReadAsync(), ErrorCode::DeadlineExceeded, "request_deadline");
+
+  options.timeout = 2s;
+  options.stream_timeouts = {.first_response = 1s, .idle = 1s};
+  options.request_usage = true;
+  auto usage = Take(kit::detail::MakeChatCompletionsModel(options, tasks, server.Open()));
+  for (bool send_usage : {false, true}) {
+    server.read_cancelled = false;
+    server.reply = [send_usage](const auto&, const auto&) {
+      auto result = Frame(Choice({{"content", "Completed output"}}, "stop"));
+      if (send_usage) result += Frame({{"choices", Json::array()}, {"usage", {{"prompt_tokens", 5}, {"completion_tokens", 2}}}});
+      return result;
+    };
+    auto no_done = Take(co_await usage.provider->StartTurnAsync(Request()));
+    const auto events = co_await Collect(*no_done);
+    Check(events.size() == (send_usage ? 3 : 2) &&
+        std::get<kit::ModelFinished>(events.back()).reason == kit::ModelFinishReason::Completed &&
+        std::holds_alternative<kit::ModelTextDelta>(events.front()), "A valid final choice required [DONE]");
+    if (send_usage) Check(std::get<kit::ModelUsage>(events[1]).usage.output_tokens == 2, "The trailing usage frame was lost");
+    else Check(server.read_cancelled, "The missing usage frame held the connection open");
+  }
+
+  server.hold_after_reply = false;
+  server.status = 400;
+  for (const auto& rejected : {Json{{"code", "context_length_exceeded"}}, Json{{"type", "invalid_request_error"}, {"message", "prompt is too long"}},
+                               Json{{"code", 400}, {"status", "INVALID_ARGUMENT"}, {"message", "The input token count exceeds the maximum number of tokens allowed."}}}) {
+    server.reply = [rejected](const auto&, const auto&) { return Json{{"error", rejected}}.dump(); };
+    ModelFailureIs(co_await model.provider->StartTurnAsync(Request()), ErrorCode::BudgetExceeded, "context_window_exceeded");
+  }
+  server.reply = [](const auto&, const auto&) { return R"({"error":{"code":"invalid_request_error","message":"Unknown field"}})"; };
+  ModelFailureIs(co_await model.provider->StartTurnAsync(Request()), ErrorCode::ProviderFailure, "400");
+
+  server.status = 200;
+  for (const auto& [reason, detail] : {
+      std::pair{"length", "output_token_limit"}, std::pair{"context_window_exceeded", "context_window_exceeded"},
+      std::pair{"", "stream_interrupted"}}) {
+    server.reply = [reason](const auto&, const auto&) {
+      auto body = Frame(Choice({{"content", "Keep the visible answer."}}));
+      if (*reason) body += Frame(Choice(Json::object(), reason));
+      return body;
+    };
+    const auto code = *reason ? ErrorCode::BudgetExceeded : ErrorCode::ProtocolError;
+    auto registration = Take(kit::detail::MakeChatCompletionsModel(Options(), tasks, server.Open()));
+    auto expected = std::pair{code, std::string(detail)};
+    Check(co_await ExerciseStreamRun(tasks, std::move(registration), "Stream a response", expected) == 24,
+        "An interrupted run changed its partial answer");
+  }
+}
+
+constexpr std::string_view archive_code = "CEDAR-7314";
+constexpr std::string_view archive_label = "\xe5\xbc\x80\xe6\xba\x90";
+
+bool IsSummaryRequest(const Json& body) {
+  const auto& message = body.at("messages").front();
+  return kit::detail::String(message, "content").starts_with("Summarize the earlier conversation") &&
+      kit::detail::String(message, "role") == "system";
+}
+
+Task<void> ExerciseContextConversation(TaskScope tasks, kit::ModelRegistration model, unsigned& summaries) {
+  const auto directory = File(std::filesystem::temp_directory_path().u8string());
+  const auto database = directory.Child("agentkit-context-" + kit::NewCommandId().value + ".sqlite3");
+  struct CleanUp {
+    File database;
+    ~CleanUp() { static_cast<void>(database.Delete()); }
+  } cleanup{database};
+  const kit::AgentId agent{"context-test"};
+  auto make = [&]() -> Task<std::shared_ptr<kit::AgentRuntime>> {
+    auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(database));
+    auto runtime = Take(kit::AgentRuntime::Create({.tasks = tasks,
+        .principal = [] { return kit::AgentResult<kit::PrincipalId>::Success({"context-acceptance"}); },
+        .access = [](kit::PolicyRequest) -> kit::Async<kit::PolicyDecision> {
+          co_return kit::AgentResult<kit::PolicyDecision>::Success({kit::AccessDecision::Allow, {}});
+        }, .store = std::move(store)}));
+    Take(runtime->RegisterModel(model));
+    Take(runtime->RegisterAgent({.definition = {.ref = {agent, 1}, .display_name = "Context test", .model = model.ref.id}}));
+    Take(co_await runtime->StartAsync());
+    co_return runtime;
+  };
+  auto runtime = co_await make();
+  const auto created = Take(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
+      .options = {.agent = agent, .retention = kit::SessionRetention::Stored}}));
+  const auto session = std::get<kit::SessionCreated>(created.outcome).session;
+  auto chat = Take(co_await runtime->Sessions().OpenAsync(session));
+  std::shared_ptr<const kit::SessionSnapshot> snapshot;
+  auto observe = [&]() { return chat->ObserveAsync([&](auto change) { if (change.Succeeded()) snapshot = change.Value(); }); };
+  auto watcher = Take(co_await observe());
+  const auto send = [&](std::string text) -> Task<void> {
+    auto receipt = Take(co_await chat->SendAsync(kit::NewCommandId(), {.text = std::move(text)}));
+    const auto id = std::get<kit::RunAccepted>(receipt.outcome).run;
+    const auto until = std::chrono::steady_clock::now() + 90s;
+    while ((!snapshot || snapshot->runs.empty() || snapshot->runs.back().id != id || snapshot->summary.active_run) &&
+           std::chrono::steady_clock::now() < until) co_await Delay(12ms);
+    Check(snapshot && !snapshot->runs.empty() && snapshot->runs.back().id == id && !snapshot->summary.active_run,
+        "The context conversation turn did not settle");
+    const auto& run = snapshot->runs.back();
+    Check(run.state == kit::RunState::Succeeded, run.failure ? run.failure->message.c_str() : "Context turn failed");
+  };
+  std::optional<kit::SourceSlice> source;
+  std::string first_text;
+  for (unsigned i = 0; i < 7; ++i) {
+    std::string text = "Record this material for later. Remember earlier agreed decisions and archive identifiers. Reply with OK only.\n";
+    if (i == 0) text += "Important archive decision: the tracking code is " + std::string(archive_code) +
+        " and its label is " + std::string(archive_label) + ". Keep the code for later recall.\n";
+    for (unsigned j = 0; j < 27; ++j) text += "Record " + std::to_string(i) + "/" + std::to_string(j) +
+        ": document the review process, issue ownership, contribution prerequisites and community follow-up.\n";
+    if (i == 0) first_text = text;
+    co_await send(std::move(text));
+    if (i != 0) continue;
+    const auto message = std::ranges::find(snapshot->messages, kit::MessageAuthor::User, &kit::Message::author);
+    Check(message != snapshot->messages.end() && !message->blocks.empty(), "The first original message is missing");
+    const auto offset = first_text.find(archive_label);
+    source = kit::SourceSlice{message->ref, {}, kit::SourceTextRange{
+        message->blocks.front().id, offset, offset + archive_label.size()}};
+  }
+  Check(summaries > 0, "The constrained conversation did not trigger compaction");
+  const auto compacted = std::ranges::find_if(snapshot->runs, [](const auto& run) {
+    return run.context_usage && run.context_usage->before_compaction_tokens.has_value();
+  });
+  Check(compacted != snapshot->runs.end(), "The run snapshot did not report compacted input");
+  const auto compacted_run = compacted->id;
+  const auto occupancy = *compacted->context_usage;
+  Check(occupancy.estimated_input_tokens < *occupancy.before_compaction_tokens &&
+      occupancy.estimated_input_tokens <= occupancy.input_budget_tokens &&
+      occupancy.input_budget_tokens < *model.context_limits.context_window,
+      "The snapshot context usage does not reflect the budget and compression");
+  const auto checked = std::ranges::find(snapshot->messages, std::get<kit::MessageRef>(source->source), &kit::Message::ref);
+  Check(checked != snapshot->messages.end() && std::get<kit::TextBlock>(checked->blocks.front().body).text == first_text,
+      "Compaction changed the visible history");
+  Check(Take(co_await chat->ReadSelectionAsync(*source)) == archive_label, "Compaction changed the original UTF-8 selection");
+  watcher.Reset();
+  chat.reset();
+  Take(co_await runtime->CloseAsync());
+  runtime.reset();
+
+  runtime = co_await make();
+  chat = Take(co_await runtime->Sessions().OpenAsync(session));
+  watcher = Take(co_await observe());
+  Check(Take(co_await chat->ReadSelectionAsync(*source)) == archive_label, "Restart lost the original selection version or bytes");
+  const auto restored = std::ranges::find(snapshot->runs, compacted_run, &kit::RunSnapshot::id);
+  Check(restored != snapshot->runs.end() && restored->context_usage &&
+      restored->context_usage->estimated_input_tokens == occupancy.estimated_input_tokens &&
+      restored->context_usage->input_budget_tokens == occupancy.input_budget_tokens &&
+      restored->context_usage->before_compaction_tokens == occupancy.before_compaction_tokens,
+      "Restart lost context occupancy and its original compaction estimate");
+  co_await send("What was the tracking code from the first archive decision? Reply with the exact code only.");
+  const auto received = std::ranges::find_if(snapshot->messages | std::views::reverse, [](const auto& item) {
+    return item.author == kit::MessageAuthor::Agent && !item.blocks.empty();
+  });
+  Check(received != (snapshot->messages | std::views::reverse).end() &&
+      std::get<kit::TextBlock>(received->blocks.front().body).text.find(archive_code) != std::string::npos,
+      "The assistant could not recall the first archive code after compaction and restart");
+  const auto summarized = std::ranges::count_if(snapshot->messages, [](const auto& message) {
+    return message.author == kit::MessageAuthor::Agent;
+  });
+  Check(summarized == 8, "A private compaction turn was added to the visible conversation");
+  watcher.Reset();
+  Take(co_await runtime->CloseAsync());
+}
+
+Task<void> ContextCompaction(TaskScope tasks) {
+  Script server;
+  server.fragment_bytes = 32 * 1024;
+  unsigned summaries = 0;
+  server.reply = [&summaries](const auto&, const auto& body) {
+    std::string response = "OK";
+    if (IsSummaryRequest(body)) {
+      ++summaries;
+      Check(!body.contains("tools") && !body.value("store", false), "Compaction exposed tools or server state");
+      Check(body.at("messages").dump().find(archive_code) != std::string::npos,
+          "A context summary lost the earlier summary or first archive decision");
+      response = "The user's important archive tracking code is CEDAR-7314. Remember the code exactly for later recall.";
+    } else if (body.at("messages").dump().find("What was the tracking code") != std::string::npos) {
+      Check(body.at("messages").dump().find("Summary of earlier conversation") != std::string::npos &&
+          body.at("messages").dump().find(archive_code) != std::string::npos,
+          "The final request did not carry the archive code in the compacted summary");
+      response = archive_code;
+    }
+    return Frame(Choice({{"content", std::move(response)}}, "stop"));
+  };
+  auto model = Take(kit::detail::MakeChatCompletionsModel(Options(), tasks, server.Open()));
+  model.context_limits = {.context_window = 6200, .max_output_tokens = 1024};
+  co_await ExerciseContextConversation(tasks, std::move(model), summaries);
+}
+
+Task<void> ContextToolBudget(TaskScope tasks) {
+  const File directory(std::filesystem::temp_directory_path().u8string());
+  const auto database = directory.Child("agentkit-context-tool-" + kit::NewCommandId().value + ".sqlite3");
+  struct CleanUp {
+    File file;
+    ~CleanUp() { static_cast<void>(file.Delete()); }
+  } cleanup{database};
+  const kit::AgentId agent{"context-tools"};
+  const kit::ToolId read{"read_record"}, review{"confirm_record"};
+  auto record = std::string(7200, 'v');
+  auto first = "EARLIER_RESULT:" + record;
+  auto newest = "LATEST_RESULT:" + record;
+  unsigned reads = 0, approved = 0;
+  bool saw_reduction = false;
+  Script server;
+  server.fragment_bytes = 32 * 1024;
+  server.reply = [&](const auto&, const auto& body) {
+    Check(!IsSummaryRequest(body), "Tool-only pressure unexpectedly ran a conversation summary");
+    const auto emit_tool = [](std::string id, std::string name) {
+      return Frame(Choice({{"tool_calls", Json::array({ToolFragment(0, "{}", std::move(id), std::move(name))})}})) +
+          Frame(Choice(Json::object(), "tool_calls"));
+    };
+    if (server.requests == 1) return emit_tool("read-first", read.value);
+    if (server.requests == 2) return emit_tool("read-latest", read.value);
+    const auto& messages = body.at("messages");
+    const auto earlier = std::ranges::find_if(messages, [](const auto& entry) {
+      return kit::detail::String(entry, "tool_call_id") == "read-first";
+    });
+    const auto last = std::ranges::find_if(messages, [](const auto& entry) {
+      return kit::detail::String(entry, "tool_call_id") == "read-latest";
+    });
+    Check(earlier != messages.end() && last != messages.end(), "Compaction lost the original tool result IDs");
+    const auto compacted = Json::parse(kit::detail::String(*earlier, "content"));
+    Check(compacted.value("older_tool_output_reduced", false) &&
+        Json::parse(kit::detail::String(*last, "content")).get<std::string>() == newest,
+        "Compaction did not shorten the older result or changed the active tool result");
+    saw_reduction = true;
+    if (server.requests == 3) return emit_tool("pending-review", review.value);
+    Check(server.requests == 4 && approved == 1, "Recovery repeated the tool call or skipped its approval");
+    return Frame(Choice({{"content", "The approved record is complete."}}, "stop"));
+  };
+  auto model = Take(kit::detail::MakeChatCompletionsModel(Options(), tasks, server.Open()));
+  model.context_limits = {.context_window = 6500, .max_output_tokens = 1024};
+  const auto make = [&]() -> Task<std::shared_ptr<kit::AgentRuntime>> {
+    auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(database));
+    auto runtime = Take(kit::AgentRuntime::Create({.tasks = tasks,
+        .principal = [] { return kit::AgentResult<kit::PrincipalId>::Success({"context-acceptance"}); },
+        .access = [review](kit::PolicyRequest request) -> kit::Async<kit::PolicyDecision> {
+          const bool confirm = request.capability == kit::Capability::ExecuteTool && request.tool && request.tool->id == review;
+          co_return kit::AgentResult<kit::PolicyDecision>::Success(
+              {confirm ? kit::AccessDecision::RequireConfirmation : kit::AccessDecision::Allow, {}});
+        }, .store = std::move(store)}));
+    Take(runtime->RegisterModel(model));
+    for (auto id : {read, review}) {
+      Take(runtime->RegisterTool({
+          .id = id, .version = 1, .description = "Read or review a context-test record",
+          .input_schema = {kit::JsonValue{true}}, .effect = kit::ToolEffect::Read,
+          .prepare = [](kit::ToolPrepareContext, kit::ToolRequest tool) -> kit::Async<kit::PreparedChange> {
+            co_return kit::AgentResult<kit::PreparedChange>::Success({.execution_data = std::move(tool.arguments)});
+          },
+          .execute = [&, id](kit::ToolContext, kit::PreparedToolCall) -> kit::Async<kit::ToolExecutionResult> {
+            if (id == review) {
+              ++approved;
+              co_return kit::AgentResult<kit::ToolExecutionResult>::Success({
+                  .outcome = kit::ToolOutcome::Succeeded, .model_value = kit::JsonValue{std::string("Approved")}});
+            }
+            ++reads;
+            co_return kit::AgentResult<kit::ToolExecutionResult>::Success({
+                .outcome = kit::ToolOutcome::Succeeded, .model_value = kit::JsonValue{reads == 1 ? first : newest}});
+          }}));
+    }
+    Take(runtime->RegisterAgent({.definition = {.ref = {agent, 1}, .display_name = "Context tool test",
+        .model = model.ref.id, .tools = {read, review}}}));
+    Take(co_await runtime->StartAsync());
+    co_return runtime;
+  };
+  auto runtime = co_await make();
+  auto created = Take(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
+      .options = {.agent = agent, .retention = kit::SessionRetention::Stored},
+      .initial = kit::SendInput{.text = "Read the two records, then request review."}}));
+  const auto session = std::get<kit::SessionCreated>(created.outcome).session;
+  auto chat = Take(co_await runtime->Sessions().OpenAsync(session));
+  std::shared_ptr<const kit::SessionSnapshot> snapshot;
+  auto observe = [&]() { return chat->ObserveAsync([&](auto change) { if (change.Succeeded()) snapshot = change.Value(); }); };
+  auto watching = Take(co_await observe());
+  const auto deadline = std::chrono::steady_clock::now() + 20s;
+  while ((!snapshot || (snapshot->summary.active_run && snapshot->interactions.empty())) &&
+      std::chrono::steady_clock::now() < deadline) co_await Delay(10ms);
+  Check(saw_reduction && snapshot && snapshot->interactions.size() == 1 && reads == 2 && !approved, "Compaction lost the pending approval");
+  const auto pending = snapshot->interactions.front();
+  Check(pending.state == kit::InteractionState::Pending, "The approval was prematurely settled");
+  watching.Reset();
+  chat.reset();
+  Take(co_await runtime->CloseAsync());
+  runtime.reset();
+
+  runtime = co_await make();
+  chat = Take(co_await runtime->Sessions().OpenAsync(session));
+  watching = Take(co_await observe());
+  for (int i = 0; i < 100 && (!snapshot || !snapshot->summary.active_run); ++i) co_await Delay(10ms);
+  Check(snapshot && snapshot->interactions.size() == 1 &&
+      snapshot->interactions.front().id == pending.id && snapshot->interactions.front().version == pending.version &&
+      snapshot->interactions.front().state == kit::InteractionState::Pending && reads == 2 && !approved,
+      "SQLite did not restore the exact original approval and prior tool results");
+  Take(co_await chat->SubmitAsync(kit::NewCommandId(), {pending.id, pending.version, kit::ApprovalDecision::Approve}));
+  const auto finish = std::chrono::steady_clock::now() + 20s;
+  while (snapshot->summary.active_run && std::chrono::steady_clock::now() < finish) co_await Delay(10ms);
+  Check(snapshot->summary.run_state == kit::RunState::Succeeded && reads == 2 && approved == 1, "The compacted Run did not resume exactly once");
+  watching.Reset();
+  Take(co_await runtime->CloseAsync());
 }
 
 kit::ResponsesOptions ResponsesOptions() {
@@ -1364,6 +1747,90 @@ void NativeHttp(std::string base_url) {
   Check(completed, "native HTTP test did not complete");
 }
 
+void ConfiguredContext() {
+  const auto* endpoint = std::getenv("HUXERUI_AGENTKIT_BASE_URL");
+  const auto* model = std::getenv("HUXERUI_AGENTKIT_MODEL");
+  const auto* credential = std::getenv("HUXERUI_AGENTKIT_API_KEY");
+  Check(endpoint && *endpoint && model && *model && credential && *credential, "Configure the live model endpoint, model and credential");
+  std::exception_ptr failure;
+  bool completed = false;
+  Application app{
+      []() -> View { return Text("AgentKit context compaction acceptance"); },
+      {.application_hooks = {[&](ApplicationContext&) {
+        const auto app = UseApplication();
+        const auto tasks = UseApplicationTaskScope();
+        tasks.Launch([&, tasks, app]() -> Task<void> {
+          try {
+            unsigned summaries = 0;
+            auto options = Options(kit::ChatCompletionsDialect::Compatible);
+            options.base_url = endpoint;
+            options.model = model;
+            options.bearer_token = [key = std::string(credential)]() -> kit::Async<std::string> {
+              co_return kit::AgentResult<std::string>::Success(key);
+            };
+            const auto native = kit::detail::NativeModelTransport({});
+            auto observe = [native, &summaries](HttpRequest request) -> kit::Async<kit::detail::ModelHttpResponse> {
+              const auto* bytes = reinterpret_cast<const char*>(request.body.data());
+              if (IsSummaryRequest(Json::parse(bytes, bytes + request.body.size()))) ++summaries;
+              co_return co_await native(std::move(request));
+            };
+            auto registered = Take(kit::detail::MakeChatCompletionsModel(std::move(options), tasks, std::move(observe)));
+            registered.context_limits = {.context_window = 6200, .max_output_tokens = 1024};
+            co_await ExerciseContextConversation(tasks, std::move(registered), summaries);
+            std::cout << "Windows live context: " << summaries
+                      << " summary requests, 8 visible replies, archive code and exact UTF-8 selection recovered after restart\n";
+            completed = true;
+          } catch (...) { failure = std::current_exception(); }
+          app.Quit();
+        });
+      }}}};
+  static_cast<void>(RunApplication());
+  if (failure) std::rethrow_exception(failure);
+  Check(completed, "The live context test did not complete");
+}
+
+void ConfiguredStreaming(std::string_view mode) {
+  const auto* endpoint = std::getenv("HUXERUI_AGENTKIT_BASE_URL");
+  const auto* model = std::getenv("HUXERUI_AGENTKIT_MODEL");
+  const auto* credential = std::getenv("HUXERUI_AGENTKIT_API_KEY");
+  Check(endpoint && *endpoint && model && *model && credential && *credential, "Configure the live model endpoint, model and credential");
+  Check(mode == "normal" || mode == "no-done" || mode == "idle", "Unknown streaming acceptance mode");
+  std::exception_ptr failure;
+  bool completed = false;
+  Application app{
+      []() -> View { return Text("AgentKit live stream acceptance"); },
+      {.application_hooks = {[&](ApplicationContext&) {
+        const auto app = UseApplication();
+        const auto tasks = UseApplicationTaskScope();
+        tasks.Launch([&, tasks, app]() -> Task<void> {
+          try {
+            auto options = Options(kit::ChatCompletionsDialect::Compatible);
+            options.base_url = endpoint;
+            options.model = model;
+            options.request_usage = mode == "no-done";
+            options.bearer_token = [key = std::string(credential)]() -> kit::Async<std::string> {
+              co_return kit::AgentResult<std::string>::Success(key);
+            };
+            std::optional<std::pair<kit::ErrorCode, std::string>> expected;
+            if (mode == "idle") {
+              options.stream_timeouts.idle = 2s;
+              expected.emplace(kit::ErrorCode::DeadlineExceeded, "stream_idle_timeout");
+            }
+            auto registration = Take(kit::MakeChatCompletionsModel(std::move(options)));
+            const auto bytes = co_await ExerciseStreamRun(tasks, std::move(registration),
+                "Write a concise numbered checklist with 15 practical ways to contribute to an open source project.", expected);
+            std::cout << "Windows live " << mode << ": " << bytes << " assistant bytes, "
+                      << (expected ? "marked interrupted with the idle timeout" : "completed") << '\n';
+            completed = true;
+          } catch (...) { failure = std::current_exception(); }
+          app.Quit();
+        });
+      }}}};
+  static_cast<void>(RunApplication());
+  if (failure) std::rethrow_exception(failure);
+  Check(completed, "The live streaming test did not complete");
+}
+
 struct LiveResponseRecovery {
   File database;
   bool resume;
@@ -1735,6 +2202,24 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
+  if (argc == 2 && std::string_view(argv[1]) == "--configured-context") {
+    try {
+      ConfiguredContext();
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << error.what() << '\n';
+      return 1;
+    }
+  }
+  if (argc == 3 && std::string_view(argv[1]) == "--configured-stream") {
+    try {
+      ConfiguredStreaming(argv[2]);
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << error.what() << '\n';
+      return 1;
+    }
+  }
   if (argc == 3 && std::string_view(argv[1]) == "--native-http") {
     try {
       NativeHttp(argv[2]);
@@ -1759,6 +2244,9 @@ int main(int argc, char** argv) {
             co_await StructuredOutput(scope, kit::ChatOutputFormat::JsonSchema);
             co_await StructuredOutput(scope, kit::ChatOutputFormat::JsonObject);
             co_await ErrorsAndCancellation(scope);
+            co_await StreamDeadlines(scope);
+            co_await ContextCompaction(scope);
+            co_await ContextToolBudget(scope);
             co_await ResponsesToolProtocol(scope);
             co_await ResponsesReasoningSummary(scope);
             co_await ResponsesSqliteRecovery(scope);

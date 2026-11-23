@@ -258,6 +258,13 @@ struct DelegatedRun {
   bool started = false;
 };
 
+struct ModelHistory {
+  std::vector<std::pair<MessageRef, std::size_t>> messages;
+  std::vector<MessageRef> summarized;
+  std::string summary;
+  bool edited = false;
+};
+
 struct RunExecution {
   RunSnapshot view;
   PrincipalId principal;
@@ -300,6 +307,7 @@ struct RunExecution {
   std::optional<CallbackCompletion<bool>> delegate_waiter;
   bool delegate_dispatched = false;
   bool finishing = false;
+  ModelHistory model_history;
 
   bool UsingHostedModelTools() const {
     return host_model_busy && host_model_step && std::ranges::any_of(host_model_step->allowed_tools,
@@ -406,6 +414,7 @@ struct StoredRun {
   std::optional<ArtifactAction> artifact_action;
   std::optional<DelegatedRun> delegate;
   std::map<CommandId, std::vector<RunId>> delegations;
+  ModelHistory model_history;
 };
 
 struct StoredCommand {
@@ -1012,6 +1021,7 @@ public:
   Task<void> ConsumeQueue(SessionId id);
 
   Task<void> Drive(RunId run);
+  Task<void> DriveModelConversation(RunId run);
 
   Async<ModelReply> RunHostModel(RunId run, ModelInput input);
 

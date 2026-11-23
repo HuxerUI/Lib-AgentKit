@@ -215,7 +215,9 @@ public:
       if (type.empty() || (frame.type != "message" && frame.type != type)) throw std::invalid_argument("Messages event type changed");
       if (type == "ping") return AgentResult<bool>::Success(false);
       if (type == "error") {
-        const auto code = String(event.at("error"), "type") == "rate_limit_error" ? ErrorCode::RateLimited : ErrorCode::ProviderFailure;
+        const auto& failure = event.at("error");
+        if (auto context = ModelContextError(failure)) return AgentResult<bool>::Failure(std::move(*context));
+        const auto code = String(failure, "type") == "rate_limit_error" ? ErrorCode::RateLimited : ErrorCode::ProviderFailure;
         return Fail<bool>(code, "Messages provider reported a stream error");
       }
       if (type == "message_start") {
@@ -336,7 +338,8 @@ private:
     ModelFinishReason reason;
     if (stop_reason_ == "end_turn" || stop_reason_ == "stop_sequence") reason = ModelFinishReason::Completed;
     else if (stop_reason_ == "tool_use") reason = ModelFinishReason::ToolCalls;
-    else if (stop_reason_ == "max_tokens" || stop_reason_ == "model_context_window_exceeded") reason = ModelFinishReason::Length;
+    else if (stop_reason_ == "max_tokens") reason = ModelFinishReason::Length;
+    else if (stop_reason_ == "model_context_window_exceeded") reason = ModelFinishReason::ContextLimit;
     else if (stop_reason_ == "refusal") reason = ModelFinishReason::Refused;
     else if (stop_reason_ == "content_filter") reason = ModelFinishReason::Filtered;
     else if (stop_reason_ == "pause_turn") return Fail<bool>(ErrorCode::Unsupported, "Hosted Messages tools are unavailable");
@@ -409,7 +412,7 @@ private:
   bool has_usage_ = false;
 };
 
-class MessagesProvider final : public ModelProvider {
+class MessagesProvider final : public PositionedModelProvider {
 public:
   MessagesProvider(MessagesOptions options, std::string url, TaskScope tasks, ModelHttpOpen open)
       : options_(std::move(options)), url_(std::move(url)), tasks_(tasks), open_(std::move(open)) {}
@@ -442,7 +445,7 @@ public:
       co_return Fail<Stream>(ErrorCode::InvalidArgument, "Invalid Messages input or continuation");
     }
     co_return co_await OpenModelStream(std::move(call), tasks_, open_, options_.api_key, request.stop,
-        std::move(protocol), ModelCredential::ApiKey);
+        std::move(protocol), options_.stream_timeouts, ModelCredential::ApiKey);
   }
 
 private:
@@ -461,7 +464,7 @@ AgentResult<ModelRegistration> MakeMessagesModel(MessagesOptions options, TaskSc
   const bool budgeted = options.thinking && options.thinking->mode == Mode::Budgeted;
   const auto& version = options.api_version;
   if (!options.ref.version || options.ref.id.value.empty() || options.model.empty() ||
-      !ValidUtf8(options.model) || options.timeout <= Duration::zero() || !open || !options.max_output_tokens ||
+      !ValidUtf8(options.model) || !ValidModelTimeouts(options.timeout, options.stream_timeouts) || !open || !options.max_output_tokens ||
       version.size() != 10 || version[4] != '-' || version[7] != '-' ||
       !std::ranges::all_of(version, [](char value) { return value == '-' || (value >= '0' && value <= '9'); }) ||
       (budgeted && (options.thinking->budget_tokens < 1024 || options.thinking->budget_tokens >= options.max_output_tokens))) {

@@ -32,6 +32,8 @@ public:
 
   huxerui::File TaskDirectory(const huxerui::agentkit::RunId& run) const;
 
+  huxerui::agentkit::AgentResult<std::string> ResolveTaskDirectory(const huxerui::agentkit::RunId& run) const;
+
 private:
   huxerui::File task_files_;
   std::weak_ptr<huxerui::FilePicker> picker_;
@@ -48,7 +50,18 @@ huxerui::agentkit::AgentResult<std::string> LocalDirectory(const huxerui::File& 
 
 huxerui::agentkit::ToolResourceResolver LocalFileResources(std::shared_ptr<CodeWorkspaces> workspaces);
 
+bool IsLocalPageArtifact(const huxerui::agentkit::ArtifactRef& artifact);
+
+bool HasLocalPagePublication(const huxerui::agentkit::Message& output);
+
+std::optional<huxerui::agentkit::ResourceRef> LocalPageOutput(const huxerui::agentkit::ToolCallSnapshot& call);
+
+huxerui::agentkit::ArtifactStore WithLocalPages(huxerui::agentkit::ArtifactStore store, huxerui::File pages);
+
+huxerui::agentkit::AgentResult<huxerui::File> ResolveLocalPage(huxerui::File pages,
+    std::optional<huxerui::agentkit::ArtifactPreview> artifact, std::optional<huxerui::agentkit::ResourceRef> legacy);
+
 huxerui::agentkit::AgentResult<void> RegisterLocalFileTools(
-    const std::shared_ptr<huxerui::agentkit::AgentRuntime>& runtime, std::shared_ptr<LocalFileAccess> access);
+    const std::shared_ptr<huxerui::agentkit::AgentRuntime>& runtime, std::shared_ptr<LocalFileAccess> access, huxerui::File pages);
 
 } // namespace agentkit_preview

@@ -77,7 +77,7 @@ View ModelRoleField(StringVariant label, std::vector<ModelChoice> choices, Strin
 View SettingsRow(StringVariant label, StringVariant help, View control, bool stacked, const ColorScheme& colors) {
   auto copy = Column{
       Text(label).Style({Font::System(14.0F).WithWeight(FontWeight::Medium), colors.on_surface}),
-      Text(help).Style({Font::System(12.0F), colors.on_surface_variant}),
+      Text(help).Style({Font::System(13.0F), colors.on_surface_variant}),
   }.With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch));
   if (stacked) return Column{std::move(copy), std::move(control)}.With(Padding(14.0F), Spacing(9.0F),
       CrossAlign(CrossAxisAlignment::Stretch));
@@ -137,6 +137,9 @@ kit::Async<PreviewSettings> ReadPreviewSettings(File file) {
     if (appearance >= appearance_labels.size() || tone >= tone_labels.size() || instructions.size() > instruction_limit) {
       throw std::invalid_argument("Invalid Preview settings");
     }
+    auto image_generation_model = doc.value("image_generation_model", std::string("gpt-image-1.5"));
+    if (image_generation_model.size() > 256 || image_generation_model.find_first_of(" \t\r\n") != std::string::npos)
+      throw std::invalid_argument("Invalid image generation model");
     LocalFilePermissions file_access;
     if (const auto access = doc.find("file_access"); access != doc.end()) {
       file_access.full_access = access->at("full_access").get<bool>();
@@ -147,7 +150,8 @@ kit::Async<PreviewSettings> ReadPreviewSettings(File file) {
     }
     co_return Result::Success({.appearance = static_cast<PreviewAppearance>(appearance), .tone = static_cast<ReplyTone>(tone),
         .instructions = std::move(instructions), .daily_model = ReadModel(doc, "daily_model"),
-        .image_model = ReadModel(doc, "image_model"), .review_model = ReadModel(doc, "review_model"), .file_access = std::move(file_access)});
+        .image_model = ReadModel(doc, "image_model"), .review_model = ReadModel(doc, "review_model"),
+        .image_endpoint = ReadModel(doc, "image_endpoint"), .image_generation_model = std::move(image_generation_model), .file_access = std::move(file_access)});
   } catch (const std::exception&) {
     co_return Result::Failure({.code = kit::ErrorCode::InvalidArgument, .message = "The saved Preview settings are invalid."});
   }
@@ -158,11 +162,15 @@ kit::Async<void> SavePreviewSettings(File file, PreviewSettings settings) {
   if (settings.instructions.size() > instruction_limit) {
     co_return Result::Failure({.code = kit::ErrorCode::InvalidArgument, .message = "Personal instructions may use up to 4 KiB."});
   }
+  if (settings.image_generation_model.size() > 256 ||
+      settings.image_generation_model.find_first_of(" \t\r\n") != std::string::npos)
+    co_return Result::Failure({.code = kit::ErrorCode::InvalidArgument, .message = "Enter a single image generation model ID."});
   auto temporary = file.Parent()->Child(kit::NewCommandId().value + ".settings-pending");
   auto contents = Json{{"appearance", static_cast<std::size_t>(settings.appearance)},
       {"tone", static_cast<std::size_t>(settings.tone)}, {"instructions", std::move(settings.instructions)},
       {"daily_model", ModelRecord(settings.daily_model)}, {"image_model", ModelRecord(settings.image_model)},
-      {"review_model", ModelRecord(settings.review_model)}, {"file_access", {
+      {"review_model", ModelRecord(settings.review_model)}, {"image_endpoint", ModelRecord(settings.image_endpoint)},
+      {"image_generation_model", std::move(settings.image_generation_model)}, {"file_access", {
         {"full_access", settings.file_access.full_access}, {"directories", std::move(settings.file_access.directories)},
         {"revision", std::move(settings.file_access.revision)}}}}.dump();
   if (!co_await temporary.WriteStringAsync(std::move(contents)) || !co_await temporary.MoveToAsync(file, true)) {
@@ -199,6 +207,7 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
     std::function<kit::Async<void>(LocalFilePermissions)> apply_file_access) {
   const auto draft = UseState(current.Get());
   const auto instructions = UseState(TextEditingValue::FromText(current->instructions));
+  const auto image_model = UseState(TextEditingValue::FromText(current->image_generation_model));
   const auto busy = UseState(false);
   const auto error = UseState(std::string{});
   const auto section = UseState(SettingsSection::Models);
@@ -299,6 +308,18 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
         SettingsRow(::app::strings::ui_image_understanding, ::app::strings::ui_choose_a_model_that_accepts_images,
             ModelRoleField(::app::strings::ui_image_understanding, vision, ::app::strings::ui_use_the_selected_chat_model, draft, &PreviewSettings::image_model)
                 .Key("settings-image-model"), stack_fields, colors),
+        SettingsRow(::app::strings::ui_image_endpoint, ::app::strings::ui_image_endpoint_help,
+            ModelRoleField(::app::strings::ui_image_endpoint, choices, ::app::strings::ui_automatic, draft, &PreviewSettings::image_endpoint)
+                .Key("settings-image-endpoint"), stack_fields, colors),
+        SettingsRow(::app::strings::ui_image_generation, ::app::strings::ui_image_generation_help,
+            Column{ProvideEnvironment(fields, TextField(image_model).Label(::app::strings::ui_image_generation)
+                .Variant(TextFieldVariant::Outlined).Placeholder("gpt-image-1.5")
+                .OnChanged([draft, image_model](const TextEditingValue& text) {
+                  image_model = text;
+                  auto value = draft.Get();
+                  value.image_generation_model = text.text;
+                  draft = std::move(value);
+                }).Key("settings-image-generation-model"))}.With(CrossAlign(CrossAxisAlignment::Stretch)), stack_fields, colors),
         SettingsRow(::app::strings::ui_auto_review_model, ::app::strings::ui_use_for_automatic_approval_review,
             ModelRoleField(::app::strings::ui_auto_review_model, choices, ::app::strings::ui_use_the_host_review_policy, draft, &PreviewSettings::review_model)
                 .Key("settings-review-model"), stack_fields, colors),

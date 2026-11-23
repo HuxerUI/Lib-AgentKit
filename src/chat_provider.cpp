@@ -187,16 +187,22 @@ public:
       : model_(options.ref), dialect_(options.dialect), input_items_(request.items.size()),
         structured_(request.output_schema.has_value()), multiple_(options.multi_tool_calls),
         tools_via_json_(options.tools_via_json),
-        finish_on_choice_(options.tools_via_json && !options.request_usage),
+        request_usage_(options.request_usage),
         json_tool_id_(options.tools_via_json && !request.tools.empty() ? "json-" + request.turn.value : std::string{}),
         names_(std::move(names)), fields_(std::move(private_fields)) {}
 
   AgentResult<bool> Accept(SseFrame frame, std::deque<ModelEvent>& events) override {
     try {
-      if (frame.type == "error") return Fail<bool>(ErrorCode::ProviderFailure, "Model reported a stream error");
       if (frame.data == "[DONE]") return Finish(events);
       auto document = Json::parse(frame.data);
-      if (Member(document, "error")) return Fail<bool>(ErrorCode::ProviderFailure, "Model reported a stream error");
+      if (const auto* failure = Member(document, "error")) {
+        if (auto context = ModelContextError(*failure)) return AgentResult<bool>::Failure(std::move(*context));
+        return Fail<bool>(ErrorCode::ProviderFailure, "Model reported a stream error");
+      }
+      if (frame.type == "error") {
+        if (auto context = ModelContextError(document)) return AgentResult<bool>::Failure(std::move(*context));
+        return Fail<bool>(ErrorCode::ProviderFailure, "Model reported a stream error");
+      }
       const auto* usage = Member(document, "usage");
       if (usage) {
         const auto* input = Member(*usage, "prompt_tokens");
@@ -206,7 +212,7 @@ public:
       }
       auto choices = document.at("choices");
       if (!choices.is_array() || choices.size() > 1) throw std::invalid_argument("Only one model choice is supported");
-      if (choices.empty()) return AgentResult<bool>::Success(false);
+      if (choices.empty()) return finish_ && usage ? Finish(events) : AgentResult<bool>::Success(false);
       if (finish_) throw std::invalid_argument("Unexpected delta after the final choice");
       const auto& choice = choices.front();
       if (Count(choice.at("index")) != 0) throw std::invalid_argument("Unexpected model choice index");
@@ -215,15 +221,25 @@ public:
       if (!finish.empty()) {
         if (finish == "stop") finish_ = refused_ ? ModelFinishReason::Refused : ModelFinishReason::Completed;
         else if (finish == "tool_calls") finish_ = ModelFinishReason::ToolCalls;
-        else if (finish == "length") finish_ = ModelFinishReason::Length;
+        else if (finish == "length" || finish == "max_tokens") finish_ = ModelFinishReason::Length;
+        else if (finish == "context_length_exceeded" || finish == "model_context_window_exceeded" ||
+                 finish == "context_window_exceeded") finish_ = ModelFinishReason::ContextLimit;
         else if (finish == "content_filter" || finish == "sensitive") finish_ = ModelFinishReason::Filtered;
         else return Fail<bool>(ErrorCode::ProtocolError, "Model returned an unsupported finish reason");
-        if (finish_on_choice_) return Finish(events);
+        if (!request_usage_ || usage) return Finish(events);
       }
       return AgentResult<bool>::Success(false);
     } catch (const std::exception&) {
       return Fail<bool>(ErrorCode::ProtocolError, "Malformed Chat Completions event");
     }
+  }
+
+  bool HasTerminalFrame() const noexcept override { return finish_.has_value(); }
+
+  AgentResult<void> End(std::deque<ModelEvent>& events) override {
+    auto finished = Finish(events);
+    if (!finished.Succeeded()) return AgentResult<void>::Failure(finished.Error());
+    return AgentResult<void>::Success();
   }
 
 private:
@@ -374,7 +390,7 @@ private:
   bool structured_;
   bool multiple_;
   bool tools_via_json_;
-  bool finish_on_choice_;
+  bool request_usage_;
   std::string json_tool_id_;
   ToolNames names_;
   Json fields_;
@@ -389,7 +405,7 @@ private:
   bool refused_ = false;
 };
 
-class ChatProvider final : public ModelProvider {
+class ChatProvider final : public PositionedModelProvider {
 public:
   ChatProvider(ChatCompletionsOptions options, std::string url, TaskScope tasks, ModelHttpOpen open)
       : options_(std::move(options)), url_(std::move(url)), tasks_(tasks), open_(std::move(open)) {}
@@ -425,7 +441,7 @@ public:
       co_return Fail<std::unique_ptr<ModelTurnStream>>(ErrorCode::InvalidArgument, "Invalid Chat Completions input or continuation");
     }
     co_return co_await OpenModelStream(std::move(call), tasks_, open_, options_.bearer_token,
-        request.stop, std::move(protocol));
+        request.stop, std::move(protocol), options_.stream_timeouts);
   }
 
 private:
@@ -441,7 +457,7 @@ AgentResult<ModelRegistration> MakeChatCompletionsModel(ChatCompletionsOptions o
   auto url = ModelUrl(options.base_url, bool(options.bearer_token), "/chat/completions");
   if (!url.Succeeded()) return AgentResult<ModelRegistration>::Failure(url.Error());
   if (!options.ref.version || options.ref.id.value.empty() || options.model.empty() ||
-      !ValidUtf8(options.model) || options.timeout <= Duration::zero() || !open) {
+      !ValidUtf8(options.model) || !ValidModelTimeouts(options.timeout, options.stream_timeouts) || !open) {
     return Fail<ModelRegistration>(ErrorCode::InvalidArgument, "Invalid Chat Completions model configuration");
   }
   std::string provider;

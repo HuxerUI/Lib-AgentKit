@@ -12,6 +12,14 @@
 
 namespace huxerui::agentkit {
 
+/// @brief Per-stage liveness limits for an HTTP model turn.
+struct ModelStreamTimeouts {
+  /// Positive time to receive the first model event, including connection and response headers.
+  Duration first_response{120000};
+  /// Positive time between model events once a response starts. SSE keep-alives do not extend it.
+  Duration idle{60000};
+};
+
 /// @brief Wire conventions for Chat Completions endpoints.
 enum class ChatCompletionsDialect {
   /// OpenAI Chat Completions conventions.
@@ -48,7 +56,7 @@ struct ChatCompletionsOptions {
   /// Optional asynchronous credential source used for the HTTP Authorization header.
   std::function<Async<std::string>()> bearer_token;
   /// Positive request timeout in milliseconds, including response consumption.
-  Duration timeout{120000};
+  Duration timeout{600000};
   /// Advertises and enables tool calling for this model configuration.
   bool tool_calls = true;
   /// Allows multiple calls per turn when tool_calls is enabled.
@@ -66,6 +74,8 @@ struct ChatCompletionsOptions {
   /// Exchange tool requests and results as JSON in chat messages for endpoints without native function calling.
   /// The adapter buffers each tool turn and supports one call per turn in this mode.
   bool tools_via_json = false;
+  /// Time limits for receiving successive stream events.
+  ModelStreamTimeouts stream_timeouts;
 };
 
 /// @brief Creates the Chat Completions adapter on the application thread.
@@ -107,7 +117,7 @@ struct ResponsesOptions {
   /// Optional asynchronous credential source used for the HTTP Authorization header.
   std::function<Async<std::string>()> bearer_token;
   /// Positive request timeout in milliseconds, including response consumption.
-  Duration timeout{120000};
+  Duration timeout{600000};
   /// Advertises and enables tool calling for this model configuration.
   bool tool_calls = true;
   /// Allows multiple calls per turn when tool_calls is enabled.
@@ -125,6 +135,8 @@ struct ResponsesOptions {
   /// Requests displayable reasoning summaries on a supporting OpenAI Responses model.
   /// The summary is published in RunSnapshot and follows the Run's retention.
   bool reasoning_summary = false;
+  /// Time limits for receiving successive stream events.
+  ModelStreamTimeouts stream_timeouts;
 };
 
 /// @brief Creates the Responses adapter on the application thread.
@@ -185,7 +197,7 @@ struct MessagesOptions {
   /// API version header in YYYY-MM-DD form.
   std::string api_version = "2023-06-01";
   /// Positive request timeout in milliseconds, including response consumption.
-  Duration timeout{120000};
+  Duration timeout{600000};
   /// Positive maximum output token count for a turn.
   std::uint32_t max_output_tokens = 8192;
   /// Advertises and enables tool calling for this model configuration.
@@ -198,6 +210,8 @@ struct MessagesOptions {
   bool allow_persist_resume_state = false;
   /// Structured-output mode to advertise and use.
   MessagesOutputFormat output_format = MessagesOutputFormat::Text;
+  /// Time limits for receiving successive stream events.
+  ModelStreamTimeouts stream_timeouts;
 };
 
 /// @brief Creates the Messages adapter on the application thread.
@@ -218,7 +232,7 @@ struct GeminiGenerateContentOptions {
   /// Optional asynchronous credential source used for the provider's API-key header.
   std::function<Async<std::string>()> api_key;
   /// Positive request timeout in milliseconds, including response consumption.
-  Duration timeout{120000};
+  Duration timeout{600000};
   /// Advertises and enables tool calling for this model configuration.
   bool tool_calls = true;
   /// Allows multiple calls per turn when tool_calls is enabled.
@@ -235,6 +249,8 @@ struct GeminiGenerateContentOptions {
   std::size_t max_inline_bytes = 8 * 1024 * 1024;
   /// Opt-in to durable storage of compatible adapter continuation bytes.
   bool allow_persist_resume_state = false;
+  /// Time limits for receiving successive stream events.
+  ModelStreamTimeouts stream_timeouts;
 };
 
 /// @brief Creates the Gemini GenerateContent adapter on the application thread.
@@ -255,7 +271,7 @@ struct GeminiInteractionsOptions {
   /// Optional asynchronous credential source used for the provider's API-key header.
   std::function<Async<std::string>()> api_key;
   /// Positive request timeout in milliseconds, including response consumption.
-  Duration timeout{120000};
+  Duration timeout{600000};
   /// Advertises and enables tool calling for this model configuration.
   bool tool_calls = true;
   /// Allows multiple calls per turn when tool_calls is enabled.
@@ -274,6 +290,8 @@ struct GeminiInteractionsOptions {
   bool allow_server_state = false;
   /// Opt-in to durable storage of compatible adapter continuation bytes.
   bool allow_persist_resume_state = false;
+  /// Time limits for receiving successive stream events.
+  ModelStreamTimeouts stream_timeouts;
 };
 
 /// @brief Creates the Gemini Interactions adapter on the application thread.

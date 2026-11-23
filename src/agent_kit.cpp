@@ -314,7 +314,8 @@ AgentResult<void> AgentRuntime::RegisterModel(ModelRegistration model) {
   if (state_->stage != RuntimeState::Stage::Started && state_->stage != RuntimeState::Stage::Registering)
     return Fail<void>(ErrorCode::InvalidState, "Registration closed");
   if (model.ref.id.value.empty() || !model.ref.version || !model.provider || model.endpoint.provider.empty() ||
-      model.endpoint.model.empty() || model.endpoint.protocol.empty()) {
+      model.endpoint.model.empty() || model.endpoint.protocol.empty() || model.context_limits.context_window == 0 ||
+      model.context_limits.max_input_tokens == 0 || model.context_limits.max_output_tokens == 0) {
     return Fail<void>(ErrorCode::InvalidArgument, "Invalid model registration");
   }
   auto& versions = state_->models[model.ref.id];

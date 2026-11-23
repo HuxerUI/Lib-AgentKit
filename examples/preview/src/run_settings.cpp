@@ -263,7 +263,7 @@ kit::ExecutionProfileRef RunSettings::GrantFullAccess(kit::WorkspaceId workspace
 }
 
 kit::AgentResult<kit::PolicyDecision> RunSettings::Decide(const kit::PolicyRequest& request, bool needs_confirmation,
-                                                        bool workspace_available) const {
+                                                        bool workspace_available, bool full_local_access) const {
   using Result = kit::AgentResult<kit::PolicyDecision>;
   const auto profile = request.run_configuration ? request.run_configuration->execution_profile : std::nullopt;
   auto decision = needs_confirmation ? kit::AccessDecision::RequireConfirmation : kit::AccessDecision::Allow;
@@ -271,6 +271,9 @@ kit::AgentResult<kit::PolicyDecision> RunSettings::Decide(const kit::PolicyReque
       request.run_configuration && request.run_configuration->model == DemoModel) {
     return Result::Failure({.code = kit::ErrorCode::Unsupported, .message = "Choose a configured model for the code assistant"});
   }
+  if (full_local_access && request.actor.principal == PreviewUser && workspace_available &&
+      request.capability == kit::Capability::ExecuteTool && request.tool && IsCodePatchTool(request.tool->id))
+    decision = kit::AccessDecision::Allow;
   if (!profile || *profile == AskProfile) return Result::Success({decision, {}});
   if (request.actor.principal != PreviewUser) {
     return Result::Failure({.code = kit::ErrorCode::PermissionDenied, .message = "Permissions belong to another user"});
@@ -283,6 +286,7 @@ kit::AgentResult<kit::PolicyDecision> RunSettings::Decide(const kit::PolicyReque
     return Result::Failure({.code = kit::ErrorCode::Conflict, .message = "Permission preset changed. Choose permissions again."});
   }
   if (!HasFullAccess(*profile, request.workspace) || !request.agent) {
+    if (full_local_access) return Result::Success({decision, {}});
     return Result::Failure({.code = kit::ErrorCode::Conflict, .message = "Full Access is unavailable for this task. Choose permissions again."});
   }
   if (!workspace_available) {
@@ -709,12 +713,13 @@ namespace {
 View RunOptionTrigger(std::string value, StringResource label, std::string key, ViewHandle anchor,
                       std::function<void()> open, Color ink, bool enabled, const ModelBrand* brand = nullptr,
                       bool permission = false) {
-  const auto colors = UseTheme().colors;
+  const auto theme = UseTheme();
+  const auto& colors = theme.colors;
   const auto compact = UseViewportClass() == ViewportClass::Compact;
   auto style = UseEnvironment<ChipStyle>();
   style.background = colors.surface_container_low;
   style.border = Border{Color::Transparent()};
-  style.label_style = {Font::System(12.0F).WithWeight(FontWeight::Medium), ink};
+  style.label_style = {Font::FromFamily(theme.typography.family, theme.typography.body_small).WithWeight(FontWeight::Medium), ink};
   style.padding = EdgeInsets::Symmetric(8.0F, 3.0F);
   style.minimum_height = 32.0F;
   style.icon_size = 14.0F;
@@ -746,7 +751,8 @@ View RunOptionTrigger(std::string value, StringResource label, std::string key, 
 [[huxerui::composable]]
 View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserRunOptions> next, kit::AgentId agent,
     std::optional<kit::WorkspaceId> workspace, std::optional<File> workspace_root,
-    std::function<void()> changed, std::optional<View> extra_action, AddModelProfile add_model, bool show_permissions) {
+    std::function<void()> changed, std::optional<View> extra_action, AddModelProfile add_model, bool show_permissions,
+    bool full_local_access, kit::ExecutionProfileRef default_profile) {
   const auto model_menu = UseMenu();
   const auto permission_menu = UseMenu();
   const auto dialogs = UseDialog();
@@ -769,7 +775,7 @@ View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserR
   auto model = effective_model == DemoModel ? UseString(::app::strings::ui_local_demo_model) :
       selected != choices.end() ? selected->name : effective_model ? UseString(::app::strings::ui_unavailable_model) :
       UseString(::app::strings::ui_select_model);
-  const auto effective_profile = next->execution_profile.value_or(AskProfile);
+  const auto effective_profile = next->execution_profile.value_or(default_profile);
   const bool full_access = workspace && workspace_root;
   const bool full_access_selected = full_access && settings->HasFullAccess(effective_profile, workspace);
   const auto select_model = [next, changed](kit::ModelProviderRef ref) {
@@ -835,8 +841,16 @@ View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserR
       RunOptionTrigger(std::move(model), ::app::strings::ui_model, "run-model", model_anchor, choose_model,
           colors.on_surface_variant, !choices.empty() || bool(add_model), selected_brand),
   };
-  if (show_permissions) controls.push_back(RunOptionTrigger(std::move(permission), ::app::strings::ui_permissions,
-      "run-permissions", permission_anchor, choose_permission, permission_ink, true, nullptr, true));
+  if (show_permissions && full_local_access) {
+    controls.push_back(Row{
+        Image(::app::images::shield).Tint(colors.on_primary_container).With(Frame{.width = 14.0F, .height = 14.0F}),
+        Text(::app::strings::ui_full_access_mode).Style({Font::System(12.0F).WithWeight(FontWeight::Medium), colors.on_primary_container}),
+    }.With(Frame{.min_height = 32.0F}, Padding(EdgeInsets::Symmetric(8.0F, 3.0F)), Spacing(5.0F),
+        CrossAlign(CrossAxisAlignment::Center), Tooltip(::app::strings::ui_local_full_access_help)).Key("run-global-full-access"));
+  } else if (show_permissions) {
+    controls.push_back(RunOptionTrigger(std::move(permission), ::app::strings::ui_permissions,
+        "run-permissions", permission_anchor, choose_permission, permission_ink, true, nullptr, true));
+  }
   if (extra_action) {
     auto style = UseEnvironment<ButtonStyle>();
     style.background = Color::Transparent();

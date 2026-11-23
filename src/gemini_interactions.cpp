@@ -236,6 +236,12 @@ public:
       }
       if (type == "error" || type == "interaction.failed") {
         const auto* fault = Member(event, "error");
+        if (!fault) {
+          if (const auto* interaction = Member(event, "interaction")) fault = Member(*interaction, "error");
+        }
+        if (fault) {
+          if (auto context = ModelContextError(*fault)) return AgentResult<bool>::Failure(std::move(*context));
+        }
         const auto rate_limited = fault && (String(*fault, "code") == "RESOURCE_EXHAUSTED" ||
             String(*fault, "code") == "rate_limit_exceeded");
         return Fail<bool>(rate_limited ? ErrorCode::RateLimited : ErrorCode::ProviderFailure, "Interactions provider reported a stream failure");
@@ -446,10 +452,12 @@ private:
   std::size_t private_bytes_ = 0;
 };
 
-class InteractionsProvider final : public ModelProvider {
+class InteractionsProvider final : public PositionedModelProvider {
 public:
   InteractionsProvider(GeminiInteractionsOptions options, std::string url, TaskScope tasks, ModelHttpOpen open)
       : options_(std::move(options)), url_(std::move(url)), tasks_(tasks), open_(std::move(open)) {}
+
+  Layout ResumeLayout() const noexcept override { return Layout::Interactions; }
 
   ModelCapabilities Capabilities() const override {
     return {.text_stream = true, .tool_calls = options_.tool_calls, .structured_output = options_.structured_output,
@@ -498,7 +506,7 @@ private:
     call.body = ByteString(body);
     auto protocol = std::make_unique<InteractionsProtocol>(options_, request, names, layouts, store);
     co_return co_await OpenModelStream(std::move(call), tasks_, open_, options_.api_key,
-        request.stop, std::move(protocol), ModelCredential::GoogleApiKey);
+        request.stop, std::move(protocol), options_.stream_timeouts, ModelCredential::GoogleApiKey);
   }
 
   GeminiInteractionsOptions options_;
@@ -514,7 +522,7 @@ AgentResult<ModelRegistration> MakeGeminiInteractionsModel(GeminiInteractionsOpt
   auto url = ModelUrl(options.base_url, bool(options.api_key), "/interactions");
   if (!url.Succeeded()) return AgentResult<ModelRegistration>::Failure(url.Error());
   if (!options.ref.version || options.ref.id.value.empty() || options.model.empty() || options.model.size() > 256 ||
-      !ValidUtf8(options.model) || options.timeout <= Duration::zero() || !open ||
+      !ValidUtf8(options.model) || !ValidModelTimeouts(options.timeout, options.stream_timeouts) || !open ||
       !options.max_inline_bytes || options.max_inline_bytes > 14'000'000) {
     return Fail<ModelRegistration>(ErrorCode::InvalidArgument, "Invalid Gemini Interactions model configuration");
   }

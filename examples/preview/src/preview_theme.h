@@ -161,6 +161,8 @@ inline huxerui::ThemeSpec PreviewTheme(huxerui::ThemeBrightness brightness) {
   using huxerui::Color;
   const bool dark = brightness == huxerui::ThemeBrightness::Dark;
   auto theme = dark ? huxerui::MaterialDarkThemeSpec() : huxerui::MaterialLightThemeSpec();
+  theme.typography.body_large = 14.0F;
+  theme.typography.body_small = 13.0F;
   auto& colors = theme.colors;
   colors.surface = dark ? Color::Rgb(20, 21, 24) : Color::Rgb(249, 247, 244);
   colors.background = colors.surface;

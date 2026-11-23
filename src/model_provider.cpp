@@ -3,6 +3,7 @@
 #include "json_wire.h"
 #include "runtime_internal.h"
 
+#include <charconv>
 #include <cstring>
 #include <nlohmann/json.hpp>
 #include <set>
@@ -36,6 +37,46 @@ std::string ModelInstructions(const ModelTurnRequest& request) {
 }
 
 using Json = nlohmann::json;
+
+bool RebaseModelContinuation(const ModelProvider& provider, ModelContinuation& continuation,
+    std::size_t removed, std::size_t inserted) {
+  const auto* positioned = dynamic_cast<const PositionedModelProvider*>(&provider);
+  if (!positioned || removed > continuation.prefix_items || continuation.state.opaque.empty()) return false;
+  const auto bytes = std::span(continuation.state.opaque);
+  auto document = Json::parse(reinterpret_cast<const char*>(bytes.data()),
+      reinterpret_cast<const char*>(bytes.data() + bytes.size()), nullptr, false);
+  if (!document.is_object()) return false;
+  const auto layout = positioned->ResumeLayout();
+  const char* field = layout == PositionedModelProvider::Layout::Responses ? "reasoning" :
+      layout == PositionedModelProvider::Layout::Interactions ? "layouts" : nullptr;
+  const auto entries = field ? document.find(field) : document.end();
+  const auto* positions = field ? entries == document.end() ? nullptr : &*entries : &document;
+  if (!positions || !positions->is_object()) return false;
+  auto rebased = Json::object();
+  for (auto item = positions->begin(); item != positions->end(); ++item) {
+    const auto& key = item.key();
+    std::size_t index = 0;
+    const auto end = key.data() + key.size();
+    const auto parsed = std::from_chars(key.data(), end, index);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || index > continuation.prefix_items) return false;
+    if (index >= removed) rebased[std::to_string(index - removed + inserted)] = *item;
+  }
+  const auto prefix = continuation.prefix_items - removed + inserted;
+  if (field) {
+    document[field] = std::move(rebased);
+    if (layout == PositionedModelProvider::Layout::Responses) {
+      document["prefix"] = prefix;
+      document.erase("previous_response_id");
+    } else {
+      document.erase("link");
+    }
+  } else {
+    document = std::move(rebased);
+  }
+  continuation.prefix_items = prefix;
+  continuation.state.opaque = ByteString(document.dump());
+  return true;
+}
 
 const Json* Member(const Json& object, std::string_view name) {
   if (!object.is_object()) throw std::invalid_argument("Expected provider object");
@@ -155,13 +196,62 @@ AgentResult<std::string> ModelUrl(std::string_view base_url, bool authenticated,
   return AgentResult<std::string>::Success(std::move(url));
 }
 
+bool ValidModelTimeouts(Duration total, ModelStreamTimeouts timeouts) {
+  return total > Duration::zero() && timeouts.first_response > Duration::zero() && timeouts.idle > Duration::zero();
+}
+
+std::optional<AgentError> ModelContextError(const nlohmann::json& payload) {
+  if (!payload.is_object()) return {};
+  const auto field = [&payload](std::string_view key) {
+    const auto* value = Member(payload, key);
+    return value && value->is_string() ? Lowercase(value->get<std::string>()) : std::string{};
+  };
+  const auto is_context = [](std::string_view code) {
+    return code == "context_length_exceeded" || code == "context_window_exceeded" ||
+        code == "model_context_window_exceeded" || code == "max_context_length_exceeded";
+  };
+  const auto message = field("message");
+  const bool too_many_input_tokens = message.find("input token count") != std::string::npos &&
+      (message.find("exceeds") != std::string::npos || message.find("only supports up to") != std::string::npos);
+  if (!is_context(field("code")) && !is_context(field("type")) && !is_context(field("status")) &&
+      message.find("prompt is too long") == std::string::npos &&
+      message.find("maximum context length") == std::string::npos &&
+      message.find("context window exceeded") == std::string::npos && !too_many_input_tokens) return {};
+  auto error = Error(ErrorCode::BudgetExceeded, "Model context window exceeded");
+  error.provider_code = "context_window_exceeded";
+  return error;
+}
+
+namespace {
+
+Async<std::optional<AgentError>> ReadHttpContextError(const ModelBodyReader& read) {
+  constexpr std::size_t limit = 32 * 1024;
+  std::string body;
+  while (body.size() < limit) {
+    auto bytes = co_await read(limit - body.size());
+    if (!bytes.Succeeded() || bytes.Value().size() > limit - body.size()) break;
+    if (bytes.Value().empty()) {
+      auto doc = nlohmann::json::parse(body, nullptr, false);
+      if (doc.is_object()) {
+        const auto* error = Member(doc, "error");
+        co_return AgentResult<std::optional<AgentError>>::Success(ModelContextError(error ? *error : doc));
+      }
+      break;
+    }
+    body.append(reinterpret_cast<const char*>(bytes.Value().data()), bytes.Value().size());
+  }
+  co_return AgentResult<std::optional<AgentError>>::Success({});
+}
+
+} // namespace
+
 AgentResult<HttpRequest> MakeModelPost(std::string url, Duration timeout, std::optional<TimePoint> deadline) {
   HttpRequest call{.url = std::move(url), .method = HttpMethod::Post,
       .headers = {{"Content-Type", "application/json"}, {"Accept", "text/event-stream"}}, .timeout = timeout};
   if (deadline) {
     const auto now = std::chrono::time_point_cast<Duration>(std::chrono::system_clock::now());
     if (*deadline <= now) {
-      return Fail<HttpRequest>(ErrorCode::DeadlineExceeded, "Model turn deadline passed");
+      return AgentResult<HttpRequest>::Failure(ModelTimeoutError(ModelTimeout::Total));
     }
     call.timeout = std::min(timeout, *deadline - now);
   }
@@ -170,7 +260,7 @@ AgentResult<HttpRequest> MakeModelPost(std::string url, Duration timeout, std::o
 
 Async<std::unique_ptr<ModelTurnStream>> OpenModelStream(HttpRequest call, TaskScope tasks,
     const ModelHttpOpen& open, const std::function<Async<std::string>()>& credential,
-    std::stop_token stop, std::unique_ptr<SseModelProtocol> protocol, ModelCredential method) {
+    std::stop_token stop, std::unique_ptr<SseModelProtocol> protocol, ModelStreamTimeouts timeouts, ModelCredential method) {
   using Opened = AgentResult<std::unique_ptr<ModelTurnStream>>;
   if (credential) {
     auto token = co_await credential();
@@ -185,11 +275,25 @@ Async<std::unique_ptr<ModelTurnStream>> OpenModelStream(HttpRequest call, TaskSc
     }
   }
   if (stop.stop_requested()) co_return Fail<std::unique_ptr<ModelTurnStream>>(ErrorCode::AlreadyClosed, "Model turn cancelled");
-  auto response = co_await open(std::move(call));
-  if (!response.Succeeded()) co_return Opened::Failure(response.Error());
+  const auto started = ModelClock::now();
+  const ModelStreamDeadlines deadlines{started + timeouts.first_response, started + *call.timeout, timeouts.idle};
+  const auto timeout_kind = deadlines.total <= deadlines.first ? ModelTimeout::Total : ModelTimeout::FirstResponse;
+  const auto timeout = ModelTimeoutError(timeout_kind);
+  auto operation = open(std::move(call));
+  auto response = co_await WaitForModelIo(tasks, std::move(operation), stop, std::min(deadlines.first, deadlines.total), timeout);
+  if (!response.Succeeded()) {
+    co_return Opened::Failure(response.Error().code == ErrorCode::DeadlineExceeded ? timeout : response.Error());
+  }
   auto opened = std::move(response).Value();
   if (stop.stop_requested()) co_return Fail<std::unique_ptr<ModelTurnStream>>(ErrorCode::AlreadyClosed, "Model turn cancelled");
   if (opened.status != 200) {
+    if (opened.read && (opened.status == 400 || opened.status == 413 || opened.status == 422)) {
+      const auto until = std::min(deadlines.total, ModelClock::now() + Duration{2000});
+      auto diagnosis = co_await WaitForModelIo(tasks, ReadHttpContextError(opened.read), stop, until,
+          ModelTimeoutError(ModelTimeout::Total));
+      if (stop.stop_requested()) co_return Fail<std::unique_ptr<ModelTurnStream>>(ErrorCode::AlreadyClosed, "Model turn cancelled");
+      if (diagnosis.Succeeded() && diagnosis.Value()) co_return Opened::Failure(*diagnosis.Value());
+    }
     auto code = opened.status == 429 ? ErrorCode::RateLimited :
         opened.status == 401 || opened.status == 403 ? ErrorCode::PermissionDenied : ErrorCode::ProviderFailure;
     auto error = Error(code, "Model request returned HTTP " + std::to_string(opened.status));
@@ -199,7 +303,7 @@ Async<std::unique_ptr<ModelTurnStream>> OpenModelStream(HttpRequest call, TaskSc
   if (!HasEventStream(opened.headers) || !opened.read) {
     co_return Fail<std::unique_ptr<ModelTurnStream>>(ErrorCode::ProtocolError, "Model did not return an event stream");
   }
-  co_return Opened::Success(MakeSseModelStream(tasks, std::move(opened.read), stop, std::move(protocol)));
+  co_return Opened::Success(MakeSseModelStream(tasks, std::move(opened.read), stop, std::move(protocol), deadlines));
 }
 
 ModelHttpOpen NativeModelTransport(std::shared_ptr<HttpClient> client) {

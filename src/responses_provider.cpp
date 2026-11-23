@@ -236,6 +236,10 @@ public:
         sequence_ = number;
       }
       if (type == "error" || type == "response.failed" || type == "response.cancelled") {
+        const auto* response = Member(event, "response");
+        const auto& envelope = response ? *response : event;
+        const auto* error = Member(envelope, "error");
+        if (auto context = ModelContextError(error ? *error : envelope)) return AgentResult<bool>::Failure(std::move(*context));
         return Fail<bool>(ErrorCode::ProviderFailure, "Responses request did not complete");
       }
       if (type == "response.created" && store_) {
@@ -336,6 +340,8 @@ private:
       const auto* details = Member(response, "incomplete_details");
       const auto reason = details ? String(*details, "reason") : "";
       if (reason == "content_filter") events.emplace_back(ModelFinished{ModelFinishReason::Filtered});
+      else if (reason == "context_length_exceeded" || reason == "model_context_window_exceeded" ||
+               reason == "context_window_exceeded") events.emplace_back(ModelFinished{ModelFinishReason::ContextLimit});
       else if (reason == "max_output_tokens" || reason == "max_messages") {
         events.emplace_back(ModelFinished{ModelFinishReason::Length});
       } else return Fail<bool>(ErrorCode::ProviderFailure, "Responses turn ended incomplete");
@@ -462,10 +468,12 @@ private:
   std::size_t text_bytes_ = 0;
 };
 
-class ResponsesProvider final : public ModelProvider {
+class ResponsesProvider final : public PositionedModelProvider {
 public:
   ResponsesProvider(ResponsesOptions options, std::string url, TaskScope tasks, ModelHttpOpen open)
       : options_(std::move(options)), url_(std::move(url)), tasks_(tasks), open_(std::move(open)) {}
+
+  Layout ResumeLayout() const noexcept override { return options_.dialect == ResponsesDialect::OpenAI ? Layout::Flat : Layout::Responses; }
 
   ModelCapabilities Capabilities() const override {
     return {.text_stream = true, .tool_calls = options_.tool_calls,
@@ -506,7 +514,7 @@ private:
     call.body = ByteString(RequestBody(options_, request, names, reasoning, store, previous).dump());
     auto protocol = std::make_unique<ResponsesProtocol>(options_, request, names, reasoning, store);
     co_return co_await OpenModelStream(std::move(call), tasks_, open_, options_.bearer_token,
-        request.stop, std::move(protocol));
+        request.stop, std::move(protocol), options_.stream_timeouts);
   }
 
   ResponsesOptions options_;
@@ -521,7 +529,7 @@ AgentResult<ModelRegistration> MakeResponsesModel(ResponsesOptions options, Task
   auto url = ModelUrl(options.base_url, bool(options.bearer_token), "/responses");
   if (!url.Succeeded()) return AgentResult<ModelRegistration>::Failure(url.Error());
   if (!options.ref.version || options.ref.id.value.empty() || options.model.empty() ||
-      !ValidUtf8(options.model) || options.timeout <= Duration::zero() || !open) {
+      !ValidUtf8(options.model) || !ValidModelTimeouts(options.timeout, options.stream_timeouts) || !open) {
     return Fail<ModelRegistration>(ErrorCode::InvalidArgument, "Invalid Responses model configuration");
   }
   const bool glm = options.dialect == ResponsesDialect::GlmCompatible;

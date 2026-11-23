@@ -10,6 +10,7 @@
 #include "fork_review_view.h"
 #include "goal_view.h"
 #include "general_workflow.h"
+#include "host_tools.h"
 #include "link_navigation.h"
 #include "local_files.h"
 #include "markdown_images.h"
@@ -238,11 +239,26 @@ public:
           }
           break;
         }
+        if (latest.find("Choose a layout for each slide:") != std::string::npos) {
+          for (auto& slide : outline.slides) {
+            slide.layout = agentkit_preview::SlideLayout::List;
+            slide.media = "";
+          }
+        }
         events = {kit::ModelStructuredOutput{agentkit_preview::WritePresentationOutline(outline)}};
-      } else events = {kit::ModelTextDelta{"A sample outline is ready to review."},
-                kit::ModelStructuredOutput{agentkit_preview::WritePresentationOutline({
-                    std::move(topic), {{"Overview", {"Describe the purpose and audience"}},
-                                       {"Next steps", {"Summarize decisions and owners"}}}})}};
+      } else {
+        using agentkit_preview::SlideLayout;
+        agentkit_preview::PresentationOutline outline{std::move(topic), {{"Overview", {"Describe the purpose and audience"}},
+            {"Next steps", {"Summarize decisions and owners"}}}};
+        if (latest.find("Choose a layout for each slide:") != std::string::npos) {
+          outline.slides.front().layout = SlideLayout::Cover;
+          outline.slides.back().layout = SlideLayout::Flow;
+          for (auto& slide : outline.slides) slide.media = "";
+          outline.slides.back().bullets.insert(outline.slides.back().bullets.begin(), "Identify the next decision");
+        }
+        events = {kit::ModelTextDelta{"A sample outline is ready to review."},
+                  kit::ModelStructuredOutput{agentkit_preview::WritePresentationOutline(outline)}};
+      }
     } else if (latest == agentkit_preview::GeneralAnswerInstruction) {
       events = {kit::ModelTextDelta{"Received: "}, kit::ModelTextDelta{std::move(previous)}};
     } else if (request.instructions == selection_instructions) {
@@ -321,8 +337,82 @@ struct PreviewService {
   std::vector<CallbackCompletion<Started>> listeners;
 };
 
-std::optional<View> RenderPreviewBlock([[maybe_unused]] const PreviewService& service, const kit::Message& message,
+[[huxerui::composable]]
+View LocalPageCard(File pages, std::string name, std::shared_ptr<kit::Conversation> conversation,
+    std::optional<kit::ArtifactRef> artifact, std::optional<kit::ToolCallId> legacy_call) {
+  const auto tasks = UseTaskScope();
+  const auto busy = UseState(false);
+  const auto error = UseState(std::optional<StringResource>{});
+  const auto theme = UseTheme();
+  const auto& colors = theme.colors;
+  auto open = [tasks, busy, error, pages, conversation, artifact, legacy_call] {
+    if (busy.Get()) return;
+    busy = true;
+    error = std::nullopt;
+    tasks.Launch([busy, error, pages, conversation, artifact, legacy_call]() -> Task<void> {
+      const auto current = conversation->Snapshot();
+      std::optional<kit::ArtifactPreview> preview;
+      std::optional<kit::ResourceRef> legacy;
+      if (artifact) {
+        auto allowed = co_await conversation->PreviewArtifactAsync(*artifact);
+        if (allowed.Succeeded()) preview = std::move(allowed).Value();
+      } else if (current && legacy_call) {
+        const auto call = std::ranges::find(current->tools, *legacy_call, &kit::ToolCallSnapshot::id);
+        if (call != current->tools.end()) legacy = agentkit_preview::LocalPageOutput(*call);
+      }
+      auto path = co_await RunWorker(agentkit_preview::ResolveLocalPage, pages, preview, std::move(legacy));
+      const auto latest = conversation->Snapshot();
+      const auto revision = preview ? preview->access_revision : current ? current->access_revision : kit::Revision{};
+      if (!path.Succeeded() || !latest || latest->access_revision != revision) {
+        error = ::app::strings::ui_local_page_unavailable;
+      } else if (!agentkit_preview::OpenLocalPage(path.Value())) {
+        error = ::app::strings::ui_local_browser_failed;
+      }
+      busy = false;
+    });
+  };
+  auto title = name.empty() ? StringVariant{::app::strings::ui_local_html_page} : StringVariant{std::move(name)};
+  const Frame icon{.width = 14.0F, .height = 14.0F};
+  auto tile = Row{
+      Image(::app::images::code).Tint(colors.on_surface_variant).With(icon, LayoutPriority(1.0F)),
+      Text(title).Style({Font::FromFamily(theme.typography.family, theme.typography.body_small).WithWeight(FontWeight::Medium),
+          colors.on_surface}).LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Frame{.max_width = 220.0F}),
+      Image(::app::images::open_external).Tint(colors.on_surface_variant).With(icon, LayoutPriority(1.0F)),
+  }.OnClick(open).On<ViewEvents::KeyDown>([open](const KeyEvent& event) {
+    if (event.key != Key::Enter && event.key != Key::Space) return false;
+    if (!event.repeat) open();
+    return true;
+  }).With(Enabled(!busy.Get()), Focusable{}, PointerCursor(PointerCursorKind::Hand),
+      Spacing(9.0F), CrossAlign(CrossAxisAlignment::Center), Frame{.min_height = 34.0F},
+      Padding(EdgeInsets::Symmetric(10.0F, 4.0F)), CornerRadius(7.0F), Background(colors.surface_container_low),
+      agentkit_preview::PreviewRowIndication(theme, 7.0F), Tooltip(::app::strings::ui_local_open_page),
+      Semantics{.role = SemanticRole::Button, .label = ::app::strings::ui_local_open_page, .value = title})
+      .Key("open-local-page/" + (artifact ? artifact->id.value : legacy_call ? legacy_call->value : std::string{}));
+  std::vector<View> content{std::move(tile)};
+  if (error.Get()) content.push_back(Text(*error.Get(), TextRole::Label).With(Foreground(colors.error)));
+  return Row{Column(std::move(content)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Start)), Spacer()};
+}
+
+std::optional<View> RenderPreviewBlock(const PreviewService& service, const kit::Message& message,
     const kit::ContentBlock& block, std::shared_ptr<kit::Conversation> conversation) {
+  const auto page_name = [](const kit::ResourceRef& output) {
+    const auto name = std::filesystem::u8path(output.id.value).filename().u8string();
+    return std::string(name.begin(), name.end());
+  };
+  if (const auto* artifact = std::get_if<kit::ArtifactBlock>(&block.body);
+      artifact && agentkit_preview::IsLocalPageArtifact(artifact->artifact) && service.workspace_evidence &&
+      agentkit_preview::CanOpenLocalPages()) {
+    auto name = artifact->name;
+    if (const auto current = conversation->Snapshot(); name.empty() && current) {
+      for (const auto& call : current->tools) {
+        if (std::ranges::find(call.artifacts, artifact->artifact) == call.artifacts.end()) continue;
+        if (const auto file = agentkit_preview::LocalPageOutput(call)) name = page_name(*file);
+        break;
+      }
+    }
+    return LocalPageCard(service.workspace_evidence->Child("local-pages"), std::move(name), std::move(conversation),
+        artifact->artifact, {});
+  }
   if (const auto* step = std::get_if<kit::ToolBlock>(&block.body)) {
     const auto current = conversation->Snapshot();
     if (!current) return {};
@@ -330,6 +420,14 @@ std::optional<View> RenderPreviewBlock([[maybe_unused]] const PreviewService& se
     if (call == current->tools.end()) return {};
     if ((call->tool.id == agentkit_preview::RunCodeTests || call->tool.id == agentkit_preview::RunWorkspaceTests) &&
         call->output_message == message.ref) return agentkit_preview::CTestActivity(message);
+    if (service.workspace_evidence && agentkit_preview::CanOpenLocalPages() && call->output_message == message.ref &&
+        !agentkit_preview::HasLocalPagePublication(message) &&
+        !std::ranges::any_of(call->artifacts, agentkit_preview::IsLocalPageArtifact)) {
+      if (const auto file = agentkit_preview::LocalPageOutput(*call)) {
+        return LocalPageCard(service.workspace_evidence->Child("local-pages"), page_name(*file), std::move(conversation),
+            {}, call->id);
+      }
+    }
     if (agentkit_preview::IsCodePatchTool(call->tool.id) && !call->effects.empty() && service.workspace_evidence) {
       auto workspace = current->summary.workspace ? service.workspaces->Find(*current->summary.workspace) : std::nullopt;
       return agentkit_preview::WorkspaceChangeActivity(std::move(conversation), service.runtime, *call,
@@ -646,6 +744,7 @@ kit::ModelRegistration MakeProfileModel(const agentkit_preview::ModelProfileInpu
       .protocol = profile.protocol, .api_key = environment.empty() ? profile.api_key : std::string{},
       .image_input = profile.image_input, .file_input = profile.file_input,
       .credential_environment = std::move(environment), .reasoning_summary = profile.reasoning_summary}, {}, std::move(revision));
+  model->context_limits = profile.limits;
   return std::move(model).value();
 }
 
@@ -973,9 +1072,11 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
                                               std::shared_ptr<agentkit_preview::AttachmentImports> attachments,
                                               std::optional<kit::AgentResult<kit::ModelRegistration>> review_model,
                                               const agentkit_preview::PreviewSettings& preferences,
-                                              bool review_user_comparisons, bool can_add_models) {
+                                              bool review_user_comparisons, bool can_add_models,
+                                              std::weak_ptr<PreviewService> host) {
   const auto designs = files.staging.Parent()->Child("designs");
   const auto evidence = files.staging.Parent()->Child("workspace-evidence");
+  const auto local_pages = evidence.Child("local-pages");
   const bool code_available = !configured.empty() || code_model.has_value();
   const bool release_available = code_available && test_runner.has_value();
   std::ranges::stable_sort(configured, {}, [](const auto& model) { return model.ref.version; });
@@ -992,11 +1093,21 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
         ? Registration::Success(*review)
         : Registration::Failure({.code = kit::ErrorCode::NotFound, .message = "The selected Auto Review model is unavailable"});
   }
+#ifdef _WIN32
+  agentkit_preview::WebSearchConfiguration web_search{
+      Environment("GANWORK_WEB_SEARCH_ENDPOINT"), Environment("GANWORK_WEB_SEARCH_API_KEY")};
+  if (web_search.endpoint.empty()) web_search.endpoint = "https://api.search.brave.com/res/v1/web/search";
+  const bool web_search_available = web_search.Available();
+#endif
   auto runtime_ref = std::make_shared<std::weak_ptr<kit::AgentRuntime>>();
   auto runtime = kit::AgentRuntime::Create({
       .tasks = tasks,
       .principal = [] { return kit::AgentResult<kit::PrincipalId>::Success(preview_user); },
-      .access = [settings, workspaces, local_files, review_user_comparisons](kit::PolicyRequest request) -> kit::Async<kit::PolicyDecision> {
+      .access = [settings, workspaces, local_files, review_user_comparisons
+#ifdef _WIN32
+                 , web_search_available
+#endif
+                 ](kit::PolicyRequest request) -> kit::Async<kit::PolicyDecision> {
         if (review_user_comparisons && request.capability == kit::Capability::CreateComparison &&
             request.operation != kit::JsonValue{}) {
           co_return kit::AgentResult<kit::PolicyDecision>::Success({kit::AccessDecision::RequireConfirmation, {}});
@@ -1006,6 +1117,16 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
           co_return kit::AgentResult<kit::PolicyDecision>::Success({kit::AccessDecision::RequireConfirmation, {}});
         }
         const auto tool = request.tool ? request.tool->id : kit::ToolId{};
+#ifdef _WIN32
+        if (agentkit_preview::HostToolLabel(tool)) {
+          auto decision = kit::AccessDecision::Allow;
+          if (request.actor.principal != preview_user || (tool == agentkit_preview::WebSearch && !web_search_available))
+            decision = kit::AccessDecision::Deny;
+          else if (request.capability == kit::Capability::ExecuteTool)
+            decision = kit::AccessDecision::RequireConfirmation;
+          co_return kit::AgentResult<kit::PolicyDecision>::Success({decision, {}});
+        }
+#endif
         if (agentkit_preview::IsLocalFileTool(tool))
           co_return kit::AgentResult<kit::PolicyDecision>::Success(local_files->Decide(request));
         const auto workspace = request.workspace ? workspaces->Find(*request.workspace) : std::nullopt;
@@ -1022,15 +1143,21 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
             tool != agentkit_preview::ReadDesign && tool != agentkit_preview::PublishDesign &&
             tool != agentkit_preview::ReadReport && tool != agentkit_preview::PrepareReleaseOutline &&
             tool != agentkit_preview::PublishReportChart;
-        co_return settings->Decide(request, needs_confirmation, workspace_available);
+        co_return settings->Decide(request, needs_confirmation, workspace_available, local_files->Current()->full_access);
       },
       .tool_reviewer = agentkit_preview::ChartExportReviewer(files.exports, std::move(review_model)),
       .tool_resources = [presentations = agentkit_preview::PresentationResources(files, runtime_ref),
                         code = agentkit_preview::CodeResources(workspaces),
                         local = agentkit_preview::LocalFileResources(workspaces),
+#ifdef _WIN32
+                        native = agentkit_preview::HostToolResources(workspaces, local_files),
+#endif
                         design = agentkit_preview::DesignChangeResources(runtime_ref),
                         charts = agentkit_preview::ReportChartResources(files.exports)](
                             kit::ToolInvocation invocation) -> kit::Async<std::vector<kit::ResourceAccess>> {
+#ifdef _WIN32
+        if (agentkit_preview::HostToolLabel(invocation.tool.id)) co_return co_await native(std::move(invocation));
+#endif
         if (agentkit_preview::IsLocalFileTool(invocation.tool.id)) co_return co_await local(std::move(invocation));
         if (agentkit_preview::HasDesignTargets(invocation.prepared_targets))
           co_return co_await design(std::move(invocation));
@@ -1058,9 +1185,9 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
       .verify = [runtime_ref, workspaces, files](kit::VerificationRequest request) {
         return agentkit_preview::VerifyWorkspaceRelease(runtime_ref->lock(), workspaces, files, std::move(request));
       },
-      .artifact_store = agentkit_preview::WithAttachmentImports(agentkit_preview::WithWorkspaceEvidence(
+      .artifact_store = agentkit_preview::WithLocalPages(agentkit_preview::WithAttachmentImports(agentkit_preview::WithWorkspaceEvidence(
           agentkit_preview::WithDesignArtifacts(agentkit_preview::PresentationArtifactStore(files), designs), evidence),
-          std::move(attachments)),
+          std::move(attachments)), local_pages),
       .changes = agentkit_preview::WithDesignChanges(
           agentkit_preview::WithCodeChanges(agentkit_preview::PresentationChanges(files, runtime_ref), evidence, workspaces, runtime_ref),
           designs, runtime_ref),
@@ -1132,8 +1259,11 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
       .instructions = instructions(std::string(selection_instructions)), .model = selected, .requires_model = {.text_stream = true},
       .budget = {.tokens = 6000, .model_turns = 2, .context_bytes = 128 << 10, .deadline = std::chrono::seconds(90)}}}));
   Require(agentkit_preview::RegisterCodeTools(registered, evidence, workspaces));
+#ifdef _WIN32
+  Require(agentkit_preview::RegisterHostTools(registered, local_files, std::move(web_search)));
+#endif
 #ifndef __EMSCRIPTEN__
-  Require(agentkit_preview::RegisterLocalFileTools(registered, std::move(local_files)));
+  Require(agentkit_preview::RegisterLocalFileTools(registered, std::move(local_files), local_pages));
 #endif
   if (code || can_add_models) {
     auto code_provider = code ? code->id : selected;
@@ -1233,7 +1363,47 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
           .capabilities = {kit::Capability::ReadGoal, kit::Capability::ReadProject, kit::Capability::ManageTask, kit::Capability::Reply},
           .requires_model = {.text_stream = true, .structured_output = true}},
       "create or revise an interface wireframe", agentkit_preview::RunDesign);
-  Require(agentkit_preview::RegisterPresentationTools(registered, files));
+  const auto image_available = [host] {
+    const auto service = host.lock();
+    return service && !service->settings->image_generation_model.empty() &&
+        (!service->model_revisions.empty() || !Environment("HUXERUI_AGENTKIT_BASE_URL").empty());
+  };
+  Require(agentkit_preview::RegisterPresentationTools(registered, files,
+      [host]() -> kit::Async<agentkit_preview::PresentationImageModel> {
+    using Result = kit::AgentResult<agentkit_preview::PresentationImageModel>;
+    const auto service = host.lock();
+    if (!service) co_return Result::Failure({.code = kit::ErrorCode::RuntimeClosed, .message = "GanWork has closed"});
+    const auto settings = service->settings.Get();
+    const auto missing = [] {
+      return Result::Failure({.code = kit::ErrorCode::InvalidState, .message = "Configure a saved image generation endpoint and model"});
+    };
+    if (settings.image_generation_model.empty()) co_return missing();
+    auto configured = service->run_settings->CurrentModel(settings.image_endpoint ? settings.image_endpoint : settings.daily_model);
+    if (!configured) configured = service->run_settings->DefaultModel(agentkit_preview::GeneralAgent);
+    auto saved = configured ? service->model_revisions.find(*configured) : service->model_revisions.end();
+    if (saved == service->model_revisions.end() && !settings.image_endpoint) {
+      const auto env_url = Environment("HUXERUI_AGENTKIT_BASE_URL");
+      if (!env_url.empty()) co_return Result::Success({env_url, Environment("HUXERUI_AGENTKIT_API_KEY"), settings.image_generation_model});
+      for (const auto& choice : service->run_settings->Models(agentkit_preview::GeneralAgent)) {
+        saved = service->model_revisions.find(choice.ref);
+        if (saved != service->model_revisions.end()) break;
+      }
+    }
+    if (saved == service->model_revisions.end()) co_return missing();
+    agentkit_preview::ModelProfileInput profile;
+    if (const auto* file = std::get_if<File>(&saved->second)) {
+      auto raw = co_await file->ReadStringAsync();
+      if (!raw.Succeeded()) co_return missing();
+      try { profile = ReadModelProfile(nlohmann::json::parse(raw.Value())); }
+      catch (const std::exception&) { co_return missing(); }
+    } else {
+      profile = std::get<agentkit_preview::ModelProfileInput>(saved->second);
+    }
+    const auto environment = ModelKeyEnvironment(profile.api_key);
+    auto key = environment.empty() ? std::move(profile.api_key) : Environment(environment.c_str());
+    if (!environment.empty() && key.empty()) co_return missing();
+    co_return Result::Success({std::move(profile.base_url), std::move(key), settings.image_generation_model});
+  }));
   register_specialist(
       {.ref = {agentkit_preview::PptAgent, 1}, .display_name = "PPT assistant",
           .instructions = instructions("Prepare slide outlines based on the user's brief. Treat reference notes as source material."),
@@ -1242,10 +1412,10 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
           .capabilities = {kit::Capability::ReadGoal, kit::Capability::ReadProject, kit::Capability::ReadContext,
               kit::Capability::ManageTask, kit::Capability::Reply},
           .requires_model = {.text_stream = true, .structured_output = true}},
-      "create a slide presentation", [export_directory](kit::RunContext context, kit::RunInput input,
+      "create a slide presentation", [export_directory, image_available](kit::RunContext context, kit::RunInput input,
                                                           std::optional<kit::RunCheckpoint> checkpoint) {
         return agentkit_preview::RunPresentation(
-            std::move(context), std::move(input), std::move(checkpoint), export_directory);
+            std::move(context), std::move(input), std::move(checkpoint), export_directory, {}, image_available());
       });
   return registered;
 }
@@ -1379,7 +1549,7 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
                                       service->workspaces, service->worktrees, std::move(code_model),
                                       std::move(test_runner), data.Child("test-logs"), service->run_settings, service->local_files,
                                       service->attachments, std::move(reviewer), service->applied_settings.Get(), review_user_comparisons,
-                                      service->model_profiles.has_value());
+                                      service->model_profiles.has_value(), service);
         selection->runtime = service->runtime;
         selection->composer_controls = [owner = std::weak_ptr{service}, settings = service->run_settings](
             State<kit::UserRunOptions> next, State<kit::AgentChatDraftSources> sources) -> kit::AgentChatRunControls {
@@ -1420,14 +1590,15 @@ struct Selection {
   bool operator==(const Selection&) const = default;
 };
 
-const kit::UserRunOptions default_draft_start{.execution_profile = agentkit_preview::AskProfile};
+const std::array draft_assistants{
+    agentkit_preview::GeneralAgent, agentkit_preview::PptAgent, agentkit_preview::CodeAgent, agentkit_preview::DesignAgent};
 
 struct NewConversationDraft {
   const std::string view_key = "new-draft/" + kit::NewCommandId().value;
   State<TextEditingValue> text{TextEditingValue::FromText({})};
-  State<std::size_t> assistant{std::size_t{0}};
+  State<std::optional<kit::AgentId>> assistant{std::optional<kit::AgentId>{}};
   State<std::optional<std::string>> group{std::optional<std::string>{}};
-  State<kit::UserRunOptions> start{default_draft_start};
+  State<kit::UserRunOptions> start{kit::UserRunOptions{}};
   State<std::vector<kit::SkillRef>> skills{std::vector<kit::SkillRef>{}};
   State<std::optional<agentkit_preview::ImportedPresentationReport>> report{
       std::optional<agentkit_preview::ImportedPresentationReport>{}};
@@ -1626,14 +1797,16 @@ View NavigationAction(StringVariant label, NavigationSymbol symbol, std::functio
   const auto& colors = theme.colors;
   const bool new_conversation = symbol == NavigationSymbol::New;
   const bool folder_heading = expanded.has_value();
+  const auto label_font = Font::FromFamily(theme.typography.family,
+      folder_heading ? theme.typography.body_small : theme.typography.body_medium);
   const float inset = folder_heading ? 6.0F : 10.0F;
   const auto ink = selected ? colors.on_primary_container : colors.on_surface;
   std::vector<View> content{NavigationIcon(symbol, folder_heading ? colors.on_surface_variant : ink)};
   if (folder_heading) content.push_back(NavigationIcon(NavigationSymbol::Folder, colors.on_surface_variant));
-  content.push_back(Text(label).Style({Font::System(13.0F).WithWeight(new_conversation ?
+  content.push_back(Text(label).Style({label_font.WithWeight(new_conversation ?
       FontWeight::SemiBold : folder_heading ? FontWeight::Medium : FontWeight::Regular), ink})
       .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow()));
-  if (!count.empty()) content.push_back(Text(count).Style({Font::System(12.0F), colors.on_surface_variant})
+  if (!count.empty()) content.push_back(Text(count).Style({label_font.WithSize(theme.typography.body_small), colors.on_surface_variant})
       .Key("pending-navigation-count"));
   return Row(std::move(content))
       .OnClick(action).On<ViewEvents::KeyDown>([action](const KeyEvent& event) {
@@ -1712,7 +1885,8 @@ View SessionRow(kit::SessionSummary item, bool selected, bool grouped, std::func
       item.agent.id == agentkit_preview::PptAgent ? NavigationSymbol::Slides :
       item.agent.id == agentkit_preview::DesignAgent ? NavigationSymbol::Design : NavigationSymbol::Chat;
   std::vector<View> label{NavigationIcon(symbol, selected ? ink : theme.on_surface_variant).With(Tooltip(agent)),
-      Row{Text(item.title).Style({Font::System(13.0F), ink}).LineLimit(1).Overflow(TextOverflow::Ellipsis)
+      Row{Text(item.title).Style({Font::FromFamily(spec.typography.family, spec.typography.body_small), ink})
+          .LineLimit(1).Overflow(TextOverflow::Ellipsis)
           .With(Grow()).Key(item.id.value)}.With(Grow())
           .Key(item.pending_interactions ? "pending-session-title/" + item.title : "session-title")};
   if (item.pending_interactions || item.active_run) {
@@ -1813,7 +1987,8 @@ View ConversationGroupRow(ConversationGroup group, std::function<void()> toggle,
   const auto actions_id = "group-actions/" + group.id;
   auto row = Row{
       NavigationIcon(group.collapsed ? NavigationSymbol::Right : NavigationSymbol::Down, colors.on_surface_variant),
-      Text(group.name).Style({Font::System(13.0F).WithWeight(FontWeight::SemiBold), colors.on_surface})
+      Text(group.name).Style({Font::FromFamily(theme.typography.family, theme.typography.body_small)
+          .WithWeight(FontWeight::Medium), colors.on_surface})
           .LineLimit(1).Overflow(TextOverflow::Ellipsis)
           .With(Grow()).Key("group/" + group.id),
   }.OnClick(toggle).On<ViewEvents::KeyDown>([toggle](const KeyEvent& event) {
@@ -2137,8 +2312,12 @@ View PreviewShell() {
   const auto draft_error = current_draft.error;
   std::optional<agentkit_preview::CodeWorkspace> workspace;
   if (workspace_id && ready.Get()) workspace = service->workspaces->Find(*workspace_id);
-  const auto new_agent = assistant.Get() == 2 ? agentkit_preview::CodeAgent : assistant.Get() == 3 ? agentkit_preview::DesignAgent :
-      assistant.Get() == 1 ? agentkit_preview::PptAgent : agentkit_preview::GeneralAgent;
+  const auto preferred_assistant = assistant.Get().value_or(service->navigation->last_assistant);
+  const auto found_assistant = std::ranges::find(draft_assistants, preferred_assistant);
+  const auto assistant_index = found_assistant == draft_assistants.end() ? 0U :
+      static_cast<std::size_t>(found_assistant - draft_assistants.begin());
+  const auto new_agent = draft_assistants[assistant_index];
+  const auto default_profile = service->navigation->auto_review_new_conversations ? agentkit_preview::ReviewProfile : agentkit_preview::AskProfile;
   const bool can_focus_draft = ready.Get() && !selected->conversation && !showing_pending.Get() && !navigation_open.Get();
   Lifecycle([focus_draft, draft_input, draft_focused, can_focus_draft] {
     if (!can_focus_draft || !focus_draft.Get()) return;
@@ -2273,7 +2452,7 @@ View PreviewShell() {
     auto id = target.session;
     select_session(std::move(id), std::move(target));
   };
-  const auto create = [service, tasks, ready, entry = current_draft, new_agent, open_session, selecting, workspace_id] {
+  const auto create = [service, tasks, ready, entry = current_draft, new_agent, default_profile, open_session, selecting, workspace_id] {
     if (!ready.Get() || entry.creating.Get() || entry.text->composition ||
         (entry.text->text.empty() && entry.sources->attachments.empty())) return;
     const auto code = new_agent == agentkit_preview::CodeAgent;
@@ -2286,6 +2465,7 @@ View PreviewShell() {
     }
     const auto draft_start = entry.start.Get();
     auto start = draft_start;
+    if (!start.execution_profile) start.execution_profile = default_profile;
     start.model = service->run_settings->CurrentModel(start.model);
     if (code && !start.model) start.model = service->run_settings->DefaultModel(new_agent);
     entry.creating = true;
@@ -2316,9 +2496,21 @@ View PreviewShell() {
           remaining.attachments.empty() && entry.skills->empty() && !entry.report.Get();
       entry.sources = std::move(remaining);
       if (draft_consumed && entry.assistant.Get() == role && entry.start.Get() == draft_start && entry.group.Get() == group) {
-        entry.assistant = std::size_t{0};
-        entry.start = default_draft_start;
+        entry.assistant = std::nullopt;
+        entry.start = kit::UserRunOptions{};
         entry.group = std::nullopt;
+      }
+      const auto profile = draft_start.execution_profile;
+      const bool remember_profile = profile == agentkit_preview::AskProfile || profile == agentkit_preview::ReviewProfile;
+      const bool auto_review = profile == agentkit_preview::ReviewProfile;
+      const auto navigation = service->navigation.Get();
+      if (!service->navigation_edits.empty() || navigation.last_assistant != agent ||
+          (remember_profile && navigation.auto_review_new_conversations != auto_review)) {
+        EditNavigation(service, [agent, remember_profile, auto_review](NavigationPreferences& preferences) {
+          preferences.last_assistant = agent;
+          if (remember_profile) preferences.auto_review_new_conversations = auto_review;
+          return kit::AgentResult<void>::Success();
+        });
       }
       const auto id = std::get<kit::SessionCreated>(result.Value().outcome).session;
       service->composers.try_emplace(id).first->second.next = start;
@@ -2560,8 +2752,9 @@ View PreviewShell() {
     navigation_open = false;
     error = "";
   };
-  const auto section_label = [colors](StringVariant label) {
-    return Text(std::move(label)).Style({Font::System(12.0F).WithWeight(FontWeight::SemiBold), colors.on_surface_variant})
+  const auto section_font = Font::FromFamily(theme.typography.family, theme.typography.body_small).WithWeight(FontWeight::Medium);
+  const auto section_label = [colors, section_font](StringVariant label) {
+    return Text(std::move(label)).Style({section_font, colors.on_surface_variant})
         .With(Padding(EdgeInsets{.left = 8.0F}));
   };
   const auto active_snapshot = selected->conversation ? selected->conversation->Snapshot() : nullptr;
@@ -2723,7 +2916,7 @@ View PreviewShell() {
                 auto controls = agentkit_preview::RunSettingsControls(service->run_settings, next, summary.agent.id, summary.workspace,
                     folder ? folder->NativeFolder() : std::nullopt,
                     std::move(save_preference), Flow(std::move(actions)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center)),
-                    AddModelAction(service));
+                    AddModelAction(service), true, service->settings->file_access.full_access);
                 if (error.Get().empty()) return controls;
                 return View(Column{std::move(controls), Text(error.Get(), TextRole::Label)}.With(Spacing(4.0F)));
               },
@@ -2743,6 +2936,7 @@ View PreviewShell() {
         if (tool.id == ListWorkspaceFiles) return resources->GetString(::app::strings::ui_activity_list_files);
         if (tool.id == SearchWorkspaceFiles) return resources->GetString(::app::strings::ui_activity_search_files);
         if (const auto label = LocalFileToolLabel(tool.id)) return resources->GetString(*label);
+        if (const auto label = agentkit_preview::HostToolLabel(tool.id)) return resources->GetString(*label);
         if (IsCodePatchTool(tool.id)) return resources->GetString(::app::strings::ui_activity_apply_changes);
         if (tool.id == RunCodeTests || tool.id == RunWorkspaceTests) return resources->GetString(::app::strings::ui_activity_workspace_tests);
         return {};
@@ -2874,7 +3068,7 @@ View PreviewShell() {
     if (!error.Get().empty())
       main = Column{std::move(main).With(Grow()), Text(error.Get(), TextRole::Label).With(Padding(10.0F))}.With(Grow());
   } else {
-    const bool code = assistant.Get() == 2;
+    const bool code = new_agent == agentkit_preview::CodeAgent;
     const auto native_workspace = workspace ? workspace->NativeFolder() : std::nullopt;
     std::string status = draft_error->empty() ? error.Get() : draft_error.Get();
     if (code && status.empty()) {
@@ -2886,21 +3080,24 @@ View PreviewShell() {
     const auto chosen_group = draft_group.Get();
     const auto group = chosen_group ? std::ranges::find(nav.groups, *chosen_group, &ConversationGroup::id) : nav.groups.end();
     const auto workspace_path = native_workspace ? native_workspace->Path() : std::string{};
-    const auto choose_assistant = [assistants, assistant, new_start, new_skills, focus_draft] {
+    const auto choose_assistant = [assistants, assistant, new_agent, new_start, new_skills, focus_draft] {
       std::vector<MenuEntry> choices;
       for (std::size_t index = 0; index < assistants.size(); ++index) {
-        choices.emplace_back(MenuItem(assistants[index], [assistant, new_start, new_skills, focus_draft, index] {
+        const auto agent = draft_assistants[index];
+        choices.emplace_back(MenuItem(assistants[index], [assistant, new_agent, new_start, new_skills, focus_draft, agent] {
           focus_draft = true;
-          if (assistant.Get() == index) return;
-          assistant = index;
-          new_start = default_draft_start;
+          if (new_agent == agent) return;
+          assistant = agent;
+          auto start = new_start.Get();
+          start.model.reset();
+          new_start = std::move(start);
           new_skills = std::vector<kit::SkillRef>{};
-        }).Checked(assistant.Get() == index));
+        }).Checked(new_agent == agent));
       }
       return choices;
     };
     std::vector<View> selectors{
-        DraftChoice(NavigationSymbol::Chat, ::app::strings::ui_assistant, UseString(assistants[assistant.Get()]),
+        DraftChoice(NavigationSymbol::Chat, ::app::strings::ui_assistant, UseString(assistants[assistant_index]),
             {}, "draft-assistant", choose_assistant, ready.Get()),
         DraftChoice(NavigationSymbol::Folder, ::app::strings::ui_workspace, workspace ? folder_name(*workspace) :
             UseString(workspace_id ? ::app::strings::ui_workspace_unavailable : ::app::strings::ui_no_workspace),
@@ -2958,22 +3155,24 @@ View PreviewShell() {
         else draft_action = std::move(*picker);
       }
       controls = agentkit_preview::RunSettingsControls(service->run_settings, new_start, new_agent, workspace_id,
-          native_workspace, {}, std::move(draft_action), AddModelAction(service));
+          native_workspace, {}, std::move(draft_action), AddModelAction(service), true, service->settings->file_access.full_access,
+          default_profile);
     }
     const auto send_available = [ready, draft, new_sources, code, service, native_workspace] {
       const bool code_ready = service->code_available.Get() && (local_file_tools_available || native_workspace.has_value());
       return ready.Get() && !draft->composition && (!draft->text.empty() || !new_sources->attachments.empty()) &&
           (!code || code_ready);
     };
-    const auto placeholder = code ? ::app::strings::ui_describe_the_change : assistant.Get() == 1 ?
-        ::app::strings::ui_describe_your_presentation : assistant.Get() == 3 ?
+    const auto placeholder = code ? ::app::strings::ui_describe_the_change : new_agent == agentkit_preview::PptAgent ?
+        ::app::strings::ui_describe_your_presentation : new_agent == agentkit_preview::DesignAgent ?
         ::app::strings::ui_describe_the_screen_or_interaction : ::app::strings::ui_send_a_message;
     std::vector<View> context{
         Flow(std::move(selectors)).With(Spacing(7.0F), CrossAlign(CrossAxisAlignment::Center)),
     };
     std::vector<View> start_page{
         Text(::app::strings::ui_new_conversation, TextRole::Title)
-            .Style({Font::System(compact ? 26.0F : 31.0F).WithWeight(FontWeight::SemiBold), colors.on_surface})
+            .Style({Font::FromFamily(theme.typography.family, compact ? 24.0F : 28.0F)
+                .WithWeight(FontWeight::SemiBold), colors.on_surface})
             .Key("new-conversation-heading"),
         Column(std::move(context)).With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch)).Key("draft-choices"),
     };

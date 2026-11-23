@@ -18,6 +18,7 @@
 #include "../examples/preview/src/git_process.h"
 #include "../examples/preview/src/general_workflow.h"
 #include "../examples/preview/src/link_navigation.h"
+#include "../examples/preview/src/local_files.h"
 #include "../examples/preview/src/markdown_images.h"
 #include "../examples/preview/src/preview_json.h"
 #include "../examples/preview/src/presentation.h"
@@ -184,6 +185,10 @@ UiNodeQuery PendingConversation(UiTest& ui, std::string title) {
   return ui.Find(UiSelector::Key("pending-session-title/" + title));
 }
 
+void ExpandLatestWorkGroup(UiTest& preview);
+
+void TapControl(UiTest& preview, UiSelector selector, const char* label, const char* scroll_key, float scroll_step);
+
 constexpr auto ReportChartFilename = "\xe5\x9b\xa2\xe9\x98\x9f\xe6\x9e\x84\xe6\x88\x90.csv";
 
 void VerifyReportChart(const File& root) {
@@ -233,8 +238,12 @@ void VerifyReportChart(const File& root) {
       throw std::runtime_error("Restored chart reopened the submitted form or wrote before approval");
     preview.Find(ButtonText("Approve")).Tap();
     Wait(preview, [&] {
-      return output.Exists() && !preview.Find(UiSelector::Key("agent-chat-stop")).Exists() && ShowsText(preview, "Saved " + output.Path());
+      return output.Exists() && !preview.Find(UiSelector::Key("agent-chat-stop")).Exists();
     }, "Approved chart export did not finish");
+    ExpandLatestWorkGroup(preview);
+    TapControl(preview, UiSelector::Text("preview.report.chart.export \xc2\xb7 Completed"),
+        "The chart export result could not be expanded", "agent-chat-history", -96.0F);
+    Wait(preview, [&] { return ShowsText(preview, "Saved " + output.Path()); }, "The approved chart export receipt was not visible");
     const auto bytes = output.ReadBytes();
     if (!bytes.Succeeded()) throw std::runtime_error(bytes.Error().message);
     const std::string_view csv(reinterpret_cast<const char*>(bytes.Value().data()), bytes.Value().size());
@@ -315,7 +324,36 @@ void SelectHistoryText(UiTest& preview, const UiNodeQuery& message, TextRange ra
   for (auto count = scalar_count(range); count > 0; --count) preview.PressKey(Key::ArrowRight, {.shift = true});
 }
 
-void CheckCTestDisclosure(UiTest& preview, std::string_view message) {
+void ExpandLatestWorkGroup(UiTest& preview) {
+  const auto group = [](const SemanticNode& entry) {
+    if (entry.offscreen || entry.expanded != false) return false;
+    const auto label = std::string_view(entry.label).substr(0, entry.label.find(" \xc2\xb7 "));
+    return label == "1 operation" || (label.ends_with(" operations") && !label.empty() && label.front() >= '0' && label.front() <= '9');
+  };
+  Wait(preview, [&] {
+    const auto buttons = preview.FindSemantics(UiSemanticSelector::Role(SemanticRole::Button)).All();
+    const auto latest = std::find_if(buttons.rbegin(), buttons.rend(), group);
+    if (latest == buttons.rend()) return false;
+    ClickPreviewMouse(preview, latest->bounds);
+    return true;
+  }, "The latest work group was not visible");
+}
+
+UiSelector RevealChatTool(UiTest& ui, const kit::SessionSnapshot& state, const kit::ToolCallId& id) {
+  const auto step = UiSelector::Key("chat-tool-toggle/" + id.value);
+  if (!ui.Find(step).Exists()) {
+    for (const auto& tool : state.tools) {
+      const auto group = UiSelector::Key("chat-work-toggle/" + tool.id.value);
+      if (!ui.Find(group).Exists()) continue;
+      TapControl(ui, group, "The work group could not be expanded", "agent-chat-history", -96.0F);
+      ui.Pump(16ms);
+      if (ui.Find(step).Exists()) break;
+    }
+  }
+  return step;
+}
+
+void CheckCTestDisclosure(UiTest& preview, std::string_view message, std::string_view reason = {}) {
   auto output = preview.Find(UiSelector::Key("ctest-output"));
   if (output.Exists()) throw std::runtime_error("CTest output expanded before it was requested");
   const auto label = ShowsText(preview, "Run workspace tests · Completed") ?
@@ -326,7 +364,8 @@ void CheckCTestDisclosure(UiTest& preview, std::string_view message) {
   };
   toggle();
   Wait(preview, [&] {
-    return output.Exists() && std::ranges::any_of(output.Find(UiSelector::Type<Text>()).All(), [&](const auto& entry) {
+    return output.Exists() && (reason.empty() || ShowsText(preview, std::string(reason))) &&
+        std::ranges::any_of(output.Find(UiSelector::Type<Text>()).All(), [&](const auto& entry) {
       return entry.text && entry.text->find(message) != std::string::npos && entry.text->find('\x1b') == std::string::npos &&
           entry.text->find("[HANDLER_OUTPUT]") == std::string::npos && entry.text->find("[ERROR_MESSAGE]") == std::string::npos;
     });
@@ -337,6 +376,21 @@ void CheckCTestDisclosure(UiTest& preview, std::string_view message) {
 
 void TapReviewCard(UiTest& preview, const char* label) {
   TapControl(preview, ReviewCard(label), label);
+}
+
+void ApproveConversationChange(UiTest& preview) {
+  const auto approve = preview.FindSemantics(UiSemanticSelector::AllOf(
+      UiSemanticSelector::Role(SemanticRole::Button), UiSemanticSelector::Label("Approve")));
+  Wait(preview, [&] { return approve.Count() == 1 && approve.One().enabled; }, "The change was not ready to approve");
+  approve.PerformSemanticAction({SemanticActionKind::Activate, {}});
+}
+
+void OpenApprovalArtifact(UiTest& preview, const kit::ArtifactRef& ref) {
+  const auto key = "artifact-review/" + ref.id.value + "/" + std::to_string(ref.version);
+  auto attachment = preview.FindSemantics(UiSemanticSelector::Identifier(key));
+  Wait(preview, [&] { return attachment.Count() == 1 && attachment.One().enabled; },
+      "The approval did not offer the exact attachment");
+  attachment.PerformSemanticAction({SemanticActionKind::Activate, {}});
 }
 
 void ChooseDraftAssistant(UiTest& preview, const char* label) {
@@ -416,14 +470,10 @@ void DraftPresentationOutline(UiTest& preview) {
   prompt.ReplaceText("Product rollout");
   Wait(preview, [&] { return preview.Find(ButtonText("Send")).One().enabled; }, "PPT conversation is not ready");
   preview.Find(ButtonText("Send")).Tap();
-  auto audience = preview.Find(UiSelector::Key("ppt-audience"));
-  Wait(preview, [&] { return audience.Exists(); }, "PPT brief was not requested");
-  audience.Tap();
-  audience.ReplaceText("Operations leads");
-  TapFormButton(preview, "Draft outline");
-
   auto title = preview.Find(UiSelector::Key("slide-title-0"));
-  Wait(preview, [&] { return title.Exists(); }, "Editable model outline was not shown");
+  Wait(preview, [&] { return title.Exists() || preview.Find(UiSelector::Key("ppt-audience")).Exists(); },
+      "Editable model outline was not shown");
+  if (!title.Exists()) throw std::runtime_error("The ordinary presentation was blocked by a brief");
 }
 
 void PreparePresentation(const Application& application, const File& output) {
@@ -461,17 +511,31 @@ void PreparePresentation(const Application& application, const File& output) {
   auto first_preview = preview.Find(UiSelector::Text("Approved rollout"));
   const auto stage = preview.Find(UiSelector::Key("presentation-slide"));
   const auto export_footer = preview.Find(UiSelector::Key("presentation-form-actions"));
-  Wait(preview, [&] { return first_preview.Exists() && stage.Exists() && export_footer.Exists() &&
-      stage.One().bounds.y + stage.One().bounds.height <= export_footer.One().bounds.y &&
-      stage.One().visible_bounds.height >= stage.One().bounds.height - 1.0F; },
-      "The first slide was clipped or overlapped by the export controls");
+  const auto full_slide_visible = [&] {
+    if (!stage.Exists() || !export_footer.Exists()) return false;
+    const auto picture = stage.One();
+    const auto& bounds = picture.bounds;
+    return std::abs(bounds.width * 9.0F / 16.0F - bounds.height) <= 1.0F &&
+        bounds.y + bounds.height <= export_footer.One().bounds.y && picture.visible_bounds.height >= bounds.height - 1.0F;
+  };
+  Wait(preview, [&] { return first_preview.Exists() && full_slide_visible() && stage.One().bounds.height >= 250.0F; },
+      "The export preview did not fit a full widescreen slide above its controls");
   const auto page_picker = preview.Find(UiSelector::Key("presentation-slide-picker"));
   page_picker.Tap();
   const auto second_preview = preview.Find(UiSelector::Text("2. Validated operations"));
   Wait(preview, [&] { return second_preview.Exists() && second_preview.One().in_viewport; }, "The preview did not offer the slide by title");
   second_preview.Tap();
-  Wait(preview, [&] { return preview.Find(UiSelector::Text("Validated operations")).Exists(); },
-       "Staged presentation did not preview the edited second slide");
+  Wait(preview, [&] { return preview.Find(UiSelector::Text("Validated operations")).Exists() &&
+      preview.Find(UiSelector::Key("presentation-diagram")).Exists(); },
+      "Staged presentation did not preserve the edited slide and its diagram");
+  const auto wide_stage = stage.One().bounds;
+  preview.SetWindowMetrics({.viewport = {520.0F, 800.0F}});
+  Wait(preview, [&] { return full_slide_visible() && stage.One().bounds.height < wide_stage.height &&
+      preview.Find(UiSelector::Key("presentation-point/1")).One().in_viewport; },
+      "The narrower preview clipped its slide or changed the aspect ratio");
+  preview.SetWindowMetrics({.viewport = {1080.0F, 880.0F}});
+  Wait(preview, [&] { return full_slide_visible() && stage.One().bounds.height >= wide_stage.height - 1.0F; },
+      "The preview did not restore its wide stage before export");
   TapFormButton(preview, "Review export");
   Wait(preview, [&] { return preview.Find(UiSelector::Text("Export PowerPoint")).Exists(); }, "Missing export approval");
   if (output.Exists()) throw std::runtime_error("Preview exported a PPTX before user approval");
@@ -1244,6 +1308,56 @@ Task<kit::InteractionSnapshot> LiveWorkspacePatch(const std::shared_ptr<kit::Con
   co_return patch;
 }
 
+Task<void> RunConfiguredPresentation(const std::shared_ptr<kit::AgentRuntime>& runtime, const kit::ProjectId& project,
+                                     const kit::WorkspaceId& workspace, const File& data) {
+  using namespace agentkit_preview;
+  using kit::JsonValue;
+  const auto chat = co_await LiveConversation(runtime, project, workspace, PptAgent, "Live open source presentation",
+      "\xe5\x81\x9a\xe4\xb8\x80\xe4\xb8\xaa\xe5\xae\xa3\xe4\xbc\xa0\xe5\xbc\x80\xe6\xba\x90\xe7\xb2\xbe\xe7\xa5\x9e\xe7\x9a\x84ppt");
+  auto watching = co_await LiveObserve(chat);
+  const auto edit = co_await LiveInteraction(chat, "Review and edit outline", {}, 140s);
+  const auto outline = LiveTake(ReadPresentationOutline(LiveForm(edit).at("outline")));
+  std::map<SlideLayout, std::size_t> layouts;
+  for (const auto& slide : outline.slides) ++layouts[slide.layout.value_or(SlideLayout::List)];
+  if (layouts[SlideLayout::Image] < 2 || !layouts[SlideLayout::Chart] || !layouts[SlideLayout::Flow] ||
+      !layouts[SlideLayout::Relationship] || !layouts[SlideLayout::Editorial])
+    throw std::runtime_error("The live model did not choose illustrations, a sourced chart, editable diagrams and an editorial slide");
+  std::cout << "Live outline: " << outline.slides.size() << " slides, " << layouts[SlideLayout::Image]
+            << " illustrations, " << layouts[SlideLayout::Chart] << " native charts, "
+            << layouts[SlideLayout::Flow] + layouts[SlideLayout::Relationship] << " diagrams" << std::endl;
+  LiveTake(co_await chat->SubmitAsync(kit::NewCommandId(), {edit.id, edit.version, WritePresentationOutline(outline)}));
+  const auto preview = co_await LiveInteraction(chat, "Preview slides and choose a file name", {}, 10min);
+  const auto rendered = LiveTake(ReadPresentationOutline(LiveForm(preview).at("outline")));
+  if (rendered.title != outline.title || rendered.slides.size() != outline.slides.size())
+    throw std::runtime_error("Staged preview changed the approved slide list");
+  for (std::size_t i = 0; i < outline.slides.size(); ++i) {
+    const auto& approved = outline.slides[i];
+    const auto& staged = rendered.slides[i];
+    if (approved.title != staged.title || approved.bullets != staged.bullets || approved.layout != staged.layout)
+      throw std::runtime_error("Staged preview changed the approved content or layout");
+    if (staged.layout == SlideLayout::Image && (!staged.media || !staged.media->starts_with("embedded")))
+      throw std::runtime_error("The staged preview did not bind the generated illustration");
+    if (staged.layout == SlideLayout::Chart && !ChartFor(rendered, staged))
+      throw std::runtime_error("The chart lost its source data in preview");
+  }
+  const std::string filename = "OpenSource.pptx";
+  JsonValue destination{JsonValue::Object{{"file_name", JsonValue{filename}}}};
+  LiveTake(co_await chat->SubmitAsync(kit::NewCommandId(), {preview.id, preview.version, std::move(destination)}));
+  const auto approval = co_await LiveInteraction(chat, "Export PowerPoint");
+  const auto output = data.Child("exports").Child(filename);
+  if (output.Exists()) throw std::runtime_error("The PowerPoint was exported before approval");
+  co_await LiveApprove(chat, approval);
+  co_await LiveRunCompleted(chat);
+  if (!output.Exists()) throw std::runtime_error("The approved live presentation did not export");
+  const auto snapshot = chat->Snapshot();
+  if (snapshot->runs.back().model == DemoModel) throw std::runtime_error("The live presentation used the demo model");
+  if (snapshot->artifacts.empty() ||
+      LiveTake(co_await ReadPresentationBytes(runtime, snapshot->artifacts.back())) != output.ReadBytes().Value())
+    throw std::runtime_error("The exported PowerPoint differs from the approved staged package");
+  std::cout << "Approved staged PowerPoint and exported bytes match" << '\n';
+  LiveTake(co_await runtime->CloseAsync());
+}
+
 Task<void> RunConfiguredPreview(std::shared_ptr<kit::AgentRuntime> runtime, kit::WorkspaceId workspace,
     kit::ProjectId project, File data, std::string phase) {
   using kit::JsonValue;
@@ -1283,13 +1397,9 @@ Task<void> RunConfiguredPreview(std::shared_ptr<kit::AgentRuntime> runtime, kit:
     CheckText(tested, "verified");
 
     const auto ppt = co_await LiveConversation(runtime, project, workspace, agentkit_preview::PptAgent, ppt_title,
-        "Create exactly two slides for a fictional workspace settings release. Summarize the two edited files and the passing validation.");
+        "Create exactly two slides for engineering leads about a fictional workspace settings release. "
+        "Use a direct technical style. config.txt enables sample mode. settings.html shows Enabled. CTest passed.");
     auto watching_ppt = co_await LiveObserve(ppt);
-    auto brief = co_await LiveInteraction(ppt, "Presentation brief");
-    JsonValue answers{JsonValue::Object{{"audience", JsonValue{std::string("Engineering leads")}},
-        {"style", JsonValue{std::string("Direct technical summary")}}, {"length", JsonValue{std::string("Exactly 2 slides")}},
-        {"reference_notes", JsonValue{std::string("config.txt enables sample mode. settings.html shows Enabled. CTest passed.")}}}};
-    LiveTake(co_await ppt->SubmitAsync(kit::NewCommandId(), {brief.id, brief.version, std::move(answers)}));
     auto edit = co_await LiveInteraction(ppt, "Review and edit outline");
     auto edited = LiveTake(agentkit_preview::ReadPresentationOutline(LiveForm(edit).at("outline")));
     if (edited.slides.size() != 2 || edited.slides[0].bullets.empty() || edited.slides[1].bullets.empty())
@@ -1790,7 +1900,7 @@ void VerifyConversationNavigation(const File& root) {
     StartProjectDraft(ui, workspace);
     ChooseDraftAssistant(ui, "PPT");
     SendNewConversation(ui, deck);
-    Wait(ui, [&] { return ui.Find(ButtonText("Draft outline")).Exists(); }, "The slide conversation did not request its brief");
+    Wait(ui, [&] { return ui.Find(ButtonText("Confirm outline")).Exists(); }, "The slide conversation did not produce a draft");
     inspect(ui, [&]() -> Task<void> {
       const auto pending = LiveTake(co_await runtime->Interactions().ListPendingAsync({}, {}));
       for (const auto& item : pending.items) {
@@ -1835,9 +1945,9 @@ void VerifyConversationNavigation(const File& root) {
     Wait(ui, [&] { return deck_entry.Exists() && deck_entry.One().in_viewport && !design_entry.Exists(); },
         "The pending view kept a completed request");
     deck_entry.Tap({.device_kind = PointerDeviceKind::Mouse});
-    auto brief = ui.Find(ButtonText("Draft outline"));
-    const auto brief_scroll = ui.Find(UiSelector::Key("ppt-form-scroll"));
-    Wait(ui, [&] { return brief.Exists() && brief_scroll.Exists() && brief_scroll.One().in_viewport &&
+    auto outline = ui.Find(ButtonText("Confirm outline"));
+    const auto outline_scroll = ui.Find(UiSelector::Key("ppt-form-scroll"));
+    Wait(ui, [&] { return outline.Exists() && outline_scroll.Exists() && outline_scroll.One().in_viewport &&
         !ui.Find(ButtonText("Review design")).Exists(); },
         "The pending item opened a different form");
 
@@ -1984,7 +2094,7 @@ void VerifyConversationNavigation(const File& root) {
     try {
       reopened.PumpAndSettle();
       remaining.Tap();
-      const auto submit = reopened.Find(ButtonText("Draft outline"));
+      const auto submit = reopened.Find(ButtonText("Confirm outline"));
       Wait(reopened, [&] { return submit.Count() == 1 && submit.One().in_viewport && submit.One().enabled; },
           "The narrow window did not open the remaining request");
     } catch (...) {
@@ -2255,11 +2365,6 @@ void PrepareCodeChange(UiTest& preview, std::string title) {
 Task<kit::InteractionSnapshot> StageReviewPresentation(const std::shared_ptr<kit::Conversation>& chat, std::string filename,
     std::string verification = "Share verification evidence") {
   using kit::JsonValue;
-  auto brief = co_await LiveInteraction(chat, "Presentation brief");
-  JsonValue answers{JsonValue::Object{{"audience", JsonValue{std::string("The project team")}},
-      {"style", JsonValue{std::string("Concise")}}, {"length", JsonValue{std::string("3 slides")}},
-      {"reference_notes", JsonValue{std::string("Set up a versioned document for review")}}}};
-  LiveTake(co_await chat->SubmitAsync(kit::NewCommandId(), {brief.id, brief.version, std::move(answers)}));
   auto edit = co_await LiveInteraction(chat, "Review and edit outline");
   auto outline = LiveTake(agentkit_preview::ReadPresentationOutline(LiveForm(edit).at("outline")));
   outline.slides = {{"First draft", {"Scope and ownership"}}, {"Reviewed decisions", {"Confirm the implementation"}},
@@ -3502,7 +3607,8 @@ std::vector<kit::ModelRegistration> SettingsModels(std::shared_ptr<std::vector<S
   std::vector<kit::ModelRegistration> models;
   for (const auto* label : {"A", "B", "C"}) {
     models.push_back({{{std::string("test.settings.") + label}, 1}, {"test", std::string("Model ") + label, "script", {}},
-        std::make_shared<SettingsPatchModel>(label, calls)});
+        std::make_shared<SettingsPatchModel>(label, calls), false, false,
+        {.context_window = 16384, .max_output_tokens = 1024}});
   }
   return models;
 }
@@ -3619,6 +3725,27 @@ void VerifyPreviewRunSettings(const File& root) {
   scope();
   Wait(preview, [&] { return !preview.Find(UiSelector::Key("agent-chat-stop")).Exists(); }, "Queued Full Access did not settle", 25s);
   CheckText(config, "mode=C\n");
+  const auto context_ring = preview.Find(UiSelector::Key("composer-context"));
+  const auto context_info = preview.FindSemantics(UiSemanticSelector::Role(SemanticRole::ProgressIndicator));
+  Wait(preview, [&] { return context_ring.Exists() && context_info.Count() == 1 && !context_info.One().value.empty(); },
+      "The composer did not report the latest model request's context");
+  const auto context_details = context_info.One().value;
+  if (context_details.find("estimated input tokens") == std::string::npos || ShowsText(preview, context_details))
+    throw std::runtime_error("The context indicator did not distinguish an estimate or exposed its tooltip early");
+  const auto hover_context = [&](Rect bounds) {
+    preview.SendPointer({.type = PointerEventType::Move, .pointer_id = 1,
+        .position = {bounds.x + bounds.width / 2, bounds.y + bounds.height / 2}, .device_kind = PointerDeviceKind::Mouse});
+  };
+  hover_context(context_ring.One().visible_bounds);
+  preview.Pump(700ms);
+  Wait(preview, [&] { return ShowsText(preview, context_details); }, "Hovering on the context indicator did not show its details");
+  hover_context(preview.Find(UiSelector::Key("agent-chat-heading")).One().visible_bounds);
+  preview.Pump(300ms);
+  Wait(preview, [&] { return !ShowsText(preview, context_details); }, "Context tooltip remained after hover ended");
+  choose("run-model", "Model B");
+  Wait(preview, [&] { return !context_ring.Exists(); }, "The previous model's context appeared for a newly selected model");
+  choose("run-model", "Model C");
+  Wait(preview, [&] { return context_ring.Exists(); }, "Returning to the measured model did not restore the indicator");
   if (calls->size() != 3 || calls->back().model != models[2].ref || !calls->back().has_quote ||
       preview.Find(ButtonText("Approve")).Exists()) throw std::runtime_error("Full Access did not apply to the queued model run");
 
@@ -3644,6 +3771,7 @@ void VerifyPreviewRunSettings(const File& root) {
   FocusPreviewEditor(preview, composer, "Current conversation draft did not receive focus");
   composer.ReplaceText("Draft preserved by session");
   preview.Find(UiSelector::Key("new-conversation")).Tap();
+  ChooseDraftAssistant(preview, "General");
   choose("run-model", "Local demo model");
   choose("run-permissions", "Auto Review");
   SendNewConversation(preview, "Pie chart:\n"
@@ -3742,6 +3870,11 @@ void VerifyRunSettingsReload(const File& root) {
       root.Child("project"), SettingsModels(calls), loaded)}}};
   UiTest preview(application, {.viewport = {1100.0F, 940.0F},
       .resource_provider = std::make_shared<PreviewTestResources>()});
+  const auto remembered = preview.Find(UiSelector::Key("draft-assistant")).Find(UiSelector::Text("Code"));
+  const auto default_permissions = preview.FindSemantics(UiSemanticSelector::AllOf(
+      UiSemanticSelector::Role(SemanticRole::Button), UiSemanticSelector::Label("Permissions")));
+  Wait(preview, [&] { return remembered.Exists() && default_permissions.Exists() && default_permissions.One().value == "Auto Review"; },
+      "New conversations did not retain the last assistant and approval choice after restart");
   auto conversation = preview.Find(UiSelector::Text("Configuration timing"));
   Wait(preview, [&] { return conversation.Exists(); }, "The persisted code conversation was not available");
   conversation.Tap();
@@ -4090,7 +4223,7 @@ void VerifyWorktreeCopy(const File& root, bool discard = false) {
 void PrepareReleaseTarget(UiTest& preview) {
   ChooseDraftAssistant(preview, "PPT");
   SendNewConversation(preview, "Workspace release slides");
-  Wait(preview, [&] { return preview.Find(UiSelector::Key("ppt-audience")).Exists(); }, "Missing initial PPT form");
+  Wait(preview, [&] { return preview.Find(UiSelector::Key("slide-title-0")).Exists(); }, "Missing initial PPT outline");
   preview.Find(UiSelector::Key("agent-chat-stop")).Tap();
   Wait(preview, [&] { return preview.Find(UiSelector::Text("Workspace release slides")).Exists() &&
       !preview.Find(UiSelector::Key("agent-chat-stop")).Exists(); }, "The existing PPT target is still busy");
@@ -4126,6 +4259,7 @@ void StartWorkspaceRelease(const Application& application, const File& config, c
   UiTest preview(application, {.viewport = {1080.0F, 920.0F}, .resource_provider = std::make_shared<PreviewTestResources>()});
   PrepareReleaseTarget(preview);
   StartProjectDraft(preview, *config.Parent());
+  ChooseDraftAssistant(preview, "General");
   SendNewConversation(preview, std::move(objective));
   auto goal = preview.Find(ButtonText("Goal"));
   Wait(preview, [&] { return goal.Exists(); }, "Release conversation did not open");
@@ -4174,7 +4308,8 @@ void StartWorkspaceRelease(const Application& application, const File& config, c
   CheckText(settings, SettingsPage(true));
 }
 
-void RejectIncompleteVerification(const Application& application, const File& tested, const char* title, bool tests_passed) {
+void RejectIncompleteVerification(const Application& application, const File& tested, const char* title, bool tests_passed,
+    const std::shared_ptr<kit::AgentRuntime>& runtime, const std::optional<TaskScope>& tasks) {
   UiTest preview(application, {.viewport = {1080.0F, 920.0F}});
   auto verification = PendingConversation(preview, "Verify Release implementation");
   Wait(preview, [&] { return verification.Exists(); }, "Missing verification for the failing release");
@@ -4188,7 +4323,25 @@ void RejectIncompleteVerification(const Application& application, const File& te
     Wait(preview, [&] { return ShowsText(preview, "The workspace tests did not produce the required implementation screenshot"); },
         "The verification did not report the missing screenshot");
   }
-  CheckCTestDisclosure(preview, tests_passed ? "100% tests passed" : "Intentional workspace verification failure");
+  Wait(preview, [&] { return runtime && tasks; }, "The verification runtime was not available");
+  std::shared_ptr<const kit::SessionSnapshot> snapshot;
+  tasks->Launch([&]() -> Task<void> {
+    const auto list = LiveTake(co_await runtime->Sessions().ListAsync({}, {}));
+    const auto entry = std::ranges::find(list.sessions, "Verify Release implementation", &kit::SessionSummary::title);
+    if (entry == list.sessions.end()) co_return;
+    const auto conversation = LiveTake(co_await runtime->Sessions().OpenAsync(entry->id));
+    snapshot = conversation->Snapshot();
+  });
+  Wait(preview, [&] { return bool(snapshot); }, "The verification conversation could not be inspected");
+  const auto test = std::ranges::find_if(snapshot->tools, [](const auto& tool) { return tool.tool.id == agentkit_preview::RunCodeTests; });
+  if (test == snapshot->tools.end()) throw std::runtime_error("The verification did not record a CTest call");
+  try {
+    static_cast<void>(RevealChatTool(preview, *snapshot, test->id));
+    CheckCTestDisclosure(preview, tests_passed ? "100% tests passed" : "Intentional workspace verification failure");
+  } catch (...) {
+    static_cast<void>(tested.Parent()->Child("verification-log.snapshot").WriteString(preview.CaptureSnapshot().ToString()));
+    throw;
+  }
   auto general = ConversationRow(preview, title);
   Wait(preview, [&] { return general.Exists(); }, "The failing release conversation disappeared");
   general.Tap();
@@ -4716,7 +4869,6 @@ void VerifyForkReview(const File& directory, PublicationInterruption scenario = 
     FocusPreviewEditor(ui, composer, "The presentation comparison draft did not receive focus");
     composer.ReplaceText(deck_title);
     TapFormButton(ui, "Send");
-    TapFormButton(ui, "Draft outline");
     fill("slide-title-0", "Original rollout");
     TapFormButton(ui, "Confirm outline");
     auto name = ui.Find(UiSelector::Key("ppt-file_name"));
@@ -5441,11 +5593,14 @@ void VerifyDesignRevert(const File& directory) {
     return snapshot;
   };
   const auto send = [](UiTest& ui, std::string text) {
-    auto composer = ui.Find(UiSelector::Key("composer"));
-    if (!composer.Exists()) composer = ui.Find(UiSelector::Type<TextField>());
-    composer.Tap();
-    composer.ReplaceText(std::move(text));
-    TapFormButton(ui, "Send");
+    const auto composer = ui.Find(UiSelector::Key("composer"));
+    if (composer.Exists()) {
+      FocusPreviewEditor(ui, composer, "Design conversation editor did not acquire input focus");
+      composer.ReplaceText(std::move(text));
+      TapFormButton(ui, "Send");
+    } else {
+      SendNewConversation(ui, std::move(text));
+    }
     Wait(ui, [&] { return ui.Find(ButtonText("Review design")).Exists(); }, "The design draft did not reach review");
   };
   const auto approve_design = [](UiTest& ui) {
@@ -5593,7 +5748,7 @@ void VerifyDesignRevert(const File& directory) {
       throw std::runtime_error("The original publication could not recover its exact previous version");
     TapControl(ui, ButtonText("Restore previous version"), "Restore previous version", "design-review-scroll");
     Wait(ui, [&] { return ui.Find(UiSelector::Text("Review design restore")).Exists(); }, "Restore confirmation did not open");
-    TapReviewCard(ui, "Review attachment 2");
+    OpenApprovalArtifact(ui, previous);
     Wait(ui, [&] { return ShowsText(ui, "Compact preferences") && ui.Find(UiSelector::Text("Version 2")).Exists(); },
         "The restore approval did not show the exact previous design");
     TapFormButton(ui, "Back to conversation");
@@ -5615,7 +5770,7 @@ void VerifyDesignRevert(const File& directory) {
         std::get<kit::ToolApproval>(pending.body).plan != std::get<kit::ToolApproval>(approval.body).plan) {
       throw std::runtime_error("Restart changed the approved design restore identity");
     }
-    TapFormButton(ui, "Approve");
+    ApproveConversationChange(ui);
     const auto restored = open_snapshot(ui, [](const auto& state) { return !state.summary.active_run && state.artifacts.size() == 4; });
     const auto applied = call_for(*restored, 4);
     const auto ref = applied.artifacts.front();
@@ -5728,9 +5883,17 @@ void VerifyCodeRevert(const File& directory, CodeRevertCase scenario = CodeRever
     config_applied = *call.effects.front().after;
     open_artifact(preview);
     prepare(preview);
-    TapReviewCard(preview, "Review attachment 1");
+    const auto pending = snapshot(preview);
+    const auto& reverse = std::get<kit::ToolApproval>(pending->interactions.back().body);
+    if (reverse.preview.artifacts.size() != 2) throw std::runtime_error("The reverse approval did not include both per-file diffs");
+    OpenApprovalArtifact(preview, reverse.preview.artifacts.front());
     auto diff = preview.Find(UiSelector::Key("artifact-text"));
-    Wait(preview, [&] { return diff.Exists() && !ReviewedDiff(preview).empty(); }, "The reverse diff did not open");
+    try {
+      Wait(preview, [&] { return diff.Exists() && !ReviewedDiff(preview).empty(); }, "The reverse diff did not open");
+    } catch (...) {
+      static_cast<void>(directory.Child("reverse-diff.snapshot").WriteString(preview.CaptureSnapshot().ToString()));
+      throw;
+    }
     if (ReviewedDiff(preview).find("-mode=enabled\n+mode=disabled") == std::string::npos)
       throw std::runtime_error("The reverse diff did not show the original code");
     TapFormButton(preview, "Back to conversation");
@@ -5740,12 +5903,16 @@ void VerifyCodeRevert(const File& directory, CodeRevertCase scenario = CodeRever
       interrupt->call = std::get<kit::ToolApproval>(pending->interactions.back().body).call;
       concurrent_code_edit.store(std::make_shared<const ConcurrentCodeEdit>(ConcurrentCodeEdit{
           interrupt->call, settings, concurrent_edit}));
-      TapFormButton(preview, "Approve");
+      ApproveConversationChange(preview);
       if (scenario == CodeRevertCase::InterruptedPartial) {
         Wait(preview, [&] { return interrupt->happened; }, "The reverse result commit was not interrupted after the file write");
       } else {
-        Wait(preview, [&] { return ShowsText(preview, "Applied: config.txt\nSkipped: settings.html") &&
-                                   !preview.Find(UiSelector::Key("agent-chat-stop")).Exists(); }, "A partial reverse patch did not report both file results");
+        Wait(preview, [&] { return !preview.Find(UiSelector::Key("agent-chat-stop")).Exists(); }, "The partial reverse patch did not settle");
+        const auto finished = snapshot(preview);
+        TapControl(preview, RevealChatTool(preview, *finished, interrupt->call),
+            "The partial reverse result could not be expanded", "agent-chat-history", -96.0F);
+        Wait(preview, [&] { return ShowsText(preview, "Applied: config.txt\nSkipped: settings.html"); },
+            "A partial reverse patch did not report both file results");
       }
       if (restore.Child(interrupt->call.value + ".revert-1.issued").Exists())
         throw std::runtime_error("The reverse patch attempted replacement after the user edit");
@@ -5753,7 +5920,7 @@ void VerifyCodeRevert(const File& directory, CodeRevertCase scenario = CodeRever
       CheckText(settings, concurrent_edit);
     } else {
       WriteFixture(settings, "User edited after restore review\n");
-      TapFormButton(preview, "Approve");
+      ApproveConversationChange(preview);
       Wait(preview, [&] { return !preview.Find(UiSelector::Key("agent-chat-stop")).Exists(); }, "A stale restore did not settle");
       if (snapshot(preview)->tools.back().state != kit::ToolCallState::Conflict)
         throw std::runtime_error("The reverse patch did not record the version conflict");
@@ -5850,7 +6017,7 @@ void VerifyCodeRevert(const File& directory, CodeRevertCase scenario = CodeRever
     if (pending.id != restore_approval.id || pending.version != restore_approval.version ||
         std::get<kit::ToolApproval>(pending.body).plan != std::get<kit::ToolApproval>(restore_approval.body).plan)
       throw std::runtime_error("Restart changed the approved restore identity");
-    TapFormButton(preview, "Approve");
+    ApproveConversationChange(preview);
     Wait(preview, [&] { return !preview.Find(UiSelector::Key("agent-chat-stop")).Exists(); }, "The approved reverse patch did not settle");
     CheckText(config, "mode=disabled\n");
     CheckText(settings, SettingsPage(true));
@@ -6180,6 +6347,13 @@ void VerifyCodeFailure(const File& directory, CodeFailureCase scenario) {
     return result;
   };
   kit::ToolCallId call;
+  const auto check_partial = [&](UiTest& ui, const kit::SessionSnapshot& state) {
+    TapControl(ui, RevealChatTool(ui, state, call), "The tool result could not be expanded", "agent-chat-history", -96.0F);
+    Wait(ui, [&] {
+      return ui.Find(UiSelector::Key(config.Path())).Find(UiSelector::Text("Applied")).Exists() &&
+          ui.Find(UiSelector::Key(settings.Path())).Find(UiSelector::Text("Skipped")).Exists();
+    }, "The patch did not show the applied and skipped files");
+  };
   {
     UiTest preview(application, options);
     if (retry_before_patch) {
@@ -6220,8 +6394,8 @@ void VerifyCodeFailure(const File& directory, CodeFailureCase scenario) {
       CheckText(config, "mode=enabled\n");
       CheckText(settings, partial ? user_edit : SettingsPage(true));
     } else if (partial) {
-      Wait(preview, [&] { return ShowsText(preview, "Applied: config.txt\nSkipped: settings.html"); },
-          "The patch did not report the applied and skipped files");
+      Wait(preview, [&] { return !preview.Find(UiSelector::Key("agent-chat-stop")).Exists(); }, "Partial patch did not settle");
+      check_partial(preview, *snapshot(preview));
     } else {
       Wait(preview, [&] { return ShowsText(preview, "Run workspace tests"); }, "The test process did not request approval");
       if (marker.Exists()) throw std::runtime_error("The test process ran before approval");
@@ -6315,8 +6489,7 @@ void VerifyCodeFailure(const File& directory, CodeFailureCase scenario) {
   CheckText(config, "mode=enabled\n");
   const auto test = std::ranges::find_if(saved->tools, [](const auto& item) { return item.tool.id == agentkit_preview::RunCodeTests; });
   if (partial) {
-    Wait(reopened, [&] { return ShowsText(reopened, "Applied: config.txt\nSkipped: settings.html"); },
-        "The per-file result did not survive restart");
+    check_partial(reopened, *saved);
     if (patch->state != kit::ToolCallState::PartiallyApplied || !patch->reason || patch->reason->code != kit::ErrorCode::Conflict ||
         !patch->artifacts.empty() || patch->effects[1].state != kit::ResourceEffectState::Unchanged ||
         patch->effects[1].after || patch->effects[1].undo || test != saved->tools.end() || marker.Exists())
@@ -6329,7 +6502,7 @@ void VerifyCodeFailure(const File& directory, CodeFailureCase scenario) {
       throw std::runtime_error("A nonzero CTest exit did not preserve the completed patch and failed verification");
     CheckText(settings, SettingsPage(true));
     CheckText(marker, "executed");
-    Wait(reopened, [&] { return ShowsText(reopened, test->reason->message); }, "The failing CTest exit did not survive restart");
+    static_cast<void>(RevealChatTool(reopened, *saved, test->id));
     const bool has_diagnostics = std::ranges::any_of(saved->messages, [&](const auto& message) {
       return message.run == test->run && message.author == kit::MessageAuthor::Tool &&
           std::ranges::any_of(message.blocks, [](const auto& block) {
@@ -6343,7 +6516,7 @@ void VerifyCodeFailure(const File& directory, CodeFailureCase scenario) {
     const auto raw = directory.Child("test-logs").Child(test->id.value + ".log").ReadString();
     if (!raw.Succeeded() || raw.Value().find("\x1b[31mFixture verification failed\x1b[0m") == std::string::npos)
       throw std::runtime_error("The original CTest log did not preserve the process diagnostic");
-    CheckCTestDisclosure(reopened, "Fixture verification failed");
+    CheckCTestDisclosure(reopened, "Fixture verification failed", test->reason->message);
   }
 }
 
@@ -6362,11 +6535,17 @@ void VerifyReleaseFailure(const File& root, bool tests_pass) {
       "message(FATAL_ERROR \"Intentional workspace verification failure\")\n");
   kit::ModelRegistration model{{{"preview.test-code"}, 1}, {"preview", "code-fixture", "script", {}},
                                std::make_shared<PatchModel>()};
+  std::shared_ptr<kit::AgentRuntime> runtime;
+  std::optional<TaskScope> tasks;
   Application application{App, {.application_hooks = {MakeCodeTestInstaller(root.Child("sessions.sqlite3"), workspace,
-      std::move(model), File(AGENTKIT_PREVIEW_CTEST))}}};
+      std::move(model), File(AGENTKIT_PREVIEW_CTEST), {}, [&](auto started, auto, auto) -> Task<void> {
+        runtime = LiveTake(std::move(started));
+        tasks = UseApplicationTaskScope();
+        co_return;
+      })}}};
   const auto* title = tests_pass ? "Workspace release: Require screenshot" : "Workspace release: Reject failed tests";
   StartWorkspaceRelease(application, workspace.Child("config.txt"), workspace.Child("settings.html"), title);
-  RejectIncompleteVerification(application, workspace.Child("tested.txt"), title, tests_pass);
+  RejectIncompleteVerification(application, workspace.Child("tested.txt"), title, tests_pass, runtime, tasks);
 }
 
 void VerifyReleaseCompletionRevision(const File& root, bool complete_automatically) {
@@ -6653,7 +6832,7 @@ void VerifyReleaseCompletionRevision(const File& root, bool complete_automatical
       composer.Tap();
       composer.ReplaceText(screenshot_follow_up);
       TapFormButton(preview, "Send");
-      Wait(preview, [&] { return !attachment.Exists() && preview.Find(UiSelector::Key("ppt-audience")).Exists(); },
+      Wait(preview, [&] { return !attachment.Exists() && preview.Find(UiSelector::Key("slide-title-0")).Exists(); },
           "Sending the conclusion did not start the next presentation task");
     }
     ui_finished = true;
@@ -6740,6 +6919,7 @@ public:
         return text && *text == timeline_layout_prompt;
       });
       if (index < (layout ? 3 : names.size())) {
+        if (layout && index == 2) events.emplace_back(kit::ModelTextDelta{"I found the configuration file."});
         const auto call = "workspace-" + std::to_string(index);
         events.emplace_back(kit::ModelToolStarted{call, names[index]});
         events.emplace_back(kit::ModelToolArguments{call, arguments[index].dump()});
@@ -6749,7 +6929,7 @@ public:
         events.emplace_back(kit::ModelTextDelta{"## Workspace overview\n\nThe workspace contains a mode setting."});
         for (int chunk = 1; chunk <= 2; ++chunk) {
           std::string body;
-          for (int paragraph = 0; paragraph < 12; ++paragraph)
+          for (int paragraph = 0; paragraph < 20; ++paragraph)
             body += "\n\nThe workspace setting is checked before entering the application.";
           body += "\n\nStream checkpoint " + std::to_string(chunk) + ".";
           events.emplace_back(kit::ModelTextDelta{std::move(body)});
@@ -6804,29 +6984,31 @@ void VerifyWorkspaceTools(const File& root) {
   ChooseDraftAssistant(ui, "Code");
   SendNewConversation(ui, timeline_layout_prompt);
   const auto history = ui.Find(UiSelector::Key("agent-chat-history"));
+  const auto first_group = ui.Find(UiSelector::Text("2 operations"));
+  const auto second_group = ui.Find(UiSelector::Text("1 operation"));
+  const auto progress_note = ui.Find(UiSelector::Text("I found the configuration file."));
   const auto list = ui.Find(UiSelector::Text("List workspace files · Completed"));
   const auto search = ui.Find(UiSelector::Text("Search workspace files · Completed"));
   const auto read = ui.Find(UiSelector::Text("Read workspace files · Completed"));
   const auto heading = ui.Find(UiSelector::Text("Workspace overview"));
-  Wait(ui, [&] { return list.Exists() && search.Exists() && read.Exists() && heading.Exists(); },
-      "The workspace steps and streamed heading did not mount");
+  Wait(ui, [&] { return first_group.Exists() && second_group.Exists() && progress_note.Exists() && heading.Exists(); },
+      "The work groups and streamed replies did not mount");
+  if (list.Exists() || search.Exists() || read.Exists()) throw std::runtime_error("The tool log was visible while its groups were collapsed");
   const auto avatar = history.Find(UiSelector::Key("chat-agent-avatar"));
   if (avatar.Count() != 1) throw std::runtime_error("The tool steps and reply did not share an assistant avatar");
   const auto identity = avatar.One().bounds;
-  const auto first_step = list.One().bounds;
+  const auto first_step = first_group.One().bounds;
   const auto answer = heading.One().bounds;
   const auto step_indent = first_step.x - answer.x;
   const auto avatar_gap = answer.x - identity.x - identity.width;
   if (first_step.y < identity.y || first_step.y + first_step.height > identity.y + identity.height ||
       avatar_gap <= 0.0F || step_indent <= 0.0F || step_indent >= identity.width)
     throw std::runtime_error("The assistant avatar and reply did not align with the first tool step");
-  const auto list_to_search = search.One().bounds.y - list.One().bounds.y - list.One().bounds.height;
-  const auto search_to_read = read.One().bounds.y - search.One().bounds.y - search.One().bounds.height;
-  if (list_to_search <= 0.0F || search_to_read <= 0.0F || std::abs(list_to_search - search_to_read) > 1.0F)
-    throw std::runtime_error("Consecutive workspace steps have unequal spacing: " + std::to_string(list_to_search) +
-        " and " + std::to_string(search_to_read));
+  if (!(first_step.y < progress_note.One().bounds.y && progress_note.One().bounds.y < second_group.One().bounds.y &&
+        second_group.One().bounds.y < answer.y))
+    throw std::runtime_error("A work group crossed the intervening assistant text");
   const auto gap = [&] {
-    const auto step = read.One().bounds;
+    const auto step = second_group.One().bounds;
     return heading.One().bounds.y - step.y - step.height;
   };
   const auto initial_gap = gap();
@@ -6835,36 +7017,67 @@ void VerifyWorkspaceTools(const File& root) {
   released->store(1);
   Wait(ui, [&] { return ShowsText(ui, "Stream checkpoint 1."); }, "The first longer reply did not start streaming");
   history.ScrollBy({0.0F, -10000.0F});
-  Wait(ui, [&] { return read.Exists() && read.One().in_viewport && heading.Exists() && heading.One().in_viewport; },
+  ui.Pump(250ms);
+  if (history.ScrollBy({0.0F, 28.0F}).y < 24.0F)
+    throw std::runtime_error("The test reply did not leave room to preserve the reading position");
+  Wait(ui, [&] { return second_group.Exists() && second_group.One().in_viewport && heading.Exists() && heading.One().in_viewport; },
       "The start of the streamed reply was not reachable");
   if (std::abs(gap() - initial_gap) > 4.0F)
     throw std::runtime_error("Streaming moved the heading away from the preceding work step");
-  const auto read_y = read.One().bounds.y;
-  read.Tap();
-  Wait(ui, [&] { return gap() > initial_gap + 6.0F; }, "The reading details did not expand under their heading");
-  if (std::abs(read.One().bounds.y - read_y) > 4.0F)
-    throw std::runtime_error("Expanding a work step moved its heading");
+  const auto group_y = second_group.One().bounds.y;
+  second_group.Tap();
+  Wait(ui, [&] { return read.Exists() && gap() > initial_gap + 6.0F; }, "The reading step did not expand under its group");
+  Wait(ui, [&] { return std::abs(second_group.One().bounds.y - group_y) <= 4.0F; }, "Expanding work moved its group heading");
   const auto expanded_gap = gap();
   released->store(2);
   Wait(ui, [&] { return ShowsText(ui, "Stream checkpoint 2."); }, "The second longer reply did not render");
   ui.Pump(16ms);
-  if (!read.One().in_viewport || std::abs(read.One().bounds.y - read_y) > 4.0F || std::abs(gap() - expanded_gap) > 4.0F)
-    throw std::runtime_error("Streaming moved the expanded work step or introduced empty space");
-  read.Tap();
+  if (!second_group.One().in_viewport || std::abs(second_group.One().bounds.y - group_y) > 4.0F ||
+      std::abs(gap() - expanded_gap) > 4.0F)
+    throw std::runtime_error("Streaming moved the expanded work group or introduced empty space");
+  second_group.Tap();
   try {
-    Wait(ui, [&] { return std::abs(gap() - initial_gap) <= 4.0F; }, "Collapsing the step left space behind");
+    Wait(ui, [&] { return !read.Exists() && std::abs(gap() - initial_gap) <= 4.0F; }, "Collapsing the work group left space behind");
   } catch (...) {
     static_cast<void>(root.Child("timeline-layout.snapshot").WriteString(ui.CaptureSnapshot().ToString()));
     throw std::runtime_error("Collapsing the step left space behind: collapsed " + std::to_string(initial_gap) +
         ", expanded " + std::to_string(expanded_gap) + ", after closing " + std::to_string(gap()));
   }
-  if (std::abs(read.One().bounds.y - read_y) > 4.0F)
-    throw std::runtime_error("Collapsing a work step moved its heading");
+  Wait(ui, [&] { return std::abs(second_group.One().bounds.y - group_y) <= 4.0F; }, "Collapsing work moved its group heading");
   ui.Find(UiSelector::Key("jump-to-latest")).Tap();
   Wait(ui, [&] { return ui.Find(UiSelector::Text("Stream checkpoint 2.")).One().in_viewport; },
       "Jump to latest did not return to the streaming reply");
   released->store(3);
   Wait(ui, [&] { return !ui.Find(UiSelector::Key("agent-chat-stop")).Exists(); }, "The layout check did not finish");
+
+  const auto set_full_access = [&](bool enable) {
+    TapControl(ui, UiSelector::Key("open-settings"), "Open settings");
+    TapControl(ui, UiSelector::Key("settings-section-permissions"), "Open file permissions");
+    TapControl(ui, UiSelector::Key("settings-local-full-access"), "Change global file access");
+    if (enable) {
+      TapFormButton(ui, "Allow");
+      Wait(ui, [&] { return !ui.Find(ButtonText("Allow")).Exists(); }, "Global permission confirmation did not close");
+    }
+    TapFormButton(ui, "Save settings");
+    const auto saved = ui.Find(ButtonText("Save settings"));
+    Wait(ui, [&] { return saved.Exists() && !saved.One().enabled; }, "Global file permissions were not saved");
+    TapControl(ui, UiSelector::Key("close-settings"), "Close settings");
+  };
+  set_full_access(true);
+  StartProjectDraft(ui, workspace);
+  const auto assistant = ui.Find(UiSelector::Key("draft-assistant")).Find(UiSelector::Text("Code"));
+  const auto full = ui.Find(UiSelector::Key("run-global-full-access"));
+  const auto scoped = ui.Find(UiSelector::Key("run-permissions"));
+  Wait(ui, [&] { return assistant.Exists() && full.Exists() && !scoped.Exists(); },
+      "New conversations did not inherit the assistant or global permission");
+  SendNewConversation(ui, "Apply a workspace patch using global file access.");
+  Wait(ui, [&] { return ShowsText(ui, "Workspace changes verified."); }, "Global file access did not authorize the workspace patch");
+  if (approve.Exists() || scoped.Exists()) throw std::runtime_error("Full Access still offered a separate approval for local edits");
+  CheckText(config, "mode=enabled\n");
+  set_full_access(false);
+  WriteFixture(config, "mode=disabled\n");
+  StartProjectDraft(ui, workspace);
+  exercise("Check that revoking global file access restores patch confirmation.");
 }
 
 class LocalFileModel final : public kit::ModelProvider {
@@ -6923,7 +7136,9 @@ public:
         }
       } else if (prompt == "Local files: build in an empty project") {
         steps = {{"list_files", {{"directory", ""}}},
-            {"create_file", {{"path", "index.html"}, {"content", "<!doctype html><title>Empty project fixture</title>\n"}}}};
+            {"create_file", {{"path", "index.html"}, {"content", "<!doctype html><title>Empty project fixture</title>\n"}}},
+            {"edit_file", {{"path", "index.html"}, {"old_text", "Empty project fixture"},
+                {"new_text", "GanWork HTML artifact acceptance"}}}};
       } else {
         steps = {{"read_file", {{"path", renamed.Path()}}}};
       }
@@ -6969,7 +7184,7 @@ private:
   std::shared_ptr<std::atomic<bool>> release_read_;
 };
 
-void VerifyLocalFiles(const File& root) {
+void VerifyLocalFiles(const File& root, bool launch_page = false) {
   const auto directory = root.Child("files");
   const auto project = root.Child("empty-project");
   if (!directory.CreateDirectories() || !project.CreateDirectories())
@@ -7021,6 +7236,8 @@ void VerifyLocalFiles(const File& root) {
   ChooseDraftAssistant(ui, "Code");
   SendNewConversation(ui, "Local files: edit and search");
   Wait(ui, [&] { return ShowsText(ui, "Local file request completed."); }, "Standalone file tool sequence did not complete", 20s);
+  if (!ui.Find(UiSelector::Key("run-global-full-access")).Exists() || ui.Find(UiSelector::Key("run-permissions")).Exists())
+    throw std::runtime_error("Standalone full file access still showed a separate permission selector");
   const auto written = directory.Child("new");
   CheckText(written.Child("renamed.txt"), "edited content\n");
   if (written.Child("original.txt").Exists() || written.Child("copy.txt").Exists())
@@ -7066,9 +7283,221 @@ void VerifyLocalFiles(const File& root) {
   const auto html = project.Child("index.html");
   if (html.Exists()) throw std::runtime_error("The empty-project file was created before approval");
   approve.Tap();
+  Wait(ui, [&] { return html.Exists() && approve.Exists() && approve.One().in_viewport; }, "Editing the page did not request approval");
+  approve.Tap();
   Wait(ui, [&] { return html.Exists() && ShowsText(ui, "Local file request completed."); }, "The empty project did not receive the file");
-  CheckText(html, "<!doctype html><title>Empty project fixture</title>\n");
+  CheckText(html, "<!doctype html><title>GanWork HTML artifact acceptance</title>\n");
+  std::optional<kit::ArtifactRef> latest_page;
+  std::exception_ptr failure;
+  tasks->Launch([&]() -> Task<void> {
+    try {
+      const auto sessions = LiveTake(co_await runtime->Sessions().ListAsync({}, {}));
+      const auto session = std::ranges::find(sessions.sessions, "Local files: build in an empty project", &kit::SessionSummary::title);
+      if (session == sessions.sessions.end()) throw std::runtime_error("The page session was not recorded");
+      auto conversation = LiveTake(co_await runtime->Sessions().OpenAsync(session->id));
+      const auto snapshot = conversation->Snapshot();
+      if (snapshot->artifacts.size() != 2) throw std::runtime_error("HTML creation and editing did not publish their artifacts");
+      const auto first = LiveTake(co_await conversation->PreviewArtifactAsync(snapshot->artifacts.front()));
+      const auto last = LiveTake(co_await conversation->PreviewArtifactAsync(snapshot->artifacts.back()));
+      const auto pages = root.Child("workspace-evidence").Child("local-pages");
+      const auto original = LiveTake(agentkit_preview::ResolveLocalPage(pages, first, {}));
+      const auto current = LiveTake(agentkit_preview::ResolveLocalPage(pages, last, {}));
+      if (first.name != "index.html" || last.name != "index.html" || original == html || current != html)
+        throw std::runtime_error("The page routes did not distinguish saved and current HTML");
+      CheckText(original, "<!doctype html><title>Empty project fixture</title>\n");
+      const auto& tools = snapshot->tools;
+      const auto source = agentkit_preview::LocalPageOutput(tools.back());
+      if (!source || LiveTake(agentkit_preview::ResolveLocalPage(pages, {}, source)) != html)
+        throw std::runtime_error("The original tool result could not open the local HTML");
+      const auto old_source = agentkit_preview::LocalPageOutput(tools.at(tools.size() - 2));
+      if (!old_source || agentkit_preview::ResolveLocalPage(pages, {}, old_source).Succeeded())
+        throw std::runtime_error("An old tool result opened a replaced HTML file as its original version");
+      latest_page = last.artifact;
+    } catch (...) { failure = std::current_exception(); }
+  });
+  Wait(ui, [&] { return latest_page || failure; }, "HTML artifact evidence could not be read");
+  if (failure) std::rethrow_exception(failure);
+  if (agentkit_preview::CanOpenLocalPages()) {
+    auto open_page = ui.Find(UiSelector::Key("open-local-page/" + latest_page->id.value));
+    Wait(ui, [&] { return open_page.Exists() && open_page.One().in_viewport; }, "The HTML artifact did not offer its browser action in chat");
+    if (launch_page) {
+      open_page.Tap();
+      Wait(ui, [&] { return open_page.One().enabled; }, "The browser action did not finish");
+      if (ShowsText(ui, "This version of the page is unavailable.") || ShowsText(ui, "Could not open the page in your browser."))
+        throw std::runtime_error("GanWork reported that the HTML artifact could not be opened");
+    }
+  }
 }
+
+#ifdef _WIN32
+struct HostToolCase {
+  std::string name;
+  const char* tool;
+  const char* approval;
+  nlohmann::json arguments;
+  bool denied = false;
+  bool timed_out = false;
+};
+
+class HostToolModel final : public kit::ModelProvider {
+public:
+  HostToolModel(std::vector<HostToolCase> cases, bool search_enabled)
+      : cases_(std::move(cases)), search_enabled_(search_enabled) {}
+
+  kit::ModelCapabilities Capabilities() const override {
+    return {.text_stream = true, .tool_calls = true, .structured_output = true};
+  }
+
+  kit::Async<std::unique_ptr<kit::ModelTurnStream>> StartTurnAsync(kit::ModelTurnRequest request) override {
+    using Result = kit::AgentResult<std::unique_ptr<kit::ModelTurnStream>>;
+    using agentkit_preview::DecodeJson;
+    using agentkit_preview::EncodeJson;
+    std::vector<kit::ModelEvent> events;
+    auto finish = kit::ModelFinishReason::Completed;
+    if (request.output_schema) {
+      events.emplace_back(kit::ModelStructuredOutput{DecodeJson({{"route", "answer"}})});
+    } else {
+      const HostToolCase* scenario = nullptr;
+      const kit::ModelToolResult* reply = nullptr;
+      for (const auto& item : request.items) {
+        if (const auto* message = std::get_if<kit::ModelContent>(&item); message && message->role == kit::ModelContent::Role::User) {
+          if (const auto* text = std::get_if<std::string>(&message->body)) {
+            const auto found = std::ranges::find(cases_, *text, &HostToolCase::name);
+            if (found != cases_.end()) scenario = &*found;
+          }
+        } else if (const auto* result = std::get_if<kit::ModelToolResult>(&item)) {
+          reply = result;
+        }
+      }
+      const auto offered = [&](std::string_view name) {
+        return std::ranges::find(request.tools, name, &kit::ModelToolSpec::name) != request.tools.end();
+      };
+      const auto error = [](std::string message) {
+        return Result::Failure({.code = kit::ErrorCode::InvalidState, .message = std::move(message)});
+      };
+      if (!scenario || !offered("run_powershell") || !offered("web_fetch") || offered("web_search") != search_enabled_)
+        co_return error("Unexpected host tool offer");
+      if (!reply) {
+        events.emplace_back(kit::ModelToolStarted{"host-tool", scenario->tool});
+        events.emplace_back(kit::ModelToolArguments{"host-tool", scenario->arguments.dump()});
+        events.emplace_back(kit::ModelToolFinished{"host-tool"});
+        finish = kit::ModelFinishReason::ToolCalls;
+      } else {
+        const auto value = reply->value ? EncodeJson(*reply->value) : nlohmann::json{};
+        if (scenario->denied || scenario->name == "Redirected page") {
+          if (reply->value || !reply->error || (!scenario->denied && !reply->error->message.starts_with("The server redirected")))
+            co_return error("A denied or redirected host request returned the wrong result");
+        } else if (!reply->value || reply->error) {
+          co_return error(reply->error ? reply->error->message : "The host tool did not return a result");
+        } else if (scenario->name == "PowerShell process result") {
+          if (value.at("exit_code") != 7 || value.at("truncated") != false ||
+              value.at("stdout").get<std::string>().find("GanWork \xe6\xb5\x8b\xe8\xaf\x95") == std::string::npos ||
+              value.at("stderr").get<std::string>().find("fixture error") == std::string::npos)
+            co_return error("PowerShell did not return the expected exit status and UTF-8 streams: " + value.dump());
+        } else if (scenario->name == "Standalone PowerShell") {
+          if (value.at("exit_code") != 0) co_return error("PowerShell could not use the task directory");
+        } else if (scenario->name == "Approved search") {
+          const auto& results = value.at("results");
+          if (results.size() != 1 || results.at(0).at("title") != "GanWork documentation" ||
+              results.at(0).at("snippet") != "A relevant page")
+            co_return error("Web search did not return clean structured results: " + value.dump());
+        } else if (scenario->name == "Approved page") {
+          const auto page = value.at("text").get<std::string>();
+          if (page.find("GanWork & docs") == std::string::npos || page.find("visible paragraph") == std::string::npos ||
+              page.find("untrusted-script-marker") != std::string::npos || page.find("hidden-style-marker") != std::string::npos)
+            co_return error("Web fetch did not return the expected page text: " + page);
+        }
+        events.emplace_back(kit::ModelTextDelta{"Host tool case completed."});
+      }
+    }
+    events.emplace_back(kit::ModelFinished{finish, {}});
+    co_return Result::Success(std::make_unique<WorkspaceToolStream>(std::move(events)));
+  }
+
+private:
+  std::vector<HostToolCase> cases_;
+  bool search_enabled_;
+};
+
+void VerifyHostTools(const File& root, std::string url) {
+  const auto workspace = root.Child("project");
+  if (!workspace.CreateDirectories()) throw std::runtime_error("Could not create the host tools workspace");
+  std::vector<HostToolCase> cases{
+      {"PowerShell process result", "run_powershell", "Run PowerShell", {{"command",
+          "Set-Content -Path approved.txt -Value created; "
+          "[Console]::WriteLine('GanWork \xe6\xb5\x8b\xe8\xaf\x95'); [Console]::Error.WriteLine('fixture error'); exit 7"}}},
+      {"Denied PowerShell", "run_powershell", "Run PowerShell",
+          {{"command", "Set-Content -Path denied.txt -Value denied"}, {"working_directory", workspace.Path()}}, true},
+      {"Standalone PowerShell", "run_powershell", "Run PowerShell", {{"command", "Set-Content -Path isolated.txt -Value isolated"}}},
+  };
+  if (!url.empty()) {
+    cases.insert(cases.end(), {
+        {"Timed-out PowerShell", "run_powershell", "Run PowerShell", {{"command",
+            "Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile -Command \"Start-Sleep -Seconds 3; "
+            "Set-Content -Path too-late.txt -Value unexpected\"'; Start-Sleep -Seconds 10"}, {"timeout_seconds", 2}}, false, true},
+        {"Approved search", "web_search", "Search the web", {{"query", "GanWork \xe6\xb5\x8b\xe8\xaf\x95 + &"}, {"max_results", 1}}},
+        {"Approved page", "web_fetch", "Read a web page", {{"url", url + "/page"}}},
+        {"Redirected page", "web_fetch", "Read a web page", {{"url", url + "/redirect"}}},
+        {"Denied page", "web_fetch", "Read a web page", {{"url", url + "/denied"}}, true},
+    });
+  }
+  kit::ModelRegistration model{{{"host-tools-fixture"}, 1}, {"fixture", "host-tools", "script", {}},
+      std::make_shared<HostToolModel>(cases, !url.empty())};
+  bool done = false;
+  std::exception_ptr failure;
+  const Application application{App, {.application_hooks = {MakeRunSettingsTestInstaller(root.Child("sessions.sqlite3"),
+      workspace, {std::move(model)}, [&](auto started, auto id, auto) -> Task<void> {
+        try {
+          auto runtime = LiveTake(std::move(started));
+          for (const auto& scenario : cases) {
+            const auto created = LiveTake(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
+                .options = {.agent = agentkit_preview::CodeAgent,
+                    .workspace = scenario.name == "Standalone PowerShell" ? std::nullopt : id, .title = scenario.name},
+                .initial = kit::SendInput{.text = scenario.name}}));
+            auto session = LiveTake(co_await runtime->Sessions().OpenAsync(std::get<kit::SessionCreated>(created.outcome).session));
+            const auto subscription = co_await LiveObserve(session);
+            const auto approval = co_await LiveInteraction(session, scenario.approval);
+            const auto& detail = std::get<kit::ToolApproval>(approval.body).preview.summary;
+            const auto field = scenario.arguments.contains("command") ? "command" : scenario.arguments.contains("query") ? "query" : "url";
+            if (detail.find(scenario.arguments.at(field).get<std::string>()) == std::string::npos || workspace.Child("denied.txt").Exists() ||
+                (scenario.name == "PowerShell process result" && workspace.Child("approved.txt").Exists()))
+              throw std::runtime_error("The user could not review the exact request before the action");
+            if (scenario.denied) {
+              LiveTake(co_await session->SubmitAsync(kit::NewCommandId(), {approval.id, approval.version, kit::ApprovalDecision::Deny}));
+            } else {
+              co_await LiveApprove(session, approval);
+            }
+            if (scenario.timed_out) {
+              const auto deadline = std::chrono::steady_clock::now() + 20s;
+              while (session->Snapshot()->summary.active_run && std::chrono::steady_clock::now() < deadline) co_await Delay(25ms);
+              const auto result = session->Snapshot();
+              if (result->summary.active_run || result->tools.empty() || result->tools.back().state != kit::ToolCallState::ResultUnknown)
+                throw std::runtime_error("A timed-out PowerShell call did not preserve its unknown-effect state");
+            } else {
+              try {
+                co_await LiveRunCompleted(session);
+              } catch (const std::exception& error) {
+                throw std::runtime_error(scenario.name + ": " + error.what());
+              }
+            }
+          }
+          if (!url.empty()) co_await RunWorker([] { std::this_thread::sleep_for(3s); });
+          LiveTake(co_await runtime->CloseAsync());
+        } catch (...) { failure = std::current_exception(); }
+        done = true;
+      })}}};
+  UiTest ui(application, {.viewport = {1100.0F, 940.0F},
+      .resource_provider = std::make_shared<PreviewTestResources>()});
+  Wait(ui, [&] { return done || failure; }, "Host tool test did not finish", 50s);
+  if (failure) std::rethrow_exception(failure);
+  if (!workspace.Child("approved.txt").Exists() || workspace.Child("denied.txt").Exists() || workspace.Child("too-late.txt").Exists())
+    throw std::runtime_error("PowerShell did not respect approval, the working directory, or its process timeout");
+  const auto folders = root.Child("ganwork-task-files").ListChildren();
+  if (!folders.Succeeded() || folders.Value().size() != 1 || !folders.Value().front().Child("isolated.txt").Exists())
+    throw std::runtime_error("Standalone PowerShell did not write to its own task directory");
+}
+#endif
+
 
 void VerifyNativeDirectoryPicker(const File& root) {
   const auto folder = root.Child("choose-this-folder");
@@ -7297,8 +7726,6 @@ void VerifyLiveCodeTurnActivity(const File& root) {
 
 void CheckCodeTimelineDetails(UiTest& preview) {
   const auto tests = UiSelector::Text("Run workspace tests · Completed");
-  Wait(preview, [&] { return ShowsText(preview, "Read workspace files · Completed") && preview.Find(tests).Exists(); },
-      "The read and verification steps did not reopen in the conversation");
   TapControl(preview, ButtonText("View changes"), "The completed turn could not locate its changes");
   const auto first_diff = UiSelector::Key("workspace-file-diff/config.txt");
   const auto second_diff = UiSelector::Key("workspace-file-diff/settings.html");
@@ -7311,6 +7738,8 @@ void CheckCodeTimelineDetails(UiTest& preview) {
       ReviewedDiff(preview).find("Enabled") != std::string::npos; },
       "The settings diff did not show the recorded applied version");
   TapControl(preview, second_diff, "The settings diff could not be closed", "agent-chat-history");
+  if (!preview.Find(tests).Exists())
+    TapControl(preview, UiSelector::Text("1 operation"), "The verification group could not expand", "agent-chat-history");
   TapControl(preview, tests, "The verification step could not expand", "agent-chat-history");
   Wait(preview, [&] { return preview.Find(UiSelector::Key("ctest-command")).Exists() &&
       preview.Find(UiSelector::Key("ctest-directory")).Exists() && preview.Find(UiSelector::Key("ctest-output")).Exists(); },
@@ -7378,8 +7807,9 @@ void VerifyCodeTurnActivity(const File& root) {
     recorded_elapsed = preview.Find(elapsed).One().text.value_or("");
     if (!recorded_elapsed.starts_with("Elapsed ") || recorded_elapsed == "Elapsed 0m 0s")
       throw std::runtime_error("The code turn did not retain a measured elapsed time");
-    if (!ShowsText(preview, "Read workspace files · Completed") || preview.Find(UiSelector::Key("ctest-output")).Exists())
-      throw std::runtime_error("A completed turn did not retain compact tool steps");
+    if (!ShowsText(preview, "2 operations") || !ShowsText(preview, "1 operation") ||
+        ShowsText(preview, "Read workspace files · Completed") || preview.Find(UiSelector::Key("ctest-output")).Exists())
+      throw std::runtime_error("A completed turn did not retain collapsed work groups");
     CheckText(workspace.Child("tested.txt"), "verified");
   }
   {
@@ -8358,7 +8788,7 @@ void ResumePresentationConclusion(const File& root) {
   if (output.Exists()) throw std::runtime_error("The original export ran before approval");
   TapFormButton(preview, "Approve");
   Wait(preview, [&] {
-    return output.Exists() && !ShowsText(preview, "1 queued") && preview.Find(UiSelector::Key("ppt-audience")).Exists() &&
+    return output.Exists() && !ShowsText(preview, "1 queued") && preview.Find(UiSelector::Key("slide-title-0")).Exists() &&
         ShowsText(preview, queued_slide_input) && preview.Find(UiSelector::Text(queued_slide_excerpt)).Count() == 1;
   }, "The recovered queue did not deliver the original slide conclusion exactly once");
 }
@@ -8865,6 +9295,28 @@ void VerifyLocalization(const File& root) {
 } // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+  if (argc == 3 && std::string_view(argv[1]) == "--open-html-artifact") {
+    try {
+      VerifyLocalFiles(File(std::filesystem::absolute(std::filesystem::u8path(argv[2])).u8string()), true);
+      std::cout << "GanWork opened the HTML artifact in the browser.\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << error.what() << '\n';
+      return 1;
+    }
+  }
+  if ((argc == 3 || argc == 4) && std::string_view(argv[1]) == "--host-tools") {
+    try {
+      VerifyHostTools(File(std::filesystem::absolute(std::filesystem::u8path(argv[2])).u8string()), argc == 4 ? argv[3] : "");
+      std::cout << "Native PowerShell and web tools passed their approval cases.\n";
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << error.what() << '\n';
+      return 1;
+    }
+  }
+#endif
   if (argc == 3 && std::string_view(argv[1]) == "--native-directory-picker") {
     try {
       VerifyNativeDirectoryPicker(File(std::filesystem::absolute(std::filesystem::u8path(argv[2])).u8string()));
@@ -9389,7 +9841,7 @@ int main(int argc, char** argv) {
     const File data(argv[2]);
     const auto workspace = data.Child("code");
     const auto phase = argc == 4 ? std::string(argv[3]) : std::string{};
-    if (argc == 4) {
+    if (argc == 4 && phase != "ppt-visual") {
       for (const auto* name : {"HUXERUI_AGENTKIT_BASE_URL", "HUXERUI_AGENTKIT_MODEL", "HUXERUI_AGENTKIT_API_KEY"}) {
         const auto* value = std::getenv(name);
         if (!value || !*value) { std::cerr << "Configure " << name << '\n'; return 1; }
@@ -9422,7 +9874,9 @@ int main(int argc, char** argv) {
         try {
           auto runtime = LiveTake(std::move(started));
           if (!workspace) throw std::runtime_error("The test workspace did not start");
-          if (phase.starts_with("review-"))
+          if (phase == "ppt-visual")
+            co_await RunConfiguredPresentation(runtime, project, *workspace, data);
+          else if (phase.starts_with("review-"))
             co_await RunConfiguredChartReview(runtime, project, data, phase);
           else if (phase.starts_with("skill-"))
             co_await RunConfiguredReleaseSkill(runtime, project, *workspace, data, phase);

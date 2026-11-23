@@ -192,6 +192,7 @@ public:
     try {
       const auto chunk = Json::parse(frame.data);
       if (const auto* failure = Member(chunk, "error")) {
+        if (auto context = ModelContextError(*failure)) return AgentResult<bool>::Failure(std::move(*context));
         const auto code = String(*failure, "status") == "RESOURCE_EXHAUSTED" ? ErrorCode::RateLimited : ErrorCode::ProviderFailure;
         return Fail<bool>(code, "Gemini reported a stream failure");
       }
@@ -355,7 +356,7 @@ private:
   bool candidate_seen_ = false;
 };
 
-class GeminiProvider final : public ModelProvider {
+class GeminiProvider final : public PositionedModelProvider {
 public:
   GeminiProvider(GeminiGenerateContentOptions options, std::string url, TaskScope tasks, ModelHttpOpen open)
       : options_(std::move(options)), url_(std::move(url)), tasks_(tasks), open_(std::move(open)) {}
@@ -394,7 +395,7 @@ public:
       co_return Fail<Stream>(ErrorCode::InvalidArgument, "Invalid Gemini input or continuation");
     }
     co_return co_await OpenModelStream(std::move(call), tasks_, open_, options_.api_key, request.stop,
-        std::move(protocol), ModelCredential::GoogleApiKey);
+        std::move(protocol), options_.stream_timeouts, ModelCredential::GoogleApiKey);
   }
 
 private:
@@ -411,7 +412,7 @@ AgentResult<ModelRegistration> MakeGeminiGenerateContentModel(
   constexpr std::string_view prefix = "models/";
   if (options.model.starts_with(prefix)) options.model.erase(0, prefix.size());
   if (!options.ref.version || options.ref.id.value.empty() || options.model.empty() || options.model.size() > 256 ||
-      options.model == "." || options.model == ".." || options.timeout <= Duration::zero() || !open ||
+      options.model == "." || options.model == ".." || !ValidModelTimeouts(options.timeout, options.stream_timeouts) || !open ||
       !options.max_inline_bytes || options.max_inline_bytes > 14'000'000 ||
       !std::ranges::all_of(options.model, [](char value) {
         return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||

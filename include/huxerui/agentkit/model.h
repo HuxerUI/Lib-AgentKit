@@ -54,6 +54,18 @@ struct ModelEndpoint {
 
 class ModelProvider;
 
+/// @brief Token limits for the model and endpoint bound to this registration.
+struct ModelContextLimits {
+  /// Combined input and output window. Empty if the endpoint has not reported it.
+  std::optional<std::uint64_t> context_window;
+  /// Independent input ceiling, if the endpoint specifies one.
+  std::optional<std::uint64_t> max_input_tokens;
+  /// Independent output ceiling, if the endpoint specifies one.
+  std::optional<std::uint64_t> max_output_tokens;
+
+  bool operator==(const ModelContextLimits&) const = default;
+};
+
 /// @brief Versioned provider implementation and continuation permissions registered with AgentRuntime.
 struct ModelRegistration {
   /// Stable model ID and registration version.
@@ -66,6 +78,8 @@ struct ModelRegistration {
   bool allow_server_state = false;
   /// Host opt-in to durably store provider-private resume bytes.
   bool allow_persist_resume_state = false;
+  /// Known limits enable budgeting and compaction during request assembly.
+  ModelContextLimits context_limits;
 };
 
 /// @brief Opaque continuation data understood by one exact provider registration.
@@ -248,12 +262,14 @@ enum class ModelFinishReason {
   Completed,
   /// The turn finished after issuing calls to be handled before continuation.
   ToolCalls,
-  /// The provider truncated the response at a limit.
+  /// The provider reached an output limit.
   Length,
   /// The provider filtered the response.
   Filtered,
   /// The provider declined the request.
-  Refused
+  Refused,
+  /// The provider exhausted the active model context window.
+  ContextLimit
 };
 /// @brief Terminal event for one model turn.
 struct ModelFinished {

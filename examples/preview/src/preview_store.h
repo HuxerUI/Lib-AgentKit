@@ -27,6 +27,8 @@ struct ConversationGroup {
 struct NavigationPreferences {
   std::vector<ConversationGroup> groups;
   std::map<huxerui::agentkit::SessionId, std::string> memberships;
+  huxerui::agentkit::AgentId last_assistant;
+  bool auto_review_new_conversations = false;
   bool operator==(const NavigationPreferences&) const = default;
 };
 
