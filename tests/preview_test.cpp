@@ -272,7 +272,18 @@ void TapControl(UiTest& preview, UiSelector selector, const char* label, const c
   control.Tap();
 }
 
+void OpenPptForm(UiTest& preview, UiSelector form) {
+  const auto editor = preview.Find(form);
+  const auto card = preview.Find(UiSelector::Key("open-ppt-form"));
+  Wait(preview, [&] { return editor.Exists() || (card.Exists() && card.One().in_viewport); },
+      "The presentation review card was unavailable");
+  if (!editor.Exists()) card.Tap();
+  Wait(preview, [&] { return editor.Exists(); }, "The presentation form did not open on its own page");
+}
+
 void TapFormButton(UiTest& preview, const char* label) {
+  const auto action = std::string_view(label);
+  if (action == "Confirm outline" || action == "Draft outline") OpenPptForm(preview, ButtonText(label));
   TapControl(preview, ButtonText(label), label);
 }
 
@@ -468,12 +479,33 @@ void DraftPresentationOutline(UiTest& preview) {
   auto prompt = preview.Find(UiSelector::Key("new-conversation-composer"));
   FocusPreviewEditor(preview, prompt, "The presentation draft did not receive focus");
   prompt.ReplaceText("Product rollout");
+  TapControl(preview, UiSelector::Key("ppt-outline-choice"), "The outline review option was unavailable");
   Wait(preview, [&] { return preview.Find(ButtonText("Send")).One().enabled; }, "PPT conversation is not ready");
   preview.Find(ButtonText("Send")).Tap();
-  auto title = preview.Find(UiSelector::Key("slide-title-0"));
-  Wait(preview, [&] { return title.Exists() || preview.Find(UiSelector::Key("ppt-audience")).Exists(); },
-      "Editable model outline was not shown");
-  if (!title.Exists()) throw std::runtime_error("The ordinary presentation was blocked by a brief");
+  const auto card = preview.Find(UiSelector::Key("open-ppt-form"));
+  Wait(preview, [&] { return card.Exists() && preview.Find(UiSelector::Key("composer")).Exists(); },
+      "The optional outline review did not leave the conversation available");
+  if (preview.Find(UiSelector::Key("slide-title-0")).Exists() || preview.Find(UiSelector::Key("ppt-audience")).Exists())
+    throw std::runtime_error("The PPT form appeared over the conversation");
+  OpenPptForm(preview, UiSelector::Key("slide-title-0"));
+}
+
+void RequestStagedPptExport(UiTest& preview, const std::string& filename, std::string_view title) {
+  TapFormButton(preview, "Export PowerPoint");
+  const auto field = preview.Find(UiSelector::Key("ppt-review-export-name"));
+  FocusPreviewEditor(preview, field, "The export file name was unavailable");
+  field.ReplaceText(filename);
+  TapFormButton(preview, "Review export");
+  TapFormButton(preview, "Done");
+  Wait(preview, [&] { return !preview.Find(ButtonText("Done")).Exists(); }, "The export dialog did not close");
+  const auto back = preview.FindSemantics(UiSemanticSelector::AllOf(
+      UiSemanticSelector::Role(SemanticRole::Button), UiSemanticSelector::Label("Back to conversation")));
+  Wait(preview, [&] { return back.Count() == 1 && back.One().enabled; }, "The presentation could not return to the conversation");
+  back.PerformSemanticAction({SemanticActionKind::Activate, {}});
+  Wait(preview, [&] { return !preview.Find(UiSelector::Key("artifact-review-heading")).Exists(); },
+      "The artifact review stayed open after returning to the conversation");
+  const auto pending = PendingConversation(preview, std::string(title));
+  Wait(preview, [&] { return pending.Exists(); }, "The staged export did not persist its pending approval");
 }
 
 void PreparePresentation(const Application& application, const File& output) {
@@ -508,15 +540,16 @@ void PreparePresentation(const Application& application, const File& output) {
   bullets.Tap();
   bullets.ReplaceText("Brief & revise <option>");
   TapFormButton(preview, "Confirm outline");
+  const auto card = ReviewCard("Review artifact v1");
+  TapControl(preview, card, "The generated presentation card was unavailable", "agent-chat-history", 96.0F);
   auto first_preview = preview.Find(UiSelector::Text("Approved rollout"));
   const auto stage = preview.Find(UiSelector::Key("presentation-slide"));
-  const auto export_footer = preview.Find(UiSelector::Key("presentation-form-actions"));
   const auto full_slide_visible = [&] {
-    if (!stage.Exists() || !export_footer.Exists()) return false;
+    if (!stage.Exists()) return false;
     const auto picture = stage.One();
     const auto& bounds = picture.bounds;
     return std::abs(bounds.width * 9.0F / 16.0F - bounds.height) <= 1.0F &&
-        bounds.y + bounds.height <= export_footer.One().bounds.y && picture.visible_bounds.height >= bounds.height - 1.0F;
+        picture.visible_bounds.height >= bounds.height - 1.0F;
   };
   Wait(preview, [&] { return first_preview.Exists() && full_slide_visible() && stage.One().bounds.height >= 250.0F; },
       "The export preview did not fit a full widescreen slide above its controls");
@@ -531,13 +564,12 @@ void PreparePresentation(const Application& application, const File& output) {
   const auto wide_stage = stage.One().bounds;
   preview.SetWindowMetrics({.viewport = {520.0F, 800.0F}});
   Wait(preview, [&] { return full_slide_visible() && stage.One().bounds.height < wide_stage.height &&
-      preview.Find(UiSelector::Key("presentation-point/1")).One().in_viewport; },
+      ShowsText(preview, "Validated operations"); },
       "The narrower preview clipped its slide or changed the aspect ratio");
   preview.SetWindowMetrics({.viewport = {1080.0F, 880.0F}});
   Wait(preview, [&] { return full_slide_visible() && stage.One().bounds.height >= wide_stage.height - 1.0F; },
       "The preview did not restore its wide stage before export");
-  TapFormButton(preview, "Review export");
-  Wait(preview, [&] { return preview.Find(UiSelector::Text("Export PowerPoint")).Exists(); }, "Missing export approval");
+  RequestStagedPptExport(preview, output.Name(), "Product rollout");
   if (output.Exists()) throw std::runtime_error("Preview exported a PPTX before user approval");
 }
 
@@ -580,7 +612,10 @@ void RestartAndExport(const Application& application, const File& output, const 
   if (staged_count != 1) throw std::runtime_error("Recovery regenerated the staged artifact");
 }
 
+void VerifyDirectPresentation(const File& root);
+
 void VerifyPresentationFailures(const File& root) {
+  VerifyDirectPresentation(root.Child("direct"));
   const auto generation = root.Child("generation");
   if (!generation.CreateDirectories() || !generation.Child("presentations").WriteString("Staging is blocked"))
     throw std::runtime_error("Could not create the blocked staging fixture");
@@ -873,10 +908,13 @@ void DeliverBriefing(const Application& application, const File& output) {
   auto ppt = PendingConversation(preview, "Product rollout");
   Wait(preview, [&] { return ppt.Exists(); }, "the recovered coordinator did not contact the existing PPT session");
   ppt.Tap();
+  OpenPptForm(preview, UiSelector::Key("ppt-audience"));
   Wait(preview, [&] { return preview.Find(UiSelector::Key("ppt-audience")).Exists(); }, "the PPT work request did not start");
   TapFormButton(preview, "Draft outline");
+  OpenPptForm(preview, UiSelector::Key("slide-title-0"));
   Wait(preview, [&] { return preview.Find(UiSelector::Key("slide-title-0")).Exists(); }, "the PPT assistant did not prepare the outline");
   TapFormButton(preview, "Confirm outline");
+  OpenPptForm(preview, UiSelector::Key("ppt-file_name"));
   auto export_name = preview.Find(UiSelector::Key("ppt-file_name"));
   Wait(preview, [&] { return export_name.Exists(); }, "the downstream tool did not stage a PPTX");
   if (!export_name.One().in_viewport) {
@@ -1242,6 +1280,80 @@ Task<std::shared_ptr<kit::Conversation>> LiveConversation(const std::shared_ptr<
   throw std::runtime_error("Could not find the native Preview conversation " + title);
 }
 
+void VerifyDirectPresentation(const File& root) {
+  const auto workspace = root.Child("workspace");
+  if (!workspace.CreateDirectories()) throw std::runtime_error("Could not create presentation fixture");
+  const auto database = root.Child("sessions.sqlite3");
+  std::shared_ptr<kit::AgentRuntime> runtime;
+  std::optional<TaskScope> tasks;
+  const Application application{App, {.application_hooks = {MakeRunSettingsTestInstaller(
+      database, workspace, {}, [&](auto started, auto, auto) -> Task<void> {
+        runtime = LiveTake(std::move(started));
+        tasks = UseApplicationTaskScope();
+        co_return;
+      })}}};
+  constexpr auto direct = "Direct product slides";
+  constexpr auto review = "Draft deck for review";
+  {
+    UiTest ui(application, {.viewport = {1080.0F, 880.0F}, .resource_provider = std::make_shared<PreviewTestResources>()});
+    ChooseDraftAssistant(ui, "PPT");
+    auto draft = ui.Find(UiSelector::Key("new-conversation-composer"));
+    FocusPreviewEditor(ui, draft, "The PPT composer did not acquire focus");
+    draft.ReplaceText(direct);
+    TapFormButton(ui, "Send");
+    const auto card = ui.Find(ReviewCard("Review artifact v1"));
+    Wait(ui, [&] { return card.Exists() && !ui.Find(UiSelector::Key("agent-chat-stop")).Exists(); },
+        "The default PPT run did not complete with a staged artifact");
+    if (ui.Find(UiSelector::Key("open-ppt-form")).Exists() || root.Child("exports").Child("Presentation.pptx").Exists())
+      throw std::runtime_error("Direct generation required review or wrote an export");
+    TapControl(ui, ReviewCard("Review artifact v1"), "The staged PPTX could not be opened", "agent-chat-history", 96.0F);
+    Wait(ui, [&] { return ui.Find(UiSelector::Key("presentation-slide")).Exists(); }, "The staged PPTX could not be previewed");
+    TapFormButton(ui, "Back to conversation");
+
+    TapControl(ui, UiSelector::Key("new-conversation"), "Could not return to the new conversation composer");
+    ChooseDraftAssistant(ui, "PPT");
+    FocusPreviewEditor(ui, draft, "The review request composer did not acquire focus");
+    draft.ReplaceText(review);
+    TapControl(ui, UiSelector::Key("ppt-outline-choice"), "The outline review was not selectable");
+    TapFormButton(ui, "Send");
+    OpenPptForm(ui, UiSelector::Key("slide-title-0"));
+    TapFormButton(ui, "Back to conversation");
+    Wait(ui, [&] {
+      return ui.Find(UiSelector::Key("composer")).Exists() && ui.Find(UiSelector::Key("open-ppt-form")).Exists() &&
+          !ui.Find(UiSelector::Key("slide-title-0")).Exists();
+    }, "Returning from the review did not restore the chat");
+    kit::SessionId session;
+    tasks->Launch([&]() -> Task<void> {
+      const auto pending = LiveTake(co_await runtime->Interactions().ListPendingAsync({}, {}));
+      const auto found = std::ranges::find_if(pending.items, [&](const auto& entry) { return entry.session.title == review; });
+      if (found != pending.items.end()) session = found->session.id;
+    });
+    Wait(ui, [&] { return !session.value.empty(); }, "The outline review was not a persisted pending interaction");
+    const auto menu = ui.Find(UiSelector::Key("session-actions/" + session.value));
+    Wait(ui, [&] { return menu.Exists() && menu.One().in_viewport; }, "The pending conversation did not offer actions");
+    ClickPreviewMouse(ui, menu.One().visible_bounds);
+    const auto remove = ui.FindSemantics(UiSemanticSelector::AllOf(UiSemanticSelector::Role(SemanticRole::MenuItem),
+        UiSemanticSelector::Label("Stop and delete conversation")));
+    Wait(ui, [&] { return remove.Count() == 1 && remove.One().enabled; }, "A pending outline review could not be stopped and deleted");
+    remove.PerformSemanticAction({SemanticActionKind::Activate, {}});
+    TapFormButton(ui, "Stop and delete");
+    Wait(ui, [&] { return !ConversationRow(ui, review).Exists() && ConversationRow(ui, direct).Exists(); },
+        "The stopped presentation stayed in the conversation list");
+    bool cleared = false;
+    tasks->Launch([&]() -> Task<void> {
+      const auto pending = LiveTake(co_await runtime->Interactions().ListPendingAsync({}, {}));
+      const auto removed = co_await runtime->Sessions().OpenAsync(session);
+      cleared = pending.items.empty() && !removed.Succeeded();
+    });
+    Wait(ui, [&] { return cleared; }, "Stopping and deleting left an accessible conversation or review");
+  }
+  runtime.reset();
+  tasks.reset();
+  UiTest ui(application, {.viewport = {1080.0F, 880.0F}, .resource_provider = std::make_shared<PreviewTestResources>()});
+  Wait(ui, [&] { return ConversationRow(ui, direct).Exists(); }, "The direct presentation was missing after restart");
+  if (ConversationRow(ui, review).Exists()) throw std::runtime_error("The deleted presentation returned after restart");
+}
+
 Task<void> RunConfiguredReleaseSkill(const std::shared_ptr<kit::AgentRuntime>& runtime, const kit::ProjectId& project,
                                      const kit::WorkspaceId& workspace, const File& data, std::string_view phase) {
   using namespace agentkit_preview;
@@ -1313,7 +1425,7 @@ Task<void> RunConfiguredPresentation(const std::shared_ptr<kit::AgentRuntime>& r
   using namespace agentkit_preview;
   using kit::JsonValue;
   const auto chat = co_await LiveConversation(runtime, project, workspace, PptAgent, "Live open source presentation",
-      "\xe5\x81\x9a\xe4\xb8\x80\xe4\xb8\xaa\xe5\xae\xa3\xe4\xbc\xa0\xe5\xbc\x80\xe6\xba\x90\xe7\xb2\xbe\xe7\xa5\x9e\xe7\x9a\x84ppt");
+      "\xe5\x81\x9a\xe4\xb8\x80\xe4\xb8\xaa\xe5\xae\xa3\xe4\xbc\xa0\xe5\xbc\x80\xe6\xba\x90\xe7\xb2\xbe\xe7\xa5\x9e\xe7\x9a\x84ppt\nReview the outline first");
   auto watching = co_await LiveObserve(chat);
   const auto edit = co_await LiveInteraction(chat, "Review and edit outline", {}, 140s);
   const auto outline = LiveTake(ReadPresentationOutline(LiveForm(edit).at("outline")));
@@ -1326,8 +1438,10 @@ Task<void> RunConfiguredPresentation(const std::shared_ptr<kit::AgentRuntime>& r
             << " illustrations, " << layouts[SlideLayout::Chart] << " native charts, "
             << layouts[SlideLayout::Flow] + layouts[SlideLayout::Relationship] << " diagrams" << std::endl;
   LiveTake(co_await chat->SubmitAsync(kit::NewCommandId(), {edit.id, edit.version, WritePresentationOutline(outline)}));
-  const auto preview = co_await LiveInteraction(chat, "Preview slides and choose a file name", {}, 10min);
-  const auto rendered = LiveTake(ReadPresentationOutline(LiveForm(preview).at("outline")));
+  co_await LiveRunCompleted(chat, 10min);
+  const auto staged = chat->Snapshot()->artifacts.back();
+  const auto preview = LiveTake(co_await chat->PreviewArtifactAsync(staged));
+  const auto rendered = LiveTake(ReadPresentationOutline(*preview.structured));
   if (rendered.title != outline.title || rendered.slides.size() != outline.slides.size())
     throw std::runtime_error("Staged preview changed the approved slide list");
   for (std::size_t i = 0; i < outline.slides.size(); ++i) {
@@ -1341,8 +1455,8 @@ Task<void> RunConfiguredPresentation(const std::shared_ptr<kit::AgentRuntime>& r
       throw std::runtime_error("The chart lost its source data in preview");
   }
   const std::string filename = "OpenSource.pptx";
-  JsonValue destination{JsonValue::Object{{"file_name", JsonValue{filename}}}};
-  LiveTake(co_await chat->SubmitAsync(kit::NewCommandId(), {preview.id, preview.version, std::move(destination)}));
+  const kit::ArtifactAction action{staged, std::string(ExportStagedPresentation), JsonValue{filename}};
+  LiveTake(co_await chat->DispatchArtifactActionAsync(kit::NewCommandId(), action));
   const auto approval = co_await LiveInteraction(chat, "Export PowerPoint");
   const auto output = data.Child("exports").Child(filename);
   if (output.Exists()) throw std::runtime_error("The PowerPoint was exported before approval");
@@ -1899,8 +2013,8 @@ void VerifyConversationNavigation(const File& root) {
     Wait(ui, [&] { return !design_row.Exists(); }, "The grouped conversation remained in the root list");
     StartProjectDraft(ui, workspace);
     ChooseDraftAssistant(ui, "PPT");
-    SendNewConversation(ui, deck);
-    Wait(ui, [&] { return ui.Find(ButtonText("Confirm outline")).Exists(); }, "The slide conversation did not produce a draft");
+    SendNewConversation(ui, std::string(deck) + "\nReview the outline first");
+    Wait(ui, [&] { return ui.Find(UiSelector::Key("open-ppt-form")).Exists(); }, "The slide conversation did not produce a review card");
     inspect(ui, [&]() -> Task<void> {
       const auto pending = LiveTake(co_await runtime->Interactions().ListPendingAsync({}, {}));
       for (const auto& item : pending.items) {
@@ -2245,11 +2359,13 @@ void VerifyReleaseSkill(const File& root, bool selected_by_user) {
   kit::InteractionId export_approval;
   kit::SkillRef skill;
   const auto review = [&](UiTest& preview) {
+    OpenPptForm(preview, UiSelector::Key("ppt-audience"));
     auto audience = preview.Find(UiSelector::Key("ppt-audience"));
     Wait(preview, [&] { return audience.Exists(); }, "The General Skill did not open a presentation brief");
     audience.Tap();
     audience.ReplaceText("Release team");
     TapFormButton(preview, "Draft outline");
+    OpenPptForm(preview, UiSelector::Key("slide-title-0"));
     auto first = preview.Find(UiSelector::Key("slide-title-0"));
     Wait(preview, [&] { return first.Exists() && first.One().value == "Verification evidence"; },
          "The model did not draft the first section of the actual template");
@@ -2260,6 +2376,7 @@ void VerifyReleaseSkill(const File& root, bool selected_by_user) {
     Wait(preview, [&] { return second.Exists() && second.One().value == "Release decision"; },
          "The model did not draft the second section of the actual template");
     TapFormButton(preview, "Confirm outline");
+    OpenPptForm(preview, UiSelector::Key("ppt-file_name"));
     TapFormButton(preview, "Review export");
     Wait(preview, [&] { return preview.Find(UiSelector::Text("Export PowerPoint")).Exists(); },
          "The Skill did not prepare normal export approval");
@@ -2291,6 +2408,7 @@ void VerifyReleaseSkill(const File& root, bool selected_by_user) {
     }
     SendNewConversation(preview, report);
     if (selected_by_user) {
+      OpenPptForm(preview, UiSelector::Key("ppt-audience"));
       Wait(preview, [&] { return preview.Find(UiSelector::Key("ppt-audience")).Exists(); }, "Selected Skill did not start the brief");
       original = snapshot(preview)->runs.back().id;
       review(preview);
@@ -2371,10 +2489,15 @@ Task<kit::InteractionSnapshot> StageReviewPresentation(const std::shared_ptr<kit
       {"Release notes", {std::move(verification)}}};
   const auto confirmed = agentkit_preview::WritePresentationOutline(outline);
   LiveTake(co_await chat->SubmitAsync(kit::NewCommandId(), {edit.id, edit.version, confirmed}));
-  auto preview = co_await LiveInteraction(chat, "Preview slides and choose a file name");
-  if (LiveForm(preview).at("outline") != confirmed) throw std::runtime_error("The staged deck lost its confirmed outline");
-  JsonValue destination{JsonValue::Object{{"file_name", JsonValue{std::move(filename)}}}};
-  LiveTake(co_await chat->SubmitAsync(kit::NewCommandId(), {preview.id, preview.version, std::move(destination)}));
+  co_await LiveRunCompleted(chat);
+  const auto snapshot = chat->Snapshot();
+  if (!snapshot || snapshot->artifacts.empty()) throw std::runtime_error("The staged presentation was not published");
+  const auto artifact = snapshot->artifacts.back();
+  const auto preview = LiveTake(co_await chat->PreviewArtifactAsync(artifact));
+  if (!preview.structured || LiveTake(agentkit_preview::ReadPresentationOutline(*preview.structured)).slides.size() != outline.slides.size())
+    throw std::runtime_error("The staged deck lost its confirmed outline");
+  const kit::ArtifactAction request{artifact, std::string(agentkit_preview::ExportStagedPresentation), JsonValue{std::move(filename)}};
+  LiveTake(co_await chat->DispatchArtifactActionAsync(kit::NewCommandId(), request));
   co_return co_await LiveInteraction(chat, "Export PowerPoint");
 }
 
@@ -3003,7 +3126,7 @@ void VerifyLongConversation(const File& root) {
         try {
           const auto runtime = LiveTake(std::move(started));
           if (!registered) throw std::runtime_error("The test workspace did not start");
-          auto original = co_await LiveConversation(runtime, project, *registered, PptAgent, "Original review deck", "Project review");
+          auto original = co_await LiveConversation(runtime, project, *registered, PptAgent, "Original review deck", "Project review\nReview the outline first");
           auto original_observer = co_await LiveObserve(original);
           auto approval = co_await StageReviewPresentation(original, "HistoryReview.pptx");
           co_await LiveApprove(original, approval);
@@ -3200,7 +3323,7 @@ void VerifyDomainReviewWindows(const File& root) {
         try {
           state->runtime = LiveTake(std::move(started));
           if (!id) throw std::runtime_error("The review workspace did not start");
-          state->ppt = co_await LiveConversation(state->runtime, project, *id, PptAgent, "Review deck", "Plan the product release");
+          state->ppt = co_await LiveConversation(state->runtime, project, *id, PptAgent, "Review deck", "Plan the product release\nReview the outline first");
           auto ppt_observer = co_await LiveObserve(state->ppt);
           auto export_request = co_await StageReviewPresentation(state->ppt, "DomainReview.pptx");
           const auto& plan = std::get<kit::ToolApproval>(export_request.body);
@@ -3494,7 +3617,7 @@ int VerifyNativeReviewWindows(const File& root) {
           second.Close();
 
           auto ppt = co_await LiveConversation(runtime, project, *workspace_id, agentkit_preview::PptAgent,
-              "Native PPT review", "Summarize the published design and tests");
+              "Native PPT review", "Summarize the published design and tests\nReview the outline first");
           auto observing_ppt = co_await LiveObserve(ppt);
           const auto export_request = co_await StageReviewPresentation(ppt, "NativeReview.pptx");
           const auto deck = std::get<kit::ToolApproval>(export_request.body).preview.artifacts.at(0);
@@ -4222,8 +4345,8 @@ void VerifyWorktreeCopy(const File& root, bool discard = false) {
 
 void PrepareReleaseTarget(UiTest& preview) {
   ChooseDraftAssistant(preview, "PPT");
-  SendNewConversation(preview, "Workspace release slides");
-  Wait(preview, [&] { return preview.Find(UiSelector::Key("slide-title-0")).Exists(); }, "Missing initial PPT outline");
+  SendNewConversation(preview, "Workspace release slides\nReview the outline first");
+  Wait(preview, [&] { return preview.Find(UiSelector::Key("open-ppt-form")).Exists(); }, "Missing initial PPT outline review");
   preview.Find(UiSelector::Key("agent-chat-stop")).Tap();
   Wait(preview, [&] { return preview.Find(UiSelector::Text("Workspace release slides")).Exists() &&
       !preview.Find(UiSelector::Key("agent-chat-stop")).Exists(); }, "The existing PPT target is still busy");
@@ -4371,10 +4494,13 @@ void ReviseWorkspaceRelease(const Application& application, const File& tested, 
   auto ppt = PendingConversation(preview, "Workspace release slides");
   Wait(preview, [&] { return ppt.Exists(); }, "Verified implementation did not unlock the existing PPT conversation", transition_timeout);
   ppt.Tap();
+  OpenPptForm(preview, UiSelector::Key("ppt-audience"));
   Wait(preview, [&] { return preview.Find(UiSelector::Text("Goal requires 10 slides.")).Exists(); }, "The first PPT run did not use the ten-slide definition");
   TapFormButton(preview, "Draft outline");
+  OpenPptForm(preview, UiSelector::Key("slide-title-0"));
   Wait(preview, [&] { return preview.Find(UiSelector::Text("1 / 10")).Exists(); }, "The ten-slide outline was not prepared");
   TapFormButton(preview, "Confirm outline");
+  OpenPptForm(preview, UiSelector::Key("ppt-file_name"));
   auto name = preview.Find(UiSelector::Key("ppt-file_name"));
   Wait(preview, [&] { return name.Exists(); }, "The original deck did not reach its export form");
   name.Tap();
@@ -4398,15 +4524,18 @@ void FinishWorkspaceRelease(const Application& application, const File& tested, 
   auto ppt = PendingConversation(preview, "Workspace release slides");
   Wait(preview, [&] { return ppt.Exists(); }, "The new revision did not resume after restart");
   ppt.Tap();
+  OpenPptForm(preview, UiSelector::Key("ppt-audience"));
   Wait(preview, [&] { return preview.Find(UiSelector::Text("Goal requires 5 slides.")).Exists(); }, "Restart exposed the old goal instead of the five-slide brief");
   if (preview.Find(UiSelector::Text("Export PowerPoint")).Exists() || old_output.Exists()) {
     throw std::runtime_error("The old export approval was restored");
   }
   CheckText(tested, "verified");
   TapFormButton(preview, "Draft outline");
+  OpenPptForm(preview, UiSelector::Key("slide-title-0"));
   Wait(preview, [&] { return preview.Find(UiSelector::Text("1 / 5")).Exists(); },
       "The five-slide release outline did not appear after submitting the revised brief", 25s);
   TapFormButton(preview, "Confirm outline");
+  OpenPptForm(preview, UiSelector::Key("ppt-file_name"));
   auto name = preview.Find(UiSelector::Key("ppt-file_name"));
   Wait(preview, [&] { return name.Exists(); }, "Release PPTX did not reach the export form");
   for (int page = 1; page < 5; ++page) TapFormButton(preview, "Next slide");
@@ -4752,6 +4881,7 @@ void VerifyForkReview(const File& directory, PublicationInterruption scenario = 
     for (std::size_t i = 0; i < ppt.candidates.size(); ++i) {
       open_branch(ppt.candidates[i]);
       TapFormButton(ui, "Draft outline");
+      OpenPptForm(ui, UiSelector::Key("slide-title-0"));
       fill("slide-title-0", i == 0 ? "Operational milestones" : "Launch impact");
       TapFormButton(ui, "Add slide");
       fill("slide-title-1", i == 0 ? "Readiness checks" : "Release milestones");
@@ -4868,18 +4998,19 @@ void VerifyForkReview(const File& directory, PublicationInterruption scenario = 
     composer = ui.Find(UiSelector::Key("new-conversation-composer"));
     FocusPreviewEditor(ui, composer, "The presentation comparison draft did not receive focus");
     composer.ReplaceText(deck_title);
+    TapControl(ui, UiSelector::Key("ppt-outline-choice"), "The initial deck did not offer outline review");
     TapFormButton(ui, "Send");
+    OpenPptForm(ui, UiSelector::Key("slide-title-0"));
     fill("slide-title-0", "Original rollout");
     TapFormButton(ui, "Confirm outline");
-    auto name = ui.Find(UiSelector::Key("ppt-file_name"));
-    Wait(ui, [&] { return name.Exists(); }, "The target deck did not stage");
-    if (!name.One().in_viewport)
-      name = ui.Find(UiSelector::Key("ppt-form-scroll")).ScrollUntil(UiSelector::Key("ppt-file_name"), {.step = {0.0F, 94.0F}});
-    FocusPreviewEditor(ui, name, "The presentation export name did not receive focus");
-    name.ReplaceText("OriginalDeck.pptx");
-    TapFormButton(ui, "Review export");
-    Wait(ui, [&] { return ShowsText(ui, "Export PowerPoint"); }, "The original deck export was not prepared");
-    TapFormButton(ui, "Approve");
+    TapControl(ui, ReviewCard("Review artifact v1"), "The target deck did not stage", "agent-chat-history", 96.0F);
+    RequestStagedPptExport(ui, "OriginalDeck.pptx", deck_title);
+    try {
+      ApproveConversationChange(ui);
+    } catch (...) {
+      static_cast<void>(directory.Child("presentation-export.snapshot").WriteString(ui.CaptureSnapshot().ToString()));
+      throw;
+    }
     const auto original_file = exports.Child("OriginalDeck.pptx");
     Wait(ui, [&] { return original_file.Exists() && !ui.Find(UiSelector::Key("agent-chat-stop")).Exists(); }, "The original deck did not export");
     const auto original_bytes = original_file.ReadBytes();
@@ -4903,6 +5034,7 @@ void VerifyForkReview(const File& directory, PublicationInterruption scenario = 
     for (std::size_t i = 0; i < started.candidates.size(); ++i) {
       open_branch(started.candidates[i]);
       TapFormButton(ui, "Draft outline");
+      OpenPptForm(ui, UiSelector::Key("slide-title-0"));
       fill("slide-title-0", i == 0 ? "Executive priorities" : "Field priorities");
       TapFormButton(ui, "Confirm outline");
       TapFormButton(ui, "Back to comparison");
@@ -6725,7 +6857,7 @@ void VerifyReleaseCompletionRevision(const File& root, bool complete_automatical
           const auto message = std::ranges::find_if(visible->messages, [](const auto& message) {
             return std::ranges::any_of(message.blocks, [](const auto& block) {
               const auto* text = std::get_if<kit::TextBlock>(&block.body);
-              return text && text->text == screenshot_follow_up;
+              return text && text->text == std::string(screenshot_follow_up) + "\nReview the outline first";
             });
           });
           if (message == visible->messages.end() || !message->run || message->run != visible->summary.active_run ||
@@ -6831,8 +6963,9 @@ void VerifyReleaseCompletionRevision(const File& root, bool complete_automatical
       auto composer = preview.Find(UiSelector::Key("composer"));
       composer.Tap();
       composer.ReplaceText(screenshot_follow_up);
+      TapControl(preview, UiSelector::Key("ppt-outline-choice"), "The follow-up did not offer outline review");
       TapFormButton(preview, "Send");
-      Wait(preview, [&] { return !attachment.Exists() && preview.Find(UiSelector::Key("slide-title-0")).Exists(); },
+      Wait(preview, [&] { return !attachment.Exists() && preview.Find(UiSelector::Key("open-ppt-form")).Exists(); },
           "Sending the conclusion did not start the next presentation task");
     }
     ui_finished = true;
@@ -7942,7 +8075,7 @@ void VerifySharedReports(const File& root) {
               "Describe the project");
           manager = curator->Snapshot()->summary.id;
           kit::CreateSessionRequest request{.options = {.agent = PptAgent, .project = project, .workspace = workspace_id,
-              .title = "Slides using the shared report"}, .initial = kit::SendInput{.text = "Prepare a release report",
+              .title = "Slides using the shared report"}, .initial = kit::SendInput{.text = "Prepare a release report\nReview the outline first",
               .context = {{report}}}};
           auto created = std::get<kit::SessionCreated>(LiveTake(co_await runtime->Sessions().CreateAsync(
               kit::NewCommandId(), std::move(request))).outcome);
@@ -8788,7 +8921,7 @@ void ResumePresentationConclusion(const File& root) {
   if (output.Exists()) throw std::runtime_error("The original export ran before approval");
   TapFormButton(preview, "Approve");
   Wait(preview, [&] {
-    return output.Exists() && !ShowsText(preview, "1 queued") && preview.Find(UiSelector::Key("slide-title-0")).Exists() &&
+    return output.Exists() && !ShowsText(preview, "1 queued") && preview.Find(ReviewCard("Review artifact v1")).Exists() &&
         ShowsText(preview, queued_slide_input) && preview.Find(UiSelector::Text(queued_slide_excerpt)).Count() == 1;
   }, "The recovered queue did not deliver the original slide conclusion exactly once");
 }

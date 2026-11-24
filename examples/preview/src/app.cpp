@@ -128,7 +128,7 @@ public:
         const auto* message = std::get_if<kit::ModelContent>(&item);
         if (!message || message->role != kit::ModelContent::Role::User) continue;
         if (const auto* text = std::get_if<std::string>(&message->body); text && !text->empty() && text->size() <= 360) {
-          topic = *text;
+          topic = agentkit_preview::PresentationTopic(*text);
         }
         break;
       }
@@ -2570,13 +2570,49 @@ View PreviewShell() {
       } else error = "Approve the copy in the source conversation";
     });
   };
-  const auto change_metadata = [service, selected, selecting, error](kit::SessionSummary item, kit::SessionMetadataChange change) {
-    UseApplicationTaskScope().Launch([service, selected, selecting, error, item, change = std::move(change)]() -> Task<void> {
+  const auto can_stop_and_delete = [](const kit::SessionSummary& item) {
+    return item.active_run && item.run_state == kit::RunState::WaitingForInput && item.pending_interactions;
+  };
+  const auto change_metadata = [service, selected, selecting, error, can_stop_and_delete,
+      changed = UseString(::app::strings::ui_delete_pending_task_changed),
+      stopping = UseString(::app::strings::ui_delete_pending_task_stopping)](
+          kit::SessionSummary item, kit::SessionMetadataChange change) {
+    UseApplicationTaskScope().Launch([service, selected, selecting, error, item, change = std::move(change),
+                                     can_stop_and_delete, changed, stopping]() -> Task<void> {
+      const bool deleting = std::holds_alternative<kit::DeleteSession>(change);
+      if (deleting && can_stop_and_delete(item)) {
+        auto opened = co_await service->runtime->Sessions().OpenAsync(item.id);
+        if (!opened.Succeeded()) { error = opened.Error().message; co_return; }
+        const auto& conversation = opened.Value();
+        auto current = conversation->Snapshot();
+        if (!current || current->summary.metadata_revision != item.metadata_revision ||
+            (current->summary.active_run && (current->summary.active_run != item.active_run ||
+                (!can_stop_and_delete(current->summary) && current->summary.run_state != kit::RunState::Cancelling)))) {
+          error = changed;
+          co_return;
+        }
+        if (current->summary.active_run && current->summary.run_state != kit::RunState::Cancelling) {
+          auto cancelled = co_await conversation->CancelAsync(kit::NewCommandId(), *item.active_run);
+          if (!cancelled.Succeeded() && cancelled.Error().code != kit::ErrorCode::AlreadyClosed) {
+            error = cancelled.Error().message;
+            co_return;
+          }
+        }
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        while ((current = conversation->Snapshot()) && current->summary.active_run == item.active_run &&
+               std::chrono::steady_clock::now() < deadline) co_await Delay(30ms);
+        if (!current || current->summary.metadata_revision != item.metadata_revision ||
+            (current->summary.active_run && current->summary.active_run != item.active_run)) {
+          error = changed;
+          co_return;
+        }
+        if (current->summary.active_run) { error = stopping; co_return; }
+      }
       const auto command = kit::NewCommandId();
       auto updated = co_await service->runtime->Sessions().UpdateMetadataAsync(command, item.id, item.metadata_revision, change);
       if (!updated.Succeeded()) { error = updated.Error().message; co_return; }
       error = "";
-      if (std::holds_alternative<kit::DeleteSession>(change)) {
+      if (deleting) {
         EditNavigation(service, [id = item.id](NavigationPreferences& navigation) {
           navigation.memberships.erase(id);
           return kit::AgentResult<void>::Success();
@@ -2599,7 +2635,7 @@ View PreviewShell() {
   };
   const auto render_session = [&](const kit::SessionSummary& item) {
     return SessionRow(item, selected->id == item.id && !showing_pending.Get(), GroupFor(nav, item.id).has_value(), open_session,
-        [item, copy_conversation, show_worktree, service, dialogs, change_metadata, transfer] {
+        [item, copy_conversation, show_worktree, service, dialogs, change_metadata, transfer, can_stop_and_delete] {
       std::vector<MenuEntry> entries{MenuItem(::app::strings::ui_rename_conversation, [dialogs, item, change_metadata] {
         agentkit_preview::ShowPreviewDialog(dialogs, DialogFactory{[item, change_metadata](DialogContext context) {
           return NavigationNameDialog(context, ::app::strings::ui_rename_conversation, item.title,
@@ -2635,17 +2671,19 @@ View PreviewShell() {
       entries.emplace_back(MenuItem(::app::strings::ui_copy_conversation, [item, copy_conversation] { copy_conversation(item); }));
       if (native_workspace && item.agent.id == agentkit_preview::CodeAgent)
         entries.emplace_back(MenuItem(::app::strings::ui_copy_to_worktree, [item, show_worktree] { show_worktree(item, {}); }));
-      entries.emplace_back(MenuItem(::app::strings::ui_delete_conversation, [item, dialogs, change_metadata] {
-        agentkit_preview::ShowPreviewDialog(dialogs, DialogFactory{[item, change_metadata](DialogContext context) {
-          return Column{Text(::app::strings::ui_delete_conversation, TextRole::Title), Text(item.title, TextRole::Label),
-              Text(::app::strings::ui_this_removes_the_conversation_and_its_group),
+      const bool stop_first = can_stop_and_delete(item);
+      const auto title = stop_first ? ::app::strings::ui_stop_and_delete_conversation : ::app::strings::ui_delete_conversation;
+      entries.emplace_back(MenuItem(title, [item, dialogs, change_metadata, stop_first, title] {
+        agentkit_preview::ShowPreviewDialog(dialogs, DialogFactory{[item, change_metadata, stop_first, title](DialogContext context) {
+          return Column{Text(title, TextRole::Title), Text(item.title, TextRole::Label),
+              Text(stop_first ? ::app::strings::ui_stop_and_delete_description : ::app::strings::ui_this_removes_the_conversation_and_its_group),
               Row{Spacer(), Button(::app::strings::ui_cancel).OnClick([context] { context.Dismiss(); }),
-                  Button(::app::strings::ui_delete).OnClick([context, item, change_metadata] {
+                  Button(stop_first ? ::app::strings::ui_stop_and_delete : ::app::strings::ui_delete).OnClick([context, item, change_metadata] {
                     change_metadata(item, kit::DeleteSession{});
                     context.Dismiss();
                   })}.With(Spacing(8.0F))}.With(Frame{.width = 400.0F}, Padding(24.0F), Spacing(14.0F));
         }});
-      }).Enabled(!item.active_run));
+      }).Enabled(!item.active_run || stop_first));
       return entries;
     }).Key("session-row/" + item.id.value);
   };
@@ -2893,7 +2931,7 @@ View PreviewShell() {
           .draft = composer.text,
           .run_controls = kit::AgentChatRunControls{composer.next,
               [service, goal_session, conversation_action_style, next = composer.next, skills = composer.skills,
-               error = composer.preference_error, sources = composer.sources](
+               error = composer.preference_error, sources = composer.sources, draft = composer.text](
                   const kit::SessionSummary& summary, std::optional<kit::RunStartBinding> current) {
                 const auto folder = summary.workspace ? service->workspaces->Find(*summary.workspace) : std::nullopt;
                 std::vector<View> actions{
@@ -2904,6 +2942,8 @@ View PreviewShell() {
                 };
                 if (summary.agent.id == agentkit_preview::GeneralAgent)
                   actions.push_back(agentkit_preview::SkillPicker(service->runtime, {summary.id}, skills));
+                if (summary.agent.id == agentkit_preview::PptAgent)
+                  actions.push_back(agentkit_preview::PresentationReviewChoice(draft));
                 auto caps = service->run_settings->Capabilities(next->model, summary.agent.id);
                 if (current) {
                   const auto active = service->run_settings->Capabilities(current->model, summary.agent.id);
@@ -3147,6 +3187,9 @@ View PreviewShell() {
           draft_action = agentkit_preview::ImportReportControl(service->runtime, project,
               [new_report](agentkit_preview::ImportedPresentationReport report) { new_report = std::move(report); }).Key(project.value);
         }
+        auto review = agentkit_preview::PresentationReviewChoice(draft);
+        if (draft_action) draft_action = Row{std::move(*draft_action), std::move(review)}.With(Spacing(6.0F));
+        else draft_action = std::move(review);
       }
       if (!new_sources->attachments.empty()) compose.push_back(kit::AgentChatAttachmentChips(new_sources));
       const auto caps = service->run_settings->Capabilities(new_start->model, new_agent);

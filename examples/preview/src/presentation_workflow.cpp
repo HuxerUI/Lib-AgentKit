@@ -6,6 +6,8 @@
 #include "release_workflow.h"
 #include "release_skill.h"
 
+#include <ranges>
+
 namespace agentkit_preview {
 namespace {
 
@@ -58,7 +60,39 @@ kit::Async<kit::ToolResult> Invoke(kit::RunContext context, std::string_view sta
   co_return outcome;
 }
 
+bool OutlineReviewLine(std::string_view line) {
+  const auto begin = line.find_first_not_of(" \t\r");
+  if (begin == line.npos) return false;
+  line = line.substr(begin, line.find_last_not_of(" \t\r") - begin + 1);
+  return line == "Review the outline first" || line == "\xe5\x85\x88\xe5\xae\xa1\xe9\x98\x85\xe5\xa4\xa7\xe7\xba\xb2";
+}
+
 } // namespace
+
+std::string PresentationTopic(std::string_view input) {
+  std::string topic;
+  for (auto line : input | std::views::split('\n')) {
+    const std::string_view text(line.begin(), line.end());
+    if (OutlineReviewLine(text)) continue;
+    if (!topic.empty()) topic.push_back('\n');
+    topic.append(text);
+  }
+  return topic;
+}
+
+bool HasOutlineReviewRequest(std::string_view input) {
+  for (auto line : input | std::views::split('\n')) {
+    if (OutlineReviewLine(std::string_view(line.begin(), line.end()))) return true;
+  }
+  return false;
+}
+
+std::string ToggleOutlineReviewRequest(std::string input, std::string_view label) {
+  if (HasOutlineReviewRequest(input)) return PresentationTopic(input);
+  if (!input.empty() && !input.ends_with('\n')) input.push_back('\n');
+  input.append(label);
+  return input;
+}
 
 kit::Async<kit::RunCompletion> RunPresentation(
     kit::RunContext context, kit::RunInput input,
@@ -80,8 +114,9 @@ kit::Async<kit::RunCompletion> RunPresentation(
     if (!exported.Succeeded()) co_return Completion::Failure(exported.Error());
     co_return Completion::Success({.summary = "Presentation exported"});
   }
+  const auto stage = checkpoint ? std::string_view(checkpoint->stage) : std::string_view{};
   if (checkpoint && (checkpoint->schema_version != 1 ||
-      (checkpoint->stage != "brief" && checkpoint->stage != "draft" && checkpoint->stage != "outline"))) {
+      (stage != "brief" && stage != "draft" && stage != "outline" && stage != "review-outline" && stage != "generate"))) {
     co_return Completion::Failure({.code = kit::ErrorCode::Unsupported, .message = "Unknown presentation checkpoint"});
   }
   std::optional<std::size_t> slide_count;
@@ -90,8 +125,11 @@ kit::Async<kit::RunCompletion> RunPresentation(
     if (!definition.Succeeded()) co_return Completion::Failure(definition.Error());
     slide_count = ReleaseSlideCount(definition.Value().completion_conditions);
   }
-  const bool needs_brief = checkpoint ? checkpoint->stage == "brief" :
-      slide_count.has_value() || skill.has_value() || input.work_request.has_value() || input.trigger == kit::RunTrigger::ForkComparison;
+  const bool managed = slide_count.has_value() || skill.has_value() || input.work_request.has_value() ||
+      input.trigger == kit::RunTrigger::ForkComparison;
+  const bool needs_brief = stage == "brief" || (!checkpoint && managed);
+  const bool review_outline = managed || stage == "outline" || stage == "review-outline" ||
+      (stage != "generate" && HasOutlineReviewRequest(input.input.text));
   if (!checkpoint) {
     auto saved = co_await context.SaveCheckpointAsync({.stage = needs_brief ? "brief" : "draft", .schema_version = 1});
     if (!saved.Succeeded()) co_return Completion::Failure(saved.Error());
@@ -105,12 +143,13 @@ kit::Async<kit::RunCompletion> RunPresentation(
     screenshot = *ref;
   }
 
-  const auto data = ReadSuppliedChart(input.input.text);
+  const auto topic = review_outline ? PresentationTopic(input.input.text) : input.input.text;
+  const auto data = ReadSuppliedChart(topic);
   JsonValue outline;
-  if (checkpoint && checkpoint->stage == "outline") {
+  if (stage == "outline" || stage == "review-outline" || stage == "generate") {
     outline = std::move(checkpoint->state);
   } else {
-    auto instruction = "Draft a slide outline for this topic: " + input.input.text + "\n";
+    auto instruction = "Draft a slide outline for this topic: " + topic + "\n";
     if (needs_brief) {
       JsonValue::Object brief_fields{{"kind", JsonValue{std::string(PresentationBrief)}}};
       if (slide_count) brief_fields.emplace("slide_count", JsonValue{static_cast<std::int64_t>(*slide_count)});
@@ -173,29 +212,33 @@ kit::Async<kit::RunCompletion> RunPresentation(
         co_return Completion::Failure({.code = kit::ErrorCode::ProviderFailure, .message = "The model chose an image without a configured image service and prompt"});
     }
     outline = std::move(*response.Value().structured);
-    auto saved = co_await context.SaveCheckpointAsync({.stage = "outline", .schema_version = 1, .state = outline});
+    auto saved = co_await context.SaveCheckpointAsync({
+        .stage = managed ? "outline" : review_outline ? "review-outline" : "generate", .schema_version = 1, .state = outline});
     if (!saved.Succeeded()) co_return Completion::Failure(saved.Error());
   }
 
-  JsonValue::Object review{{"kind", JsonValue{std::string(PresentationOutlineReview)}}, {"outline", std::move(outline)}};
-  if (screenshot) review.emplace("includes_screenshot", JsonValue{true});
-  if (slide_count) review.emplace("slide_count", JsonValue{static_cast<std::int64_t>(*slide_count)});
-  for (const auto& source : input.input.context) {
-    const auto* ref = std::get_if<kit::SharedContextRef>(&source.source);
-    if (!ref || !source.parts.empty() || source.text_range) continue;
-    auto item = co_await context.Projects().ReadContextAsync(*ref);
-    if (!item.Succeeded()) co_return Completion::Failure(item.Error());
-    if (const auto report = ReadImportedReport(item.Value())) {
-      review.emplace("report_name", JsonValue{report->name});
-      review.emplace("report_summary", JsonValue{report->summary});
-      break;
+  if (review_outline) {
+    JsonValue::Object review{{"kind", JsonValue{std::string(PresentationOutlineReview)}}, {"outline", std::move(outline)}};
+    if (screenshot) review.emplace("includes_screenshot", JsonValue{true});
+    if (slide_count) review.emplace("slide_count", JsonValue{static_cast<std::int64_t>(*slide_count)});
+    for (const auto& source : input.input.context) {
+      const auto* ref = std::get_if<kit::SharedContextRef>(&source.source);
+      if (!ref || !source.parts.empty() || source.text_range) continue;
+      auto item = co_await context.Projects().ReadContextAsync(*ref);
+      if (!item.Succeeded()) co_return Completion::Failure(item.Error());
+      if (const auto report = ReadImportedReport(item.Value())) {
+        review.emplace("report_name", JsonValue{report->name});
+        review.emplace("report_summary", JsonValue{report->summary});
+        break;
+      }
     }
+    auto approved = co_await Confirm(context, "outline", {
+        .title = "Review and edit outline", .schema = PresentationOutlineSchema(SlideLayoutField::Optional),
+        .presentation = JsonValue{std::move(review)}});
+    if (!approved.Succeeded()) co_return Completion::Failure(approved.Error());
+    outline = std::move(approved).Value();
   }
-  auto approved = co_await Confirm(context, "outline", {
-      .title = "Review and edit outline", .schema = PresentationOutlineSchema(SlideLayoutField::Optional),
-      .presentation = JsonValue{std::move(review)}});
-  if (!approved.Succeeded()) co_return Completion::Failure(approved.Error());
-  auto approved_deck = ReadPresentationOutline(approved.Value());
+  auto approved_deck = ReadPresentationOutline(outline);
   if (!approved_deck.Succeeded()) co_return Completion::Failure(approved_deck.Error());
   if (slide_count && approved_deck.Value().slides.size() != *slide_count)
     co_return Completion::Failure({.code = kit::ErrorCode::Conflict, .message = "The approved outline does not have the goal's slide count"});
@@ -208,6 +251,8 @@ kit::Async<kit::RunCompletion> RunPresentation(
   const auto artifact = generated.Value().published_artifacts.front();
   if (input.trigger == kit::RunTrigger::ForkComparison)
     co_return Completion::Success({.summary = "Presentation candidate staged", .artifacts = {artifact}});
+  if (!managed && stage != "outline")
+    co_return Completion::Success({.summary = "Presentation ready to preview", .artifacts = {artifact}});
   if (!generated.Value().model_value) co_return Completion::Failure({
       .code = kit::ErrorCode::InvalidState, .message = "The staged presentation has no slide preview"});
   auto preview_outline = std::move(*generated.Value().model_value);

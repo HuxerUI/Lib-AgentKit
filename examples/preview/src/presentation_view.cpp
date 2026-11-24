@@ -1036,15 +1036,24 @@ View StagedPresentationReview(PresentationOutline outline, std::optional<std::si
       .With(Grow(), ScrollBar());
 }
 
+std::string_view PresentationFormKind(const kit::InteractionSnapshot& interaction) {
+  const auto* form = std::get_if<kit::FormRequest>(&interaction.body);
+  const auto* data = form ? std::get_if<JsonValue::Object>(&form->presentation.value) : nullptr;
+  if (!data) return {};
+  const auto found = data->find("kind");
+  if (found == data->end()) return {};
+  const auto* kind = std::get_if<std::string>(&found->second.value);
+  return kind ? std::string_view(*kind) : std::string_view{};
+}
+
 std::optional<View> RenderForm(const kit::InteractionSnapshot& interaction,
                                std::shared_ptr<kit::Conversation> conversation, State<Drafts> drafts,
                                TaskScope tasks, const ButtonStyle& navigation, std::shared_ptr<kit::AgentRuntime> runtime,
                                const ColorScheme& colors, const TextFieldStyle& form_fields, const ButtonStyle& buttons,
-                               const std::string& untitled_slide) {
+                               const std::string& untitled_slide, std::function<void()> submitted) {
+  const auto kind = PresentationFormKind(interaction);
   const auto& form = std::get<kit::FormRequest>(interaction.body);
   const auto* data = std::get_if<JsonValue::Object>(&form.presentation.value);
-  if (!data || !data->contains("kind")) return {};
-  const auto& kind = ReadString(*data, "kind");
   const bool brief = kind == PresentationBrief;
   const bool edit = kind == PresentationOutlineReview;
   const bool preview = kind == PresentationExport;
@@ -1085,13 +1094,15 @@ std::optional<View> RenderForm(const kit::InteractionSnapshot& interaction,
           save(draft);
         }).Key(view_key);
   };
-  auto submit = [tasks, conversation, drafts, save, draft, id = interaction.id, version = interaction.version](
+  auto submit = [tasks, conversation, drafts, save, draft, submitted = std::move(submitted),
+                 id = interaction.id, version = interaction.version](
                     JsonValue answer) mutable {
     if (auto current = drafts->find(id); current != drafts->end() && current->second.submitting) return;
     draft.submitting = true;
     save(draft);
-    tasks.Launch([conversation, drafts, id, version, data = std::move(answer)]() -> Task<void> {
+    tasks.Launch([conversation, drafts, id, version, submitted, data = std::move(answer)]() -> Task<void> {
       auto reply = co_await conversation->SubmitAsync(kit::NewCommandId(), {id, version, std::move(data)});
+      if (reply.Succeeded()) submitted();
       auto current = drafts.Get();
       auto element = current.find(id);
       if (element == current.end()) co_return;
@@ -1608,9 +1619,28 @@ void ConfigurePreviewArtifactReview(kit::AgentChatOptions& options, std::shared_
 }
 
 [[huxerui::composable]]
+View PresentationReviewChoice(State<TextEditingValue> draft) {
+  const auto colors = UseTheme().colors;
+  const auto label = UseString(::app::strings::ui_review_outline_first);
+  const auto selected = HasOutlineReviewRequest(draft->text);
+  const auto style = PresentationNavigationStyle(UseEnvironment<ButtonStyle>(),
+      selected ? colors.on_primary_container : colors.on_surface_variant);
+  return ProvideEnvironment(style, Button(label).OnClick([draft, label] {
+    if (draft->composition) return;
+    draft = TextEditingValue::FromText(ToggleOutlineReviewRequest(draft->text, label));
+  }).With(Enabled(!draft->composition && !draft->text.empty()), Semantics{.selected = selected}))
+      .Key("ppt-outline-choice");
+}
+
+[[huxerui::composable]]
 View PresentationChat(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<kit::AgentRuntime> runtime,
                       kit::AgentChatOptions base_options) {
   const auto drafts = UseState(Drafts{});
+  const auto page = UseState(kit::AgentChatPage{});
+  const auto requested = UseState(base_options.interaction_request);
+  const auto next_ticket = UseState(std::uint64_t{});
+  Lifecycle([requested, external = base_options.interaction_request] { requested = external; },
+      base_options.interaction_request);
   const auto review_pages = UseState(PresentationReviewPages{});
   const auto tasks = UseTaskScope();
   const auto colors = UseTheme().colors;
@@ -1619,10 +1649,42 @@ View PresentationChat(std::shared_ptr<kit::Conversation> conversation, std::shar
   const auto form_fields = PreviewFormFieldStyle(UseEnvironment<TextFieldStyle>(), colors);
   const auto untitled_slide = UseString(::app::strings::ui_untitled_slide);
   auto options = base_options;
-  options.render_form = [drafts, tasks, runtime, navigation, colors, form_fields, buttons, untitled_slide, fallback = base_options.render_form](
+  options.page = page;
+  options.interaction_request = requested.Get();
+  options.render_form = [drafts, tasks, runtime, navigation, colors, form_fields, buttons, untitled_slide,
+                         page, requested, next_ticket, fallback = base_options.render_form](
       const kit::InteractionSnapshot& request, std::shared_ptr<kit::Conversation> session) -> std::optional<View> {
-    if (auto rendered = RenderForm(request, session, drafts, tasks, navigation, runtime, colors, form_fields, buttons, untitled_slide)) return rendered;
-    return fallback ? fallback(request, std::move(session)) : std::nullopt;
+    const auto kind = PresentationFormKind(request);
+    if (kind != PresentationBrief && kind != PresentationOutlineReview && kind != PresentationExport)
+      return fallback ? fallback(request, std::move(session)) : std::nullopt;
+    const auto shown = page.Get();
+    if (const auto* interaction = std::get_if<kit::InteractionId>(&shown); interaction && *interaction == request.id) {
+      return RenderForm(request, session, drafts, tasks, navigation, runtime, colors, form_fields, buttons, untitled_slide,
+          [requested, id = request.id] {
+            if (const auto pending = requested.Get(); pending && pending->interaction == id) requested = std::nullopt;
+          });
+    }
+    const auto label = kind == PresentationBrief ? ::app::strings::ui_open_presentation_brief :
+        kind == PresentationOutlineReview ? ::app::strings::ui_open_presentation_outline : ::app::strings::ui_open_presentation_export;
+    const auto open = [requested, next_ticket, id = request.id] {
+      auto ticket = next_ticket.Get() + 1;
+      if (const auto previous = requested.Get()) ticket = std::max(ticket, previous->ticket + 1);
+      next_ticket = ticket;
+      requested = kit::AgentChatInteractionRequest{id, ticket};
+    };
+    const Frame icon{.width = 16.0F, .height = 16.0F};
+    return Column{Row{Image(::app::images::slides).Tint(colors.on_surface_variant).With(icon),
+        Text(label, TextRole::Label).With(Grow()),
+        Image(::app::images::chevron_right).Tint(colors.on_surface_variant).With(icon)}
+        .OnClick(open).On<ViewEvents::KeyDown>([open](const KeyEvent& event) {
+          if (event.key != Key::Enter && event.key != Key::Space) return false;
+          if (!event.repeat) open();
+          return true;
+        }).With(Padding(EdgeInsets::Symmetric(10.0F, 8.0F)), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center),
+            Border{colors.outline}, CornerRadius(8.0F), Background(colors.surface_container_low), Focusable{},
+            PointerCursor(PointerCursorKind::Hand), Tooltip(::app::strings::ui_open_presentation_review),
+            Semantics{.role = SemanticRole::Button, .label = label}).Key("open-ppt-form")}
+        .With(CrossAlign(CrossAxisAlignment::Stretch));
   };
   if (!options.render_artifact) ConfigurePreviewArtifactReview(options, runtime, review_pages);
   return PreviewChat(std::move(conversation), std::move(options));

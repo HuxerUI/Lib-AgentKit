@@ -916,7 +916,7 @@ kit::ToolResourceResolver PresentationResources(PresentationFiles files,
 kit::AgentResult<void> RegisterPresentationTools(
     const std::shared_ptr<kit::AgentRuntime>& runtime, PresentationFiles files, PresentationImageProvider image_provider) {
   auto generation = runtime->RegisterTool({
-      .id = GeneratePresentation, .version = 1, .description = "Stage a presentation from its confirmed outline",
+      .id = GeneratePresentation, .version = 1, .description = "Stage a presentation from its generated or reviewed outline",
       .input_schema = PresentationOutlineSchema(SlideLayoutField::Optional, true), .effect = kit::ToolEffect::StageArtifact,
       .prepare = [](kit::ToolPrepareContext context, kit::ToolRequest request) -> kit::Async<kit::PreparedChange> {
         auto outline = ReadPresentationOutline(request.arguments);

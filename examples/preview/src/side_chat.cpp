@@ -308,7 +308,8 @@ View SelectionMenu(std::shared_ptr<kit::Conversation> conversation, kit::AgentCh
 View PreviewChat(std::shared_ptr<kit::Conversation> conversation, kit::AgentChatOptions options, std::optional<View> actions) {
   const auto chrome = UseEnvironment<ChatChrome>();
   if (!chrome.header) return kit::AgentChat(conversation, options);
-  const auto page = UseState(kit::AgentChatPage{});
+  const auto local_page = UseState(kit::AgentChatPage{});
+  const auto page = options.page.value_or(local_page);
   auto body = options;
   body.page = page;
   auto header = (*chrome.header)(page.Get(), actions);
