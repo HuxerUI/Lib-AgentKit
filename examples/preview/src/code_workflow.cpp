@@ -390,6 +390,30 @@ static std::function<void()> ObserveCodeSession(std::shared_ptr<kit::Conversatio
   return [load, subscription] { load.Cancel(); subscription->reset(); };
 }
 
+class WorkspaceReviewColumns final : public Layout<WorkspaceReviewColumns> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext& context, ViewNode& node, Constraints constraints) {
+    auto& files = node.ChildAt(0);
+    auto& diff = node.ChildAt(1);
+    const float width = constraints.ConstrainWidth(constraints.HasBoundedWidth() ? constraints.max_width : 804.0F);
+    const bool stack = width < 520.0F;
+    const float gap = stack ? 8.0F : 12.0F;
+    const float files_width = stack ? width : 208.0F;
+    const float files_height = stack ? std::min(122.0F, constraints.max_height / 3.0F) : constraints.max_height;
+    const auto files_size = context.Measure(files, {.min_width = files_width, .max_width = files_width,
+        .min_height = !stack && constraints.HasBoundedHeight() ? files_height : 0.0F, .max_height = files_height});
+    const Point origin = stack ? Point{0.0F, files_size.height + gap} : Point{files_width + gap, 0.0F};
+    const float diff_width = width - origin.x;
+    const float diff_height = std::max(0.0F, constraints.max_height - origin.y);
+    const auto diff_size = context.Measure(diff, {.min_width = diff_width, .max_width = diff_width,
+        .min_height = constraints.HasBoundedHeight() ? diff_height : 0.0F, .max_height = diff_height});
+    const float height = std::max(files_size.height, origin.y + diff_size.height);
+    return LayoutResult{}.SetSize(constraints.Constrain({width, height})).Place(files, {}).Place(diff, origin);
+  }
+};
+
 static View WorkspaceFileReview(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<kit::AgentRuntime> runtime,
     kit::ToolCallSnapshot call, std::optional<CodeWorkspace> workspace, File evidence, kit::ArtifactRef artifact);
 
@@ -939,7 +963,6 @@ static View WorkspaceDiffFileRow(std::string label, StringResource status, bool 
 static View WorkspaceFileReview(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<kit::AgentRuntime> runtime,
     kit::ToolCallSnapshot call, std::optional<CodeWorkspace> workspace, File evidence, kit::ArtifactRef artifact) {
   const auto theme = UseTheme();
-  const bool compact = UseViewportClass() == ViewportClass::Compact;
   const auto first = std::ranges::find_if(call.effects, [](const auto& effect) {
     return effect.state == kit::ResourceEffectState::Applied && effect.after;
   });
@@ -962,11 +985,8 @@ static View WorkspaceFileReview(std::shared_ptr<kit::Conversation> conversation,
       Background(theme.colors.surface_container_low), Border{theme.colors.outline}).Key("workspace-review-files");
   const auto& version = *selected.Get();
   auto diff = WorkspaceDiffContent(std::move(conversation), std::move(runtime), call, std::move(evidence), version, false, artifact)
-      .With(Grow()).Key(version.id.value + "/" + version.version);
-  if (compact) return Column{std::move(files).With(Frame{.max_height = 122.0F}), std::move(diff)}
-      .With(Grow(), Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
-  return Row{std::move(files).With(Frame{.width = 208.0F}), std::move(diff)}
-      .With(Grow(), Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch));
+      .Key(version.id.value + "/" + version.version);
+  return WorkspaceReviewColumns{std::move(files), std::move(diff)}.With(Grow());
 }
 
 [[huxerui::composable]]

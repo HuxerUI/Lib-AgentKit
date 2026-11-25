@@ -518,6 +518,11 @@ void PreparePresentation(const Application& application, const File& output) {
   Wait(preview, [&] { return outline_index.Exists() && outline_editor.Exists() &&
       outline_index.One().bounds.x + outline_index.One().bounds.width <= outline_editor.One().bounds.x; },
       "The outline index did not sit next to the editor");
+  const auto focused_request = preview.Find(UiSelector::Key("interaction-review-content"));
+  const float outline_width = focused_request.One().bounds.width;
+  preview.SetWindowMetrics({.viewport = {1760.0F, 1120.0F}});
+  Wait(preview, [&] { return focused_request.One().bounds.width > outline_width + 450.0F; },
+      "The focused outline did not fill the space made available by the wider window");
   title.Tap();
   title.ReplaceText("Approved rollout");
   preview.SetWindowMetrics({.viewport = {430.0F, 760.0F}});
@@ -563,6 +568,9 @@ void PreparePresentation(const Application& application, const File& output) {
       preview.Find(UiSelector::Key("presentation-diagram")).Exists(); },
       "Staged presentation did not preserve the edited slide and its diagram");
   const auto wide_stage = stage.One().bounds;
+  preview.SetWindowMetrics({.viewport = {1760.0F, 1120.0F}});
+  Wait(preview, [&] { return full_slide_visible() && stage.One().bounds.width > wide_stage.width + 350.0F &&
+      ShowsText(preview, "Validated operations"); }, "The preview did not enlarge the selected slide in a wider window");
   preview.SetWindowMetrics({.viewport = {520.0F, 800.0F}});
   Wait(preview, [&] { return full_slide_visible() && stage.One().bounds.height < wide_stage.height &&
       ShowsText(preview, "Validated operations"); },
@@ -691,6 +699,15 @@ void StageDesign(const Application& application, const std::filesystem::path& st
   Wait(preview, [&] {
     return preview.Find(UiSelector::Text("Default to the system setting and expose available choices.")).Exists();
   }, "selecting a node did not show its annotation");
+  const auto board = preview.Find(UiSelector::Key("design-artboard-paint"));
+  const auto original_board = board.One().bounds;
+  preview.SetWindowMetrics({.viewport = {1760.0F, 1120.0F}});
+  Wait(preview, [&] {
+    const auto resized = board.One().bounds;
+    return resized.width > original_board.width + 450.0F &&
+        std::abs(resized.height - resized.width * original_board.height / original_board.width) <= 1.0F &&
+        preview.Find(UiSelector::Key("design-selection/theme")).Exists();
+  }, "The design review did not scale the artboard and preserve its selection");
   if (std::filesystem::exists(storage)) throw std::runtime_error("Unapproved design was written");
 }
 
@@ -813,6 +830,13 @@ void ApproveAndReviseDesign(const Application& application, const std::filesyste
   const auto goal_panel_view = preview.Find(UiSelector::Key("goal-panel"));
   Wait(preview, [&] { return goal_panel_view.Exists() && goal_panel_view.One().bounds.width >= 304.0F &&
       composer.Exists() && composer.One().in_viewport; }, "The desktop goal did not open beside the conversation");
+  preview.SetWindowMetrics({.viewport = {800.0F, 880.0F}});
+  const auto content_area = preview.Find(UiSelector::Key("preview-content"));
+  Wait(preview, [&] { return goal_panel_view.Exists() &&
+      std::abs(goal_panel_view.One().bounds.width - content_area.One().bounds.width) <= 1.0F; },
+      "The undocked goal did not fill the available content area");
+  preview.SetWindowMetrics({.viewport = {1080.0F, 880.0F}});
+  preview.Pump();
   click("Set goal");
   auto objective = preview.Find(UiSelector::Key("goal-objective"));
   Wait(preview, [&] { return objective.Exists() && objective.One().focused; }, "The goal editor did not focus its objective");
@@ -3580,10 +3604,23 @@ void VerifyReviewApproval(const File& root) {
   tabs.Find(UiSelector::Text("settings.html")).Tap();
   Wait(ui, [&] { return patch.Exists() && ReviewedDiff(ui).starts_with("settings.html\n"); },
       "Switching files did not open the other attachment in the same approval");
+  ui.SetWindowMetrics({.viewport = {1080.0F, 880.0F}});
+  ui.Pump();
+  const float editor_width = patch.One().bounds.width;
+  ui.SetWindowMetrics({.viewport = {1760.0F, 940.0F}});
+  Wait(ui, [&] { return patch.One().bounds.width > editor_width + 450.0F &&
+      ReviewedDiff(ui).starts_with("settings.html\n"); }, "The selected diff did not widen with the review page");
+  ui.SetWindowMetrics({.viewport = {520.0F, 420.0F}});
+  ui.Pump();
   CheckText(config, "mode=disabled\n");
   CheckText(settings, SettingsPage(false));
   TapFormButton(ui, "Back to conversation");
-  Wait(ui, [&] { return opener.Find(UiSelector::Focused(true)).Exists(); }, "Returning from the review did not focus its opener");
+  try {
+    Wait(ui, [&] { return opener.Find(UiSelector::Focused(true)).Exists(); }, "Returning from the review did not focus its opener");
+  } catch (...) {
+    static_cast<void>(root.Child("resized-review-return.snapshot").WriteString(ui.CaptureSnapshot().ToString()));
+    throw;
+  }
   if (draft.One().value != "Keep this review draft") throw std::runtime_error("Returning from the review lost the draft");
   ui.SetWindowMetrics({.viewport = {1500.0F, 940.0F}});
   std::string error;
@@ -4984,6 +5021,13 @@ void VerifyForkReview(const File& directory, PublicationInterruption scenario = 
         }) || decks.candidates[0].artifacts == decks.candidates[1].artifacts)
       throw std::runtime_error("The presentation comparison did not retain both candidate outputs");
     side_by_side(decks);
+    const auto candidate = ui.Find(UiSelector::Key(decks.candidates.front().id.value));
+    const float candidate_width = candidate.One().bounds.width;
+    ui.SetWindowMetrics({.viewport = {1760.0F, 900.0F}});
+    Wait(ui, [&] { return candidate.One().bounds.width > candidate_width + 225.0F; },
+        "The candidate detail did not use the wider comparison page");
+    ui.SetWindowMetrics({.viewport = {1080.0F, 900.0F}});
+    ui.Pump();
     Wait(ui, [&] { return ShowsText(ui, "Operational milestones") && ShowsText(ui, "Launch impact"); },
         "Both slide results did not appear together");
     TapFormButton(ui, "Next slide");
@@ -6088,6 +6132,16 @@ void VerifyCodeRevert(const File& directory, CodeRevertCase scenario = CodeRever
     Wait(preview, [&] { return preview.Find(UiSelector::Key("workspace-applied-diff/settings.html")).Exists() &&
         ReviewedDiff(preview).find("Enabled") != std::string::npos; },
         "The review did not display the recorded versions for the selected file");
+    const auto diff = preview.Find(UiSelector::Key("workspace-applied-diff/settings.html"));
+    if (files.One().bounds.x + files.One().bounds.width > diff.One().bounds.x + 1.0F)
+      throw std::runtime_error("The wide diff did not place its file list beside the editor");
+    preview.SetWindowMetrics({.viewport = {680.0F, 880.0F}});
+    Wait(preview, [&] { return files.One().bounds.y + files.One().bounds.height <= diff.One().bounds.y + 1.0F &&
+        ReviewedDiff(preview).find("Enabled") != std::string::npos; },
+        "The file list did not stack in the narrowed review or lost the selected diff");
+    preview.SetWindowMetrics({.viewport = {1080.0F, 880.0F}});
+    Wait(preview, [&] { return files.One().bounds.x + files.One().bounds.width <= diff.One().bounds.x + 1.0F &&
+        scope.One().in_viewport; }, "The expanded diff did not restore its file rail and visible actions");
     scope.Tap();
     Wait(preview, [&] { return preview.Find(ButtonText(prepare_label)).Exists(); }, "The applied change did not offer restore");
   };

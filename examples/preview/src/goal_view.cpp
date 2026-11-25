@@ -450,9 +450,8 @@ View GoalPanel(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<
     return ProvideEnvironment(fields,
         std::move(panel).With(Grow(), Background(colors.surface))).Key("goal-panel");
   }
-  return Row {Spacer(), ProvideEnvironment(fields, std::move(panel).With(Frame{.width = 596.0F})), Spacer()}
-      .With(Grow(), Padding(compact ? 14.0F : 24.0F), CrossAlign(CrossAxisAlignment::Stretch),
-          Background(colors.surface)).Key("goal-panel");
+  return ProvideEnvironment(fields, std::move(panel).With(Grow(), Padding(compact ? 14.0F : 21.0F),
+      Background(colors.surface))).Key("goal-panel");
 }
 
 } // namespace

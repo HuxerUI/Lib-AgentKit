@@ -728,10 +728,11 @@ View ComparisonWorkspace(std::shared_ptr<kit::AgentRuntime> runtime, std::shared
     SelectReview select, std::function<void()> back, OpenSession open_branch, OpenSession open_approval) {
   const auto snapshot = source->Snapshot();
   const auto theme = UseTheme();
-  const float gutter = UseViewportClass() == ViewportClass::Compact ? 14.0F : 22.0F;
+  const auto viewport_class = UseViewportClass();
+  const float gutter = viewport_class == ViewportClass::Compact ? 14.0F : viewport_class == ViewportClass::Medium ? 21.0F : 36.0F;
   auto content = review ? ComparisonDetail(runtime, source, *review, services, select, open_branch, open_approval).Key(review->value) :
       View(ScrollView(ComparisonLibrary(runtime, source, std::move(services), select, open_approval)).With(ScrollBar()));
-  return Row{Spacer(), Column{
+  return Column{
       Row{PreviewBackAction(::app::strings::ui_back_to_conversation, std::move(back), theme).Key("back-to-conversation"),
           Text(snapshot ? snapshot->summary.title : "", TextRole::Title)
               .Style({Font::System(17.0F).WithWeight(FontWeight::SemiBold), theme.colors.on_surface})
@@ -739,8 +740,7 @@ View ComparisonWorkspace(std::shared_ptr<kit::AgentRuntime> runtime, std::shared
           .With(Spacing(8.0F), Frame{.min_height = 44.0F}, CrossAlign(CrossAxisAlignment::Center)),
       Divider(),
       std::move(content).With(Grow(), Padding(EdgeInsets{.top = 14.0F, .bottom = 20.0F})),
-  }.With(Frame{.width = 1040.0F}, CrossAlign(CrossAxisAlignment::Stretch)), Spacer()}
-      .With(Grow(), Padding(EdgeInsets::Symmetric(gutter, 0.0F)), CrossAlign(CrossAxisAlignment::Stretch));
+  }.With(Grow(), Padding(EdgeInsets::Symmetric(gutter, 0.0F)), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
 } // namespace agentkit_preview

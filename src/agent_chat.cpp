@@ -2059,6 +2059,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
   const auto action_style = ChatActionStyle(UseEnvironment<ButtonStyle>(), theme);
   const auto viewport_class = UseViewportClass();
   const bool compact = viewport_class == ViewportClass::Compact;
+  const float gutter = compact ? 14.0F : viewport_class == ViewportClass::Medium ? 21.0F : 36.0F;
   const auto selection = UseState(std::optional<SelectedText>{});
   const auto range_anchor = UseState(std::optional<SourceSlice>{});
   const auto selection_focus = UseState(std::optional<SourceSlice>{});
@@ -2648,6 +2649,17 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
       .Key("agent-chat-history");
   auto history_view = ChatHistoryViewport(std::move(history), history_controller, count, follow_paused, selection,
       part == ChatPart::Messages && layout_style.chat_bubbles && !side_chat, UseEnvironment<IconButtonStyle>(), theme);
+  const auto review_surface = [&](std::vector<View> content, std::string key) {
+    const float inset = compact ? 14.0F : 24.0F;
+    const bool fill_width = layout_style.content_width <= 0.0F;
+    View lane = Column(std::move(content)).With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch)).Key(std::move(key));
+    if (!fill_width) {
+      lane = Row{Spacer(), std::move(lane).With(Frame{.width = 804.0F}), Spacer()}
+          .With(CrossAlign(CrossAxisAlignment::Stretch));
+    }
+    return std::move(lane).With(Grow(), Padding(EdgeInsets::Symmetric(fill_width ? gutter : inset, inset)),
+        Background(theme.colors.surface));
+  };
   std::optional<View> review_page;
   AgentChatPage active_page;
   if (focused_interaction.Get()) active_page = *focused_interaction.Get();
@@ -2712,10 +2724,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
           review_loading.Get(), action_style, theme.colors).With(LayoutPriority(2.0F)));
     }
     if (!error->empty()) details.push_back(Text(error.Get(), TextRole::Label));
-    review_page = Row{Spacer(), Column(std::move(details)).With(Frame{.width = 804.0F}, Spacing(12.0F),
-        CrossAlign(CrossAxisAlignment::Stretch)).Key("artifact-review-content"), Spacer()}
-        .With(Grow(), CrossAlign(CrossAxisAlignment::Stretch), Padding(compact ? 14.0F : 24.0F),
-              Background(theme.colors.surface));
+    review_page = review_surface(std::move(details), "artifact-review-content");
   }
   Lifecycle([binding = options.page, active_page] {
     if (binding) *binding = active_page;
@@ -3040,7 +3049,6 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
   }
   if (has_notices) composer_panel = std::move(composer_panel).With(LayoutPriority(3.0F));
   content.push_back(std::move(composer_panel));
-  const float gutter = compact ? 14.0F : viewport_class == ViewportClass::Medium ? 21.0F : 36.0F;
   View lane = Column(std::move(content)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
   if (layout_style.content_width > 0.0F)
     lane = Row{Spacer(), std::move(lane).With(Frame{.width = layout_style.content_width}), Spacer()}
@@ -3078,9 +3086,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
       }
     }
     if (!error->empty()) request.push_back(Text(error.Get(), TextRole::Label));
-    request_page = Row{Spacer(), Column(std::move(request)).With(Frame{.width = 804.0F}, Spacing(12.0F),
-        CrossAlign(CrossAxisAlignment::Stretch)), Spacer()}.With(Grow(), Padding(compact ? 14.0F : 24.0F),
-              CrossAlign(CrossAxisAlignment::Stretch), Background(theme.colors.surface));
+    request_page = review_surface(std::move(request), "interaction-review-content");
   }
   if (options.page && options.page->Get() != active_page) {
     review_page.reset();

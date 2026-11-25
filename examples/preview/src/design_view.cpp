@@ -100,11 +100,15 @@ View ReviewDesignImpact(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_
       [close = std::move(close)](const kit::AgentChatPage&, std::optional<View>) -> std::optional<View> {
         return Row{Button(::app::strings::ui_close_review).OnClick(close), Spacer()}.With(Padding(14.0F));
       });
-  return ProvideEnvironment(ChatChrome{std::move(chrome)}, PreviewChat(target->owner, std::move(options)));
+  auto layout = UseEnvironment<kit::AgentChatLayoutStyle>();
+  layout.content_width = 0.0F;
+  return ProvideEnvironment(layout, ProvideEnvironment(ChatChrome{std::move(chrome)},
+      PreviewChat(target->owner, std::move(options))));
 }
 
 struct ArtboardSize { using Value = Size; };
 struct ArtboardNodeBounds { using Value = Rect; };
+struct ArtboardFitWidth { using Value = bool; };
 
 Rect DesignBounds(const DesignNode& node) {
   return {static_cast<float>(node.x), static_cast<float>(node.y), static_cast<float>(node.width), static_cast<float>(node.height)};
@@ -116,7 +120,9 @@ public:
 
   static LayoutResult Measure(LayoutContext& context, ViewNode& node, Constraints constraints) {
     const auto natural = *node.LayoutValue<ArtboardSize>();
-    const float scale = std::min({1.0F, constraints.max_width / natural.width, constraints.max_height / natural.height});
+    const float fit = std::min(constraints.max_width / natural.width, constraints.max_height / natural.height);
+    const bool scale_up = node.LayoutValueOr<ArtboardFitWidth>(false) && constraints.HasBoundedWidth();
+    const float scale = scale_up ? fit : std::min(1.0F, fit);
     const Size board{natural.width * scale, natural.height * scale};
     const auto size = constraints.Constrain(board);
     const Point origin{(size.width - board.width) / 2, (size.height - board.height) / 2};
@@ -191,7 +197,7 @@ void PaintDesignNode(PaintContext& paint, const DesignNode& node, Rect bounds, f
   paint.PopClip();
 }
 
-View RenderArtboard(std::shared_ptr<const DesignBoard> board, std::string highlighted, float height,
+View RenderArtboard(std::shared_ptr<const DesignBoard> board, std::string highlighted, std::optional<float> height,
     std::function<void(std::string)> select) {
   const Size natural{static_cast<float>(board->width), static_cast<float>(board->height)};
   const auto order = DesignPaintOrder(*board);
@@ -223,8 +229,9 @@ View RenderArtboard(std::shared_ptr<const DesignBoard> board, std::string highli
           .LayoutValue<ArtboardNodeBounds>(DesignBounds(*node)).Key("design-hit/" + node->id));
     }
   }
-  return ArtboardLayout(std::move(layers)).LayoutValue<ArtboardSize>(natural)
-      .With(Frame{.max_height = height}, Semantics{.label = ::app::strings::ui_design_artboard});
+  auto artboard = ArtboardLayout(std::move(layers)).LayoutValue<ArtboardSize>(natural)
+      .LayoutValue<ArtboardFitWidth>(!height).With(Semantics{.label = ::app::strings::ui_design_artboard});
+  return height ? std::move(artboard).With(Frame{.max_height = *height}) : std::move(artboard);
 }
 
 } // namespace
@@ -272,7 +279,7 @@ public:
   static LayoutResult Measure(LayoutContext& context, ViewNode& node, Constraints constraints) {
     auto& artboard = node.ChildAt(0);
     auto& layers = node.ChildAt(1);
-    const auto width = std::min(constraints.max_width, 1160.0F);
+    const auto width = constraints.ConstrainWidth(constraints.HasBoundedWidth() ? constraints.max_width : 1160.0F);
     const bool split = width >= 680.0F;
     constexpr float gap = 16.0F;
     constexpr float layers_width = 222.0F;
@@ -378,7 +385,7 @@ View DesignDetails(const ReviewedDesign& design, const std::vector<kit::Artifact
   if (source_actions) inspector.push_back(ProvideEnvironment(quiet, std::move(*source_actions)));
   if (inspect) inspector.push_back(ProvideEnvironment(quiet, Button(::app::strings::ui_inspect_impact).OnClick(std::move(inspect))));
   details.push_back(DesignReviewColumns{
-      RenderArtboard(design.board, selected, 420.0F, select).With(Padding(14.0F), CornerRadius(10.0F),
+      RenderArtboard(design.board, selected, std::nullopt, select).With(Padding(14.0F), CornerRadius(10.0F),
           Border{colors.outline}, Background(colors.surface_container_low)).Key("design-review-artboard"),
       Column(std::move(inspector)).With(Spacing(8.0F), Padding(10.0F), CrossAlign(CrossAxisAlignment::Stretch),
           CornerRadius(10.0F), Border{colors.outline}, Background(colors.surface_container)).Key("design-inspector"),
@@ -396,9 +403,10 @@ View DesignDetails(const ReviewedDesign& design, const std::vector<kit::Artifact
     auto actions = Row(std::move(decisions)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
     page.push_back(Row{Spacer(), std::move(actions)});
   }
-  return Row{Column(std::move(page)).With(Frame{.max_width = 1160.0F}, Grow(), Spacing(12.0F),
-      CrossAlign(CrossAxisAlignment::Stretch)).Key("design-review-content")}
-      .With(Grow(), Padding(18.0F), MainAlign(MainAxisAlignment::Center), CrossAlign(CrossAxisAlignment::Stretch));
+  const auto viewport_class = UseViewportClass();
+  const float gutter = viewport_class == ViewportClass::Compact ? 14.0F : viewport_class == ViewportClass::Medium ? 21.0F : 36.0F;
+  return Column(std::move(page)).With(Grow(), Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch),
+      Padding(EdgeInsets::Symmetric(gutter, 18.0F))).Key("design-review-content");
 }
 
 } // namespace

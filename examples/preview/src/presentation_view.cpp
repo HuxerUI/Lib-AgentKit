@@ -282,8 +282,10 @@ public:
 
   static LayoutResult Measure(LayoutContext& context, ViewNode& node, Constraints constraints) {
     constexpr float ratio = static_cast<float>(PresentationWidth) / PresentationHeight;
-    const auto limit = node.LayoutValueOr<SlideHeightLimit>(490.0F);
-    const auto width = std::min(constraints.max_width, std::min(constraints.max_height, limit) * ratio);
+    const auto limit = node.LayoutValue<SlideHeightLimit>();
+    const auto height_limit = limit ? std::min(constraints.max_height, *limit) : constraints.max_height;
+    const auto width = constraints.HasBoundedWidth() || constraints.HasBoundedHeight() || limit
+        ? std::min(constraints.max_width, height_limit * ratio) : static_cast<float>(PresentationWidth);
     const auto height = width / ratio;
     const auto viewport = constraints.Constrain({width, height});
     auto& slide = node.ChildAt(0);
@@ -396,7 +398,7 @@ SlideScene FitSlideText(SlideScene scene, TextMeasurer& measurer) {
 [[huxerui::composable]]
 View VisualPresentationSlide(SlideScene scene, std::optional<PresentationChart> chart,
     std::shared_ptr<kit::AgentRuntime> runtime, std::optional<kit::ArtifactRef> artifact, std::size_t page,
-    std::function<void(std::size_t)> select, float height_limit = 490.0F, std::optional<View> screenshot = {}) {
+    std::function<void(std::size_t)> select, std::optional<float> height_limit, std::optional<View> screenshot) {
   const auto tasks = UseTaskScope();
   const auto fitted_scene = FitSlideText(scene, UseTextMeasurer());
   const auto temporary = PictureReviewDirectory(UseApplication());
@@ -481,7 +483,8 @@ View VisualPresentationSlide(SlideScene scene, std::optional<PresentationChart> 
   if (scene.screenshot && screenshot)
     elements.push_back(View(*screenshot).LayoutValue<SlideElementBounds>(*scene.screenshot));
   auto surface = SlideSceneLayout(std::move(elements)).With(ClipChildren{}, CornerRadius(5.0F)).Key("presentation-slide");
-  return PresentationViewport{std::move(surface)}.LayoutValue<SlideHeightLimit>(height_limit);
+  View viewport = PresentationViewport{std::move(surface)};
+  return height_limit ? std::move(viewport).LayoutValue<SlideHeightLimit>(*height_limit) : std::move(viewport);
 }
 
 View PreviewSlideControls(const PresentationOutline& outline, std::size_t page,
@@ -933,7 +936,7 @@ View StagedPresentationReview(PresentationOutline outline, std::optional<std::si
         auto begin = slide.title.size() + 1;
         for (std::size_t i = 1; i < field; ++i) begin += slide.bullets[i - 1].size() + 1;
         select_field(begin, slide.bullets[field - 1].size());
-      }, 490.0F, std::move(screenshot)).Key(part.value);
+      }, std::nullopt, std::move(screenshot)).With(Grow()).Key(part.value);
   std::vector<View> content{
       PreviewSlideControls(outline, index, [pages, version, selection](std::size_t value) {
         selection = std::nullopt;
@@ -950,8 +953,7 @@ View StagedPresentationReview(PresentationOutline outline, std::optional<std::si
                                           : selected->parts.front().value;
     content.push_back(PreviewSourceActions(conversation, *selected, draft).Key(key));
   }
-  return ScrollView(Column(std::move(content)).With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch)))
-      .With(Grow(), ScrollBar());
+  return Column(std::move(content)).With(Grow(), Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
 std::string_view PresentationFormKind(const kit::InteractionSnapshot& interaction) {

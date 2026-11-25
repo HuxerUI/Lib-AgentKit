@@ -192,7 +192,8 @@ using AgentChatPage = std::variant<std::monostate, InteractionId, AgentChatRevie
 /// @brief Optional layout and activity presentation for AgentChat().
 /// Provide it with ProvideEnvironment() around a conversation or a group of conversations.
 struct AgentChatLayoutStyle {
-  /// Preferred content width in logical pixels. Use zero to fill the available width.
+  /// Preferred conversation width in logical pixels. Use zero to fill the available width in the
+  /// conversation, artifact reviews, and focused interaction pages.
   float content_width = 672.0F;
   /// Uses chat bubbles and the compact composer layout.
   bool chat_bubbles = false;
