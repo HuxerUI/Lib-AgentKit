@@ -253,6 +253,7 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HU
             examples/preview/src/preview_settings.cpp
             examples/preview/src/release_workflow.cpp
             examples/preview/src/side_chat.cpp
+            examples/preview/src/single_instance.cpp
             examples/preview/src/workspace_evidence.cpp
             examples/preview/src/worktree.cpp
             examples/preview/src/presentation.cpp

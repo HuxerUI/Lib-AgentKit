@@ -22,6 +22,7 @@
 #include "release_skill.h"
 #include "report_chart.h"
 #include "side_chat.h"
+#include "single_instance.h"
 #include "chat_chrome.h"
 #include "run_settings.h"
 #include "preview_settings.h"
@@ -2428,6 +2429,26 @@ View PreviewShell() {
     service->reload_navigation = true;
     SaveNavigation(service);
   });
+
+#if !defined(AGENTKIT_PREVIEW_TEST)
+  {
+    const auto window = UseWindow();
+    const auto app_tasks = UseApplicationTaskScope();
+    Lifecycle([window, app_tasks] {
+      agentkit_preview::single_instance::SetActivationHandler([window, app_tasks] {
+        app_tasks.Post([window] {
+          if (!window.IsOpen()) {
+            return;
+          }
+          window.Restore();
+          window.Show();
+          window.Activate();
+        });
+      });
+      return [] { agentkit_preview::single_instance::ClearActivationHandler(); };
+    });
+  }
+#endif
 
   Lifecycle([comparison_entry, focus_comparison_entry] {
     if (focus_comparison_entry.Get()) {
