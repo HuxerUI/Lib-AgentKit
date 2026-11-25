@@ -53,6 +53,72 @@ constexpr unsigned muted = 0x655D54;
 constexpr unsigned red = 0xB63A29;
 constexpr unsigned line = 0xCCBFAF;
 
+SlideRect PreviewRect(SlideRect emu) {
+  constexpr auto unit = PresentationWidth / 1280;
+  return {emu.x / unit, emu.y / unit, std::max(1, emu.width / unit), std::max(1, emu.height / unit)};
+}
+
+SlideScene ComposeClassicSlide(const PresentationOutline& outline, std::size_t page, SlideLayout layout, bool has_screenshot) {
+  const auto& slide = outline.slides[page];
+  const bool cover = layout == SlideLayout::Cover;
+  const auto accent = cover ? 0x8DE2C6U : 0x166F62U;
+  const auto title_ink = cover ? 0xF6FBF9U : 0x172B30U;
+  const auto body_ink = cover ? 0xC9E2D9U : 0x33474BU;
+  SlideScene result{.background = cover ? 0x102C2CU : 0xF7F9F7U};
+  const auto shape = [&](SlideRect bounds, unsigned color, SlideShape form = SlideShape::Rectangle, int radius = 0) {
+    result.elements.push_back({.bounds = PreviewRect(bounds), .shape = form, .color = color, .corner_radius = radius});
+  };
+  const auto text = [&](SlideRect bounds, const std::string& value, int size, unsigned color, bool bold = false,
+                        std::optional<std::size_t> excerpt = {}, bool vertically_centered = false) {
+    result.elements.push_back({.bounds = PreviewRect(bounds), .shape = SlideShape::Text, .color = color,
+        .text = value, .size = size, .bold = bold, .excerpt = excerpt, .vertically_centered = vertically_centered});
+  };
+  shape({880000, 587000, 46000, 250000}, accent);
+  if (cover) {
+    shape({8350000, 1870000, 2870000, 2870000}, 0x1D4B48, SlideShape::Circle);
+    shape({8670000, 2190000, 2230000, 2230000}, 0x102C2C, SlideShape::Circle);
+    shape({9330000, 2850000, 910000, 910000}, 0x265A51, SlideShape::Circle);
+    shape({10590000, 2120000, 460000, 460000}, accent, SlideShape::Circle);
+  } else {
+    shape({880000, 2350000, 10432000, 18000}, 0xD1DEDA);
+  }
+  text({1050000, 573000, 10200000, 430000}, outline.title, 17, accent, true);
+  text({880000, cover ? 2020000 : 1110000, cover ? 7250000 : 10432000, cover ? 1550000 : 1170000},
+      slide.title, cover ? 61 : 44, title_ink, true, 0);
+
+  const auto count = static_cast<int>(slide.bullets.size());
+  if (layout == SlideLayout::List || cover) {
+    const auto y = cover ? 3690000 : 2680000;
+    const auto width = has_screenshot ? 3650000 : cover ? 7020000 : 10100000;
+    const auto step = std::min(650000, (cover ? 1600000 : 3560000) / std::max(1, count));
+    for (int i = 0; i < count; ++i) {
+      const auto top = y + i * step;
+      if (!cover) text({880000, top, 235000, step - 55000}, "\xe2\x80\xa2", 22, accent);
+      const auto indent = cover ? 0 : 282000;
+      text({880000 + indent, top, width - indent, step - 55000}, slide.bullets[i],
+          cover ? 28 : has_screenshot ? 23 : 27, body_ink, false, i + 1);
+    }
+    if (has_screenshot) result.screenshot = PreviewRect({4870000, 2440000, 6390000, 3970000});
+    return result;
+  }
+
+  const bool flow = layout == SlideLayout::Flow;
+  for (int i = 0; i < count; ++i) {
+    const auto card = ClassicDiagramCard(layout, count, i);
+    const bool alternate = layout == SlideLayout::Comparison && i == 1;
+    const bool compact = slide.bullets[i].size() > 72;
+    const auto size = flow && count > 2 ? (compact ? 22 : 26) : (compact ? 25 : 29);
+    shape(card, alternate ? 0xE8EEF8 : flow ? 0xE4EFEB : 0xEAF1EE, SlideShape::Rectangle, 10);
+    if (!flow)
+      shape({card.x + 185000, card.y + 115000, 280000, 46000}, alternate ? 0x5374AC : 0x288779);
+    text({card.x + 205000, card.y + 130000, card.width - 410000, card.height - 260000}, slide.bullets[i], size,
+        alternate ? 0x273B5D : 0x163C36, !compact, i + 1, true);
+    if (flow && i + 1 < count)
+      shape({card.x + card.width + 70000, card.y + card.height / 2 - 61000, 240000, 122000}, 0x288779, SlideShape::RightArrow);
+  }
+  return result;
+}
+
 } // namespace
 
 std::optional<PresentationChart> ReadSuppliedChart(std::string_view text) {
@@ -132,9 +198,19 @@ std::string DescribePresentationData(const std::optional<PresentationChart>& sup
   return result;
 }
 
-SlideScene ComposeSlide(const PresentationOutline& outline, std::size_t page) {
+SlideRect ClassicDiagramCard(SlideLayout layout, int count, int index) {
+  const bool flow = layout == SlideLayout::Flow;
+  const int columns = flow ? count : 2;
+  const int gap = flow ? 380000 : 290000;
+  const int width = (10432000 - gap * (columns - 1)) / columns;
+  const int height = !flow && count > 2 ? 1490000 : 2070000;
+  return {880000 + (index % columns) * (width + gap), 2740000 + (index / columns) * (height + gap), width, height};
+}
+
+SlideScene ComposeSlide(const PresentationOutline& outline, std::size_t page, bool has_screenshot) {
   const auto& slide = outline.slides[page];
-  const auto layout = ResolveSlideLayout(outline, page);
+  const auto layout = ResolveSlideLayout(outline, page, has_screenshot);
+  if (!UsesSlideScene(layout, slide)) return ComposeClassicSlide(outline, page, layout, has_screenshot);
   const bool embedded = slide.media && slide.media->starts_with("embedded");
   const bool cover = layout == SlideLayout::Image && (embedded ? *slide.media == "embedded-cover" : page == 0);
   const bool close = layout == SlideLayout::Image && (embedded ? *slide.media == "embedded-close" :

@@ -21,6 +21,8 @@
 #include "../examples/preview/src/local_files.h"
 #include "../examples/preview/src/markdown_images.h"
 #include "../examples/preview/src/preview_json.h"
+#include "../examples/preview/src/preview_settings.h"
+#include "../examples/preview/src/preview_theme.h"
 #include "../examples/preview/src/presentation.h"
 #include "../examples/preview/src/presentation_tools.h"
 #include "../examples/preview/src/presentation_view.h"
@@ -478,8 +480,7 @@ void DraftPresentationOutline(UiTest& preview) {
   ChooseDraftAssistant(preview, "PPT");
   auto prompt = preview.Find(UiSelector::Key("new-conversation-composer"));
   FocusPreviewEditor(preview, prompt, "The presentation draft did not receive focus");
-  prompt.ReplaceText("Product rollout");
-  TapControl(preview, UiSelector::Key("ppt-outline-choice"), "The outline review option was unavailable");
+  prompt.ReplaceText("Product rollout\nReview the outline first");
   Wait(preview, [&] { return preview.Find(ButtonText("Send")).One().enabled; }, "PPT conversation is not ready");
   preview.Find(ButtonText("Send")).Tap();
   const auto card = preview.Find(UiSelector::Key("open-ppt-form"));
@@ -1296,8 +1297,48 @@ void VerifyDirectPresentation(const File& root) {
   constexpr auto review = "Draft deck for review";
   {
     UiTest ui(application, {.viewport = {1080.0F, 880.0F}, .resource_provider = std::make_shared<PreviewTestResources>()});
-    ChooseDraftAssistant(ui, "PPT");
     auto draft = ui.Find(UiSelector::Key("new-conversation-composer"));
+    const auto model = ui.Find(UiSelector::Key("run-model"));
+    const auto permission = ui.Find(UiSelector::Key("run-permissions"));
+    const auto send = ui.Find(UiSelector::Key("chat-send/Send"));
+    const auto review_action = ui.Find(UiSelector::Key("ppt-outline-choice"));
+    const auto same_row = [&] {
+      if (!model.Exists() || !permission.Exists() || !send.Exists()) return false;
+      const auto model_button = model.One();
+      const auto access = permission.One();
+      const auto send_button = send.One();
+      const auto left = model_button.bounds;
+      const auto middle = access.bounds;
+      const auto right = send_button.bounds;
+      const auto center_y = [](Rect box) { return box.y + box.height / 2.0F; };
+      return model_button.in_viewport && access.in_viewport && send_button.in_viewport &&
+          left.x + left.width <= middle.x && middle.x + middle.width <= right.x &&
+          std::abs(center_y(left) - center_y(right)) < 1.0F && std::abs(center_y(middle) - center_y(right)) < 1.0F;
+    };
+    for (const auto viewport : {Size{1080.0F, 880.0F}, Size{520.0F, 650.0F}}) {
+      ui.SetWindowMetrics({.viewport = viewport});
+      const bool compact = viewport.width == 520.0F;
+      Wait(ui, [&] { return draft.Exists() && ui.Find(UiSelector::Key("open-navigation")).Exists() == compact; },
+          "The new conversation did not settle after resizing");
+      ui.Pump(250ms);
+      const auto choose = [&](const char* assistant) {
+        try {
+          ChooseDraftAssistant(ui, assistant);
+        } catch (const std::exception& error) {
+          throw std::runtime_error(std::string(error.what()) + ": " + assistant + " at width " + std::to_string(viewport.width));
+        }
+      };
+      choose("General");
+      Wait(ui, same_row, "The general composer did not align its toolbar");
+      const auto editor_bounds = draft.One().bounds;
+      const auto send_bounds = send.One().bounds;
+      choose("PPT");
+      Wait(ui, same_row, "The PPT composer did not align its toolbar");
+      if (review_action.Exists() || std::abs(draft.One().bounds.y - editor_bounds.y) >= 1.0F ||
+          std::abs(send.One().bounds.x - send_bounds.x) >= 1.0F || std::abs(send.One().bounds.y - send_bounds.y) >= 1.0F)
+        throw std::runtime_error("Switching to PPT moved the editor or send control, or added an outline toggle");
+    }
+    ui.SetWindowMetrics({.viewport = {1080.0F, 880.0F}});
     FocusPreviewEditor(ui, draft, "The PPT composer did not acquire focus");
     draft.ReplaceText(direct);
     TapFormButton(ui, "Send");
@@ -1313,8 +1354,7 @@ void VerifyDirectPresentation(const File& root) {
     TapControl(ui, UiSelector::Key("new-conversation"), "Could not return to the new conversation composer");
     ChooseDraftAssistant(ui, "PPT");
     FocusPreviewEditor(ui, draft, "The review request composer did not acquire focus");
-    draft.ReplaceText(review);
-    TapControl(ui, UiSelector::Key("ppt-outline-choice"), "The outline review was not selectable");
+    draft.ReplaceText(std::string(review) + "\nReview the outline first");
     TapFormButton(ui, "Send");
     OpenPptForm(ui, UiSelector::Key("slide-title-0"));
     TapFormButton(ui, "Back to conversation");
@@ -2506,6 +2546,7 @@ constexpr auto MarkdownReportUrl = "https://example.test/report?part=2#verified"
 constexpr auto MarkdownSelectionWord = "\xe6\x96\xb9\xe6\xa1\x88\xf0\x9f\x98\x80";
 constexpr auto MarkdownSecondDelta = " another delta\n\n**\xe6\x96\xb9\xe6\xa1\x88\xf0\x9f\x98\x80** "
     "[\xe6\x96\xb9\xe6\xa1\x88\xf0\x9f\x98\x80](https://example.test/unselected) &amp;\n\n```cpp\nconst int ready = 1;\n```\n\n"
+    "Run `check()` before publishing.\n\n"
     "| Check | Result |\n| --- | --- |\n| Render | Pass |\n\n"
     "[Verification report](https://example.test/report?part=2#verified)\n\n[Local path](file:///report.txt)\n";
 
@@ -2640,7 +2681,8 @@ void VerifyComposerIme(const File& root) {
   if (first.One().value != "Stream review\n" + chinese) throw std::runtime_error("The first composer lost committed text");
   Wait(ui, [&] { return send.One().enabled; }, "The committed first message cannot be sent");
   ui.PressKey(Key::Enter);
-  Wait(ui, [&] { return composer.Exists() && stop.Exists() && send_mode.Exists() && ShowsText(ui, "The model is streaming"); },
+  Wait(ui, [&] { return composer.Exists() && stop.Exists() && !send.Exists() && !send_mode.Exists() &&
+       ShowsText(ui, "The model is streaming"); },
        "The first model delta did not appear");
   if (!composer_model_icon.Exists() || !composer_model_icon.One().in_viewport)
     throw std::runtime_error("The selected model icon was missing from the active conversation composer");
@@ -2657,13 +2699,24 @@ void VerifyComposerIme(const File& root) {
   if (user_bubble.One().bounds.width >= 180.0F ||
       user_bubble.One().bounds.x + user_bubble.One().bounds.width >= user_avatar.One().bounds.x)
     throw std::runtime_error("A short outgoing message did not fit its text beside the right avatar");
-  const auto original_send = send.One().bounds;
+  const auto stop_slot = stop.One().bounds;
   const auto options = ui.Find(UiSelector::Key("run-model"));
   const auto original_options = options.One().bounds;
   const auto same_box = [](Rect left, Rect right) {
     return std::abs(left.x - right.x) < 1.0F && std::abs(left.y - right.y) < 1.0F &&
         std::abs(left.width - right.width) < 1.0F && std::abs(left.height - right.height) < 1.0F;
   };
+  FocusPreviewEditor(ui, composer, "The running composer did not receive focus");
+  composer.ReplaceText("Draft follow-up");
+  Wait(ui, [&] { return send.Exists() && send_mode.Exists() && stop.Exists(); }, "Draft actions did not appear");
+  const auto original_send = send.One().bounds;
+  const auto position = [](Rect bounds) {
+    return std::to_string(bounds.x) + ", " + std::to_string(bounds.y) + " (" +
+        std::to_string(bounds.width) + " × " + std::to_string(bounds.height) + ")";
+  };
+  if (!same_box(stop_slot, original_send) || !same_box(original_options, options.One().bounds))
+    throw std::runtime_error("Typing a follow-up moved the toolbar. Primary action: " + position(stop_slot) + " to " +
+        position(original_send) + "; model: " + position(original_options) + " to " + position(options.One().bounds));
   const auto mode = [&](const char* label, const char* send_label) {
     ClickPreviewMouse(ui, send_mode.One().visible_bounds);
     auto item = ui.Find(UiSelector::Text(label));
@@ -3046,7 +3099,8 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
     extended.push_back({message, {}, kit::SourceTextRange{block, start, start + text.size()}});
     model_passages.emplace_back(text);
   };
-  for (const auto* part : {"const int ready = 1;\n", "Check", "Result", "Render", "Pass", "Verification report", "Local path"})
+  for (const auto* part : {"const int ready = 1;\n", "Run ", "check()", " before publishing.",
+                           "Check", "Result", "Render", "Pass", "Verification report", "Local path"})
     add_source(link.message, link.block, part);
   if (verify_images) {
     for (const auto* part : {"Delayed diagram", "Missing diagram", "Damaged diagram", "Local diagram", "Before ",
@@ -3058,7 +3112,7 @@ void VerifyMarkdownSource(const File& root, ImageAsset image = {}) {
   add_source(last.ref, last_block.id, "Streamed heading");
   add_source(last.ref, last_block.id, later_prefix);
   for (auto& part : model_passages) part.insert(0, "Selected passage:\n");
-  auto earlier_excerpt = excerpt + "\nconst int ready = 1;\n\nCheck\nResult\nRender\nPass\nVerification report\nLocal path";
+  auto earlier_excerpt = excerpt + "\nconst int ready = 1;\n\nRun check() before publishing.\nCheck\nResult\nRender\nPass\nVerification report\nLocal path";
   if (verify_images) earlier_excerpt +=
       "\nDelayed diagram\nMissing diagram\nDamaged diagram\nLocal diagram\nBefore Inline icon after.\nFollowing text";
   const auto later_excerpt = "Streamed heading\n" + later_prefix;
@@ -3808,6 +3862,9 @@ void VerifyPreviewRunSettings(const File& root) {
     throw std::runtime_error("The composer displayed a separate active binding");
   enter("Keep the current file scope", "Send");
   Wait(preview, [&] { return ShowsText(preview, "Waiting to apply"); }, "Direct supplement was not accepted by the active run");
+  auto pending_draft = preview.Find(UiSelector::Key("composer"));
+  FocusPreviewEditor(preview, pending_draft, "The queue draft did not receive focus");
+  pending_draft.ReplaceText("Queued on B");
   choose("send-mode", "Queue");
   enter("Queued on B", "Queue message");
   Wait(preview, [&] { return ShowsText(preview, "Model B  \xc2\xb7  Auto Review"); },
@@ -3852,6 +3909,9 @@ void VerifyPreviewRunSettings(const File& root) {
   const auto context_info = preview.FindSemantics(UiSemanticSelector::Role(SemanticRole::ProgressIndicator));
   Wait(preview, [&] { return context_ring.Exists() && context_info.Count() == 1 && !context_info.One().value.empty(); },
       "The composer did not report the latest model request's context");
+  if (!preview.Find(UiSelector::Key("chat-composer-settings")).Find(UiSelector::Key("composer-context")).Exists() ||
+      preview.Find(UiSelector::Key("chat-composer-actions")).Find(UiSelector::Key("composer-context")).Exists())
+    throw std::runtime_error("The context indicator should be grouped with the composer settings");
   const auto context_details = context_info.One().value;
   if (context_details.find("estimated input tokens") == std::string::npos || ShowsText(preview, context_details))
     throw std::runtime_error("The context indicator did not distinguish an estimate or exposed its tooltip early");
@@ -4997,8 +5057,7 @@ void VerifyForkReview(const File& directory, PublicationInterruption scenario = 
     ChooseDraftAssistant(ui, "PPT");
     composer = ui.Find(UiSelector::Key("new-conversation-composer"));
     FocusPreviewEditor(ui, composer, "The presentation comparison draft did not receive focus");
-    composer.ReplaceText(deck_title);
-    TapControl(ui, UiSelector::Key("ppt-outline-choice"), "The initial deck did not offer outline review");
+    composer.ReplaceText(std::string(deck_title) + "\nReview the outline first");
     TapFormButton(ui, "Send");
     OpenPptForm(ui, UiSelector::Key("slide-title-0"));
     fill("slide-title-0", "Original rollout");
@@ -5582,6 +5641,8 @@ file(WRITE "tested.txt" "${mode}")
     Wait(ui, [&] { return ReviewedDiff(ui) == "config.txt\n@@ -1 +1 @@\n-mode=disabled\n+mode=enabled\n"; },
         "The approval did not show the prepared diff for the main workspace");
     TapFormButton(ui, "Back to conversation");
+    if (!ui.Find(UiSelector::Key("agent-chat-heading")).Exists())
+      throw std::runtime_error("The conversation header did not return with the approval cards");
     TapReviewCard(ui, "Review attachment 2");
     Wait(ui, [&] {
       const auto diff = ReviewedDiff(ui);
@@ -5985,6 +6046,19 @@ void VerifyCodeRevert(const File& directory, CodeRevertCase scenario = CodeRever
     auto review = preview.Find(ReviewCard("Review artifact v1"));
     Wait(preview, [&] { return review.Count() == 1 && review.One().in_viewport; }, "The applied change artifact was not available");
     review.Tap();
+    const auto files = preview.Find(UiSelector::Key("workspace-review-files"));
+    const auto scope = preview.Find(UiSelector::Key("workspace-revert-scope"));
+    Wait(preview, [&] { return files.Exists() && scope.Exists() &&
+        preview.Find(UiSelector::Key("workspace-applied-diff/config.txt")).Exists(); },
+        "The applied review did not open on the first recorded diff");
+    if (preview.Find(UiSelector::Type<Checkbox>()).Exists() ||
+        ReviewedDiff(preview).find("+mode=enabled") == std::string::npos)
+      throw std::runtime_error("The applied review started in the revert scope or showed the wrong version");
+    TapControl(preview, UiSelector::Key("workspace-review-file/settings.html"), "The second changed file was not selectable");
+    Wait(preview, [&] { return preview.Find(UiSelector::Key("workspace-applied-diff/settings.html")).Exists() &&
+        ReviewedDiff(preview).find("Enabled") != std::string::npos; },
+        "The review did not display the recorded versions for the selected file");
+    scope.Tap();
     Wait(preview, [&] { return preview.Find(ButtonText(prepare_label)).Exists(); }, "The applied change did not offer restore");
   };
   const auto prepare = [&](UiTest& preview) {
@@ -6962,8 +7036,9 @@ void VerifyReleaseCompletionRevision(const File& root, bool complete_automatical
           "The screenshot conclusion did not reach the idle conversation draft");
       auto composer = preview.Find(UiSelector::Key("composer"));
       composer.Tap();
-      composer.ReplaceText(screenshot_follow_up);
-      TapControl(preview, UiSelector::Key("ppt-outline-choice"), "The follow-up did not offer outline review");
+      if (preview.Find(UiSelector::Key("ppt-outline-choice")).Exists())
+        throw std::runtime_error("PPT follow-ups still show an outline toggle");
+      composer.ReplaceText(std::string(screenshot_follow_up) + "\nReview the outline first");
       TapFormButton(preview, "Send");
       Wait(preview, [&] { return !attachment.Exists() && preview.Find(UiSelector::Key("open-ppt-form")).Exists(); },
           "Sending the conclusion did not start the next presentation task");
@@ -7147,6 +7222,13 @@ void VerifyWorkspaceTools(const File& root) {
   const auto initial_gap = gap();
   if (initial_gap < 0.0F || initial_gap > 32.0F)
     throw std::runtime_error("The timeline reserved space for folded tool output");
+  first_group.Tap();
+  Wait(ui, [&] { return list.Exists() && search.Exists(); }, "The first work group did not expand");
+  ui.Pump(16ms);
+  if (std::abs(first_group.One().bounds.y - first_step.y) > 4.0F)
+    throw std::runtime_error("Expanding work moved the start of a short conversation");
+  first_group.Tap();
+  Wait(ui, [&] { return !list.Exists() && !search.Exists(); }, "The first work group did not collapse");
   released->store(1);
   Wait(ui, [&] { return ShowsText(ui, "Stream checkpoint 1."); }, "The first longer reply did not start streaming");
   history.ScrollBy({0.0F, -10000.0F});
@@ -7157,8 +7239,9 @@ void VerifyWorkspaceTools(const File& root) {
       "The start of the streamed reply was not reachable");
   if (std::abs(gap() - initial_gap) > 4.0F)
     throw std::runtime_error("Streaming moved the heading away from the preceding work step");
-  const auto group_y = second_group.One().bounds.y;
-  second_group.Tap();
+  const auto group_bounds = second_group.One().bounds;
+  const auto group_y = group_bounds.y;
+  second_group.Tap({.device_kind = PointerDeviceKind::Mouse});
   Wait(ui, [&] { return read.Exists() && gap() > initial_gap + 6.0F; }, "The reading step did not expand under its group");
   Wait(ui, [&] { return std::abs(second_group.One().bounds.y - group_y) <= 4.0F; }, "Expanding work moved its group heading");
   const auto expanded_gap = gap();
@@ -7182,6 +7265,26 @@ void VerifyWorkspaceTools(const File& root) {
       "Jump to latest did not return to the streaming reply");
   released->store(3);
   Wait(ui, [&] { return !ui.Find(UiSelector::Key("agent-chat-stop")).Exists(); }, "The layout check did not finish");
+  history.ScrollBy({0.0F, -10000.0F});
+  Wait(ui, [&] { return first_group.Exists() && first_group.One().in_viewport; }, "The completed work group was not reachable");
+  const auto group = first_group.One().visible_bounds;
+  const Point group_center{group.x + group.width / 2.0F, group.y + group.height / 2.0F};
+  ui.SendPointer({.type = PointerEventType::Move, .pointer_id = 1, .position = group_center});
+  ui.Pump(100ms);
+  const auto idle_group = ui.CaptureSnapshot();
+  ui.SendPointer({.type = PointerEventType::Down, .pointer_id = 1, .position = group_center,
+      .changed_button = PointerButton::Primary, .pressed_buttons = PointerButton::Primary});
+  ui.Pump(85ms);
+  const auto press_changes = ui.CaptureSnapshot().Diff(idle_group);
+  for (const auto line : std::views::split(press_changes, '\n')) {
+    const std::string_view change(line.begin(), line.end());
+    if (!change.empty() && !(change.starts_with("ui/semantics/") &&
+        (change.ends_with("/focused: false -> true") || change.ends_with("/focused: true -> false"))))
+      throw std::runtime_error("Pressing the work group changed its rendered surface: " + press_changes);
+  }
+  ui.SendPointer({.type = PointerEventType::Up, .pointer_id = 1, .position = group_center,
+      .changed_button = PointerButton::Primary});
+  Wait(ui, [&] { return list.Exists(); }, "The completed work group did not expand");
 
   const auto set_full_access = [&](bool enable) {
     TapControl(ui, UiSelector::Key("open-settings"), "Open settings");
@@ -7776,11 +7879,12 @@ void VerifyLiveCodeTurnActivity(const File& root) {
       if (!workspace_id) throw std::runtime_error("The test workspace did not start");
       auto session = co_await LiveConversation(runtime, project, *workspace_id, agentkit_preview::CodeAgent,
           code_activity_prompt, std::string(code_activity_prompt) +
-          " Before your first tool call, write one short visible sentence about the work you will do. "
-          "Use read_files for both files, then apply_patch and run_tests. Summarize the outcome in your final answer.");
+          " Inspect both files with read_files before editing, then apply_patch and run_tests.");
       auto watching = co_await LiveObserve(session);
       bool saw_model_activity = false;
       bool saw_completion = false;
+      std::map<kit::MessageId, kit::Sequence> text_events;
+      std::map<kit::ToolCallId, kit::Sequence> tool_events;
       auto events = LiveTake(co_await session->ObserveEventsAsync(0, [&](auto result) {
         if (!result.Succeeded()) return;
         for (const auto& event : result.Value()->events) {
@@ -7788,6 +7892,11 @@ void VerifyLiveCodeTurnActivity(const File& root) {
             saw_model_activity |= run->model_active;
             saw_completion |= run->state == kit::RunState::Succeeded && run->timing && run->timing->ended_at &&
                 run->result.has_value();
+          } else if (const auto* message = std::get_if<kit::Message>(&event.body);
+                     message && message->author == kit::MessageAuthor::Agent && message->run) {
+            text_events.try_emplace(message->ref.message, event.sequence);
+          } else if (const auto* call = std::get_if<kit::ToolCallSnapshot>(&event.body); call && call->registered_sequence) {
+            tool_events.try_emplace(call->id, event.sequence);
           }
         }
       }));
@@ -7825,10 +7934,21 @@ void VerifyLiveCodeTurnActivity(const File& root) {
       const auto first_text = std::ranges::find(snapshot->messages, kit::MessageAuthor::Agent, &kit::Message::author);
       const auto last_text = std::ranges::find(snapshot->messages.rbegin(), snapshot->messages.rend(),
           kit::MessageAuthor::Agent, &kit::Message::author);
-      if (first_text == snapshot->messages.end() || last_text == snapshot->messages.rend() ||
-          first_text->sequence >= *read.registered_sequence || *read.registered_sequence >= *write.registered_sequence ||
+      const auto progress = std::ranges::find_if(snapshot->messages, [&](const auto& message) {
+        return message.author == kit::MessageAuthor::Agent && message.sequence > *read.registered_sequence &&
+            message.sequence < *write.registered_sequence;
+      });
+      if (first_text == snapshot->messages.end() || progress == snapshot->messages.end() ||
+          last_text == snapshot->messages.rend() || first_text->sequence >= *read.registered_sequence ||
           *write.registered_sequence >= *tests.registered_sequence || *tests.registered_sequence >= last_text->sequence)
-        throw std::runtime_error("Real model text and tool activity did not form an ordered timeline");
+        throw std::runtime_error("The live model did not announce work, report progress after reading, and conclude after verification");
+      if (!(text_events.at(first_text->ref.message) < tool_events.at(read.id) &&
+            tool_events.at(read.id) < text_events.at(progress->ref.message) &&
+            text_events.at(progress->ref.message) < tool_events.at(write.id) &&
+            tool_events.at(write.id) < tool_events.at(tests.id) &&
+            tool_events.at(tests.id) < text_events.at(last_text->ref.message)))
+        throw std::runtime_error("The SessionEvent stream did not preserve the order of progress, tools and conclusion");
+      if (run.model == agentkit_preview::DemoModel) throw std::runtime_error("The live run used the demo model");
       if (write.artifacts.size() != 1) throw std::runtime_error("The applied files did not record implementation evidence");
       const auto record = LiveTake(co_await runtime->Artifacts().ReadAsync(write.artifacts.front()));
       const auto evidence = workspace.Parent()->Child("workspace-evidence");
@@ -7843,7 +7963,8 @@ void VerifyLiveCodeTurnActivity(const File& root) {
             return text && text->text.find("--output-on-failure") != std::string::npos;
           })) throw std::runtime_error("CTest did not record the executed command");
       std::cout << "Elapsed " << (*run.timing->ended_at - run.timing->started_at).count()
-                << " ms. Verified the live timeline, two applied diffs and the CTest command.\n";
+                << " ms. Verified public progress before and during the real Run, ordered SessionEvents, "
+                << "two applied diffs and the CTest command.\n";
       LiveTake(co_await runtime->CloseAsync());
       passed = true;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; }
@@ -7859,20 +7980,29 @@ void VerifyLiveCodeTurnActivity(const File& root) {
 
 void CheckCodeTimelineDetails(UiTest& preview) {
   const auto tests = UiSelector::Text("Run workspace tests · Completed");
-  TapControl(preview, ButtonText("View changes"), "The completed turn could not locate its changes");
+  TapControl(preview, UiSelector::Key("chat-view-run-changes"), "The completed turn could not locate its changes");
   const auto first_diff = UiSelector::Key("workspace-file-diff/config.txt");
   const auto second_diff = UiSelector::Key("workspace-file-diff/settings.html");
   TapControl(preview, first_diff, "The first recorded file was not available", "agent-chat-history");
-  Wait(preview, [&] { return preview.Find(UiSelector::Key("workspace-applied-diff/config.txt")).Exists() &&
-      ReviewedDiff(preview).find("+mode=enabled") != std::string::npos; },
+  const auto config_patch = preview.Find(UiSelector::Key("workspace-applied-diff/config.txt"));
+  Wait(preview, [&] { return config_patch.Exists() && ReviewedDiff(preview).find("+mode=enabled") != std::string::npos; },
       "The config diff did not show the recorded applied version");
+  const auto patch_bounds = config_patch.One().bounds;
+  const auto editor_bounds = config_patch.Find(UiSelector::Key("artifact-text")).One().visible_bounds;
+  if (editor_bounds.y + editor_bounds.height > patch_bounds.y + patch_bounds.height + 1.0F)
+    throw std::runtime_error("The inline editor extends beyond its diff panel");
   TapControl(preview, second_diff, "The second recorded file was not available", "agent-chat-history");
   Wait(preview, [&] { return preview.Find(UiSelector::Key("workspace-applied-diff/settings.html")).Exists() &&
       ReviewedDiff(preview).find("Enabled") != std::string::npos; },
       "The settings diff did not show the recorded applied version");
   TapControl(preview, second_diff, "The settings diff could not be closed", "agent-chat-history");
-  if (!preview.Find(tests).Exists())
-    TapControl(preview, UiSelector::Text("1 operation"), "The verification group could not expand", "agent-chat-history");
+  if (!preview.Find(tests).Exists()) {
+    const auto single_operation = UiSelector::Text("1 operation");
+    if (preview.Find(single_operation).Count() == 1)
+      TapControl(preview, single_operation, "The verification group could not expand", "agent-chat-history");
+    else
+      ExpandLatestWorkGroup(preview);
+  }
   TapControl(preview, tests, "The verification step could not expand", "agent-chat-history");
   Wait(preview, [&] { return preview.Find(UiSelector::Key("ctest-command")).Exists() &&
       preview.Find(UiSelector::Key("ctest-directory")).Exists() && preview.Find(UiSelector::Key("ctest-output")).Exists(); },
@@ -8887,7 +9017,10 @@ void QueuePresentationConclusion(const File& root) {
   review.Tap();
   TapFormButton(preview, "Next slide");
   TapFormButton(preview, "Next slide");
-  TapFormButton(preview, queued_slide_excerpt);
+  auto excerpt = preview.FindSemantics(UiSemanticSelector::AllOf(UiSemanticSelector::Role(SemanticRole::Button),
+      UiSemanticSelector::Label(queued_slide_excerpt)));
+  Wait(preview, [&] { return excerpt.Count() == 1 && excerpt.One().enabled; }, "The staged excerpt was not selectable");
+  excerpt.PerformSemanticAction({SemanticActionKind::Activate, {}});
   AskAboutSelection(preview, queued_slide_excerpt);
   auto attachment = preview.Find(ButtonText("Remove conclusion"));
   Wait(preview, [&] { return attachment.Exists() && ShowsText(preview, queued_slide_excerpt); },
@@ -9352,8 +9485,72 @@ void VerifyModelEditing(const File& root, const std::string& server) {
   run_native(false);
 }
 
+void VerifyThemeSettings(const File& root) {
+  using namespace agentkit_preview;
+  const auto luminance = [](Color color) {
+    const auto channel = [](float value) {
+      return value <= 0.04045F ? value / 12.92F : std::pow((value + 0.055F) / 1.055F, 2.4F);
+    };
+    return 0.2126F * channel(color.red) + 0.7152F * channel(color.green) + 0.0722F * channel(color.blue);
+  };
+  for (const auto palette : {PreviewPalette::Graphite, PreviewPalette::Indigo, PreviewPalette::Forest, PreviewPalette::Sandstone}) {
+    for (const auto brightness : {ThemeBrightness::Light, ThemeBrightness::Dark}) {
+      const auto theme = PreviewThemeFor({.appearance = PreviewAppearance::System, .palette = palette}, brightness);
+      if (theme.brightness != brightness) throw std::runtime_error("A palette did not follow the system brightness");
+      const auto& c = theme.colors;
+      for (const auto& [ink, surface] : {std::pair{c.on_surface, c.surface}, std::pair{c.on_surface_variant, c.surface_container_high},
+              std::pair{c.primary, c.surface}, std::pair{c.on_primary, c.primary}, std::pair{c.on_primary_container, c.primary_container},
+              std::pair{c.inverse_on_surface, c.inverse_surface}, std::pair{c.error, c.surface_container}}) {
+        const auto a = luminance(ink);
+        const auto b = luminance(surface);
+        if ((std::max(a, b) + 0.05F) / (std::min(a, b) + 0.05F) < 4.5F)
+          throw std::runtime_error("A theme color pair did not meet the text contrast target");
+      }
+    }
+  }
+  if (!root.CreateDirectories()) throw std::runtime_error("Could not create the theme fixture");
+  const auto settings = root.Child("settings.json");
+  WriteFixture(settings, R"({"appearance":1})");
+  const Application app{App, {.application_hooks = {MakePreviewInstaller(root.Child("sessions.sqlite3"), false)}}};
+  const UiTestOptions options{.viewport = {1090.0F, 840.0F}, .resources = {.locale = Locale::FromLanguageTag("en-US")}};
+  const auto open_appearance = [](UiTest& ui) {
+    TapControl(ui, UiSelector::Key("open-settings"), "Settings did not open");
+    TapControl(ui, UiSelector::Key("settings-section-appearance"), "Appearance settings did not open");
+  };
+  const auto brightness = UiSelector::Key("settings-theme");
+  const auto palette = UiSelector::Key("settings-palette");
+  {
+    UiTest ui(app, options);
+    open_appearance(ui);
+    if (!ui.Find(brightness).Find(UiSelector::Text("Light")).Exists() ||
+        !ui.Find(palette).Find(UiSelector::Text("Graphite")).Exists())
+      throw std::runtime_error("Legacy appearance settings did not retain their brightness and default palette");
+    ui.Find(palette).Tap();
+    for (const auto* label : {"Graphite", "Indigo", "Forest", "Sandstone"}) {
+      Wait(ui, [&] { return ui.Find(UiSelector::Text(label)).Exists(); }, "An appearance palette was missing");
+    }
+    ui.Find(UiSelector::Text("Forest")).Tap();
+    ui.Find(brightness).Tap();
+    ui.Find(UiSelector::Text("Follow system")).Tap();
+    TapFormButton(ui, "Save settings");
+    const auto save = ui.Find(ButtonText("Save settings"));
+    Wait(ui, [&] { return save.Exists() && !save.One().enabled; }, "The palette choice did not save");
+    const auto stored = settings.ReadString();
+    if (!stored.Succeeded() || nlohmann::json::parse(stored.Value()).at("palette") != "forest")
+      throw std::runtime_error("The palette choice was not persisted with its stable name");
+  }
+  {
+    UiTest ui(app, options);
+    open_appearance(ui);
+    if (!ui.Find(brightness).Find(UiSelector::Text("Follow system")).Exists() ||
+        !ui.Find(palette).Find(UiSelector::Text("Forest")).Exists())
+      throw std::runtime_error("The palette and system brightness were not restored after restart");
+  }
+}
+
 void VerifyLocalization(const File& root) {
   if (!root.CreateDirectories()) throw std::runtime_error("Could not create the localization fixture");
+  VerifyThemeSettings(root.Child("theme"));
   const auto package = Resources::OpenPackage(File(AGENTKIT_TEST_RESOURCE_PACKAGE));
   if (!package.GetVectorImage(::app::images::goal).HasValue() ||
       !package.GetVectorImage(huxerui_agentkit::images::arrow_down).HasValue() ||
@@ -9413,6 +9610,14 @@ void VerifyLocalization(const File& root) {
     const auto instructions = ui.Find(UiSelector::Key("settings-instructions"));
     Wait(ui, [&] { return instructions.Exists() && instructions.One().bounds.height >= 100.0F; },
         "Personal instructions did not provide room for several lines");
+    if (viewport_width >= 1500.0F) {
+      ui.Find(UiSelector::Key("settings-section-appearance")).Tap();
+      const auto brightness = ui.Find(UiSelector::Key("settings-theme"));
+      Wait(ui, [&] { return brightness.Exists() && brightness.One().in_viewport; }, "The appearance control did not mount");
+      const auto bounds = brightness.One().bounds;
+      if (bounds.x + bounds.width - content.x > 840.0F)
+        throw std::runtime_error("An appearance field was separated from its label in a wide window");
+    }
     categories.Tap();
     add.Tap();
     const auto field = ui.FindSemantics(UiSemanticSelector::Label(api_key));

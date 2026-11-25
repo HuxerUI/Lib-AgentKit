@@ -1,6 +1,7 @@
 #include "side_chat.h"
 #include "chat_chrome.h"
 #include "preview_theme.h"
+#include "workspace_evidence.h"
 
 #include <app_resources.h>
 #include <huxerui/huxerui.h>
@@ -304,6 +305,30 @@ View SelectionMenu(std::shared_ptr<kit::Conversation> conversation, kit::AgentCh
 
 } // namespace
 
+kit::AgentChatReviewHeader PreviewArtifactHeader(const ThemeSpec& theme,
+    std::function<void(kit::AgentChatReviewRequest)> open_window, std::optional<State<std::string>> error) {
+  return {std::make_shared<const kit::AgentChatReviewHeader::Render>(
+      [theme, open_window = std::move(open_window), error](const kit::ArtifactPreview& artifact,
+          const kit::AgentChatReviewRequest& request, std::function<void()> back) -> View {
+    const auto title = artifact.type == ImplementationEvidence ? StringVariant{::app::strings::ui_applied_workspace_changes}
+        : artifact.name.empty() ? StringVariant{::app::strings::ui_artifact} : StringVariant{artifact.name};
+    std::vector<View> tools;
+    if (back) tools.push_back(PreviewBackAction(::app::strings::ui_back_to_conversation, std::move(back), theme)
+        .Key("back-to-conversation"));
+    tools.push_back(Text(title, TextRole::Title)
+        .Style({Font::System(19.0F).WithWeight(FontWeight::SemiBold), theme.colors.on_surface})
+        .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow(), Tooltip(title)).Key("artifact-review-title"));
+    tools.push_back(Text(StringVariant::Format(::app::strings::ui_version_0, artifact.artifact.version), TextRole::Label)
+        .Style({Font::System(12.0F), theme.colors.on_surface_variant}).Key("artifact-review-version"));
+    if (open_window) tools.push_back(PreviewChromeAction(::app::images::open_external, ::app::strings::ui_open_in_new_window,
+        [open_window, request] { open_window(request); }, theme).Key("review-open-in-new-window"));
+    auto row = Row(std::move(tools)).With(Frame{.min_height = 40.0F}, Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
+    if (error && !error->Get().empty()) return Column{std::move(row), Text(error->Get(), TextRole::Label)}
+        .With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch));
+    return row;
+  })};
+}
+
 [[huxerui::composable]]
 View PreviewChat(std::shared_ptr<kit::Conversation> conversation, kit::AgentChatOptions options, std::optional<View> actions) {
   const auto chrome = UseEnvironment<ChatChrome>();
@@ -323,14 +348,16 @@ View PreviewDraftComposer(State<TextEditingValue> draft, ViewHandle focus, State
     StringVariant placeholder, const char* input_key, std::vector<View> extras, std::optional<View> controls,
     bool editing, std::function<bool()> send_available, std::function<void()> submit, bool dense) {
   auto content = std::move(extras);
-  const auto colors = UseTheme().colors;
+  const auto theme = UseTheme();
+  const auto& colors = theme.colors;
   const bool can_send = editing && send_available();
   auto field = UseEnvironment<TextFieldStyle>();
   field.show_label = false;
   field.standard.border = field.standard.hovered_border = field.standard.focused_border = Color::Transparent();
   field.standard.minimum_height = 0.0F;
-  field.text_style = {Font::System(15.0F), colors.on_surface};
-  field.placeholder_style = {Font::System(15.0F), colors.on_surface_variant};
+  const auto font = Font::FromFamily(theme.typography.family, theme.typography.body_large);
+  field.text_style = {font, colors.on_surface};
+  field.placeholder_style = {font, colors.on_surface_variant};
   field.caret = colors.on_primary_container;
   field.padding = {};
   content.push_back(ProvideEnvironment(field, Row {
@@ -347,7 +374,7 @@ View PreviewDraftComposer(State<TextEditingValue> draft, ViewHandle focus, State
         .OnChanged([draft](const TextEditingValue& value) { draft = value; })
         .On<ViewEvents::FocusChanged>([focused](bool value) { focused = value; }).OnSubmitted(submit)
         .With(focus, Grow(), Enabled(editing)).Key(input_key),
-  }.With(Frame{.min_height = dense ? 38.0F : 54.0F},
+  }.With(Frame{.min_height = dense ? 38.0F : 46.0F},
       Padding(EdgeInsets{.top = 4.0F, .right = 4.0F, .left = 4.0F}))).Key("message-input"));
   auto send = UseEnvironment<IconButtonStyle>();
   send.icon_size = 20.0F;
@@ -361,9 +388,9 @@ View PreviewDraftComposer(State<TextEditingValue> draft, ViewHandle focus, State
         .With(Enabled(can_send), Background(can_send ? colors.primary : colors.surface_container_high),
               CornerRadius(11.0F), Tooltip(::app::strings::ui_send)).Key("chat-send/Send")),
   }.With(CrossAlign(CrossAxisAlignment::Center)).Key("agent-chat-toolbar"));
-  return Column(std::move(content)).With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Stretch), Padding(11.0F),
-      CornerRadius(17.0F), Background(colors.surface_container),
-      Border{focused.Get() ? colors.on_primary_container : colors.outline}, Enabled(editing)).Key("agent-chat-composer");
+  return Column(std::move(content)).With(Spacing(3.0F), CrossAlign(CrossAxisAlignment::Stretch), Padding(10.0F),
+      CornerRadius(12.0F), Background(colors.surface_container),
+      Border{focused.Get() ? colors.primary : colors.outline}, Enabled(editing)).Key("agent-chat-composer");
 }
 
 [[huxerui::composable]]

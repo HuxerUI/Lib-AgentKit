@@ -3,7 +3,25 @@
 #include <app_resources.h>
 #include <huxerui/huxerui.h>
 
+#include <array>
+#include <cmath>
+
 namespace agentkit_preview {
+
+enum class PreviewPalette { Graphite, Indigo, Forest, Sandstone };
+
+inline huxerui::Color PreviewTint(huxerui::Color surface, huxerui::Color ink, float weight) {
+  return {std::lerp(surface.red, ink.red, weight), std::lerp(surface.green, ink.green, weight),
+      std::lerp(surface.blue, ink.blue, weight), 1.0F};
+}
+
+inline huxerui::Color PreviewSuccess(huxerui::ThemeBrightness brightness) {
+  return brightness == huxerui::ThemeBrightness::Dark ? huxerui::Color::Rgb(158, 217, 179) : huxerui::Color::Rgb(34, 102, 62);
+}
+
+inline huxerui::Color PreviewWarning(huxerui::ThemeBrightness brightness) {
+  return brightness == huxerui::ThemeBrightness::Dark ? huxerui::Color::Rgb(239, 188, 117) : huxerui::Color::Rgb(146, 84, 25);
+}
 
 inline huxerui::ButtonStyle PreviewSecondaryButton(huxerui::ButtonStyle style, const huxerui::ColorScheme& colors) {
   style.background = colors.surface_container_high;
@@ -86,7 +104,7 @@ inline huxerui::Indication PreviewRowIndication(const huxerui::ThemeSpec& theme,
 inline huxerui::TextFieldStyle PreviewFormFieldStyle(huxerui::TextFieldStyle field, const huxerui::ColorScheme& colors) {
   using namespace huxerui;
   field.outlined = {
-      .background = colors.surface,
+      .background = colors.surface_container,
       .disabled_background = colors.surface_container_low,
       .border = colors.outline,
       .hovered_border = colors.on_surface_variant,
@@ -96,7 +114,7 @@ inline huxerui::TextFieldStyle PreviewFormFieldStyle(huxerui::TextFieldStyle fie
       .minimum_height = 38.0F,
   };
   field.filled = field.outlined;
-  field.filled.background = colors.surface_container_low;
+  field.filled.background = colors.surface_container_high;
   field.filled.corner_radii = CornerRadii::Top(7.0F);
   field.text_style = {field.text_style.font.WithSize(14.0F), colors.on_surface};
   field.placeholder_style.font = field.text_style.font;
@@ -115,7 +133,7 @@ inline huxerui::TextFieldStyle PreviewFormFieldStyle(huxerui::TextFieldStyle fie
   field.disabled_placeholder = colors.on_surface_variant;
   field.error_label = colors.error;
   field.caret = colors.on_primary_container;
-  field.selection = colors.primary_container;
+  field.selection = PreviewTint(colors.surface, colors.primary, 0.25F);
   field.error_caret = colors.error;
   field.composition = colors.on_primary_container;
   return field;
@@ -151,34 +169,70 @@ inline void ShowPreviewDialog(const huxerui::DialogHandle& dialogs, huxerui::Dia
   dialogs.Show(DialogFactory{[content = std::move(content)](DialogContext dialog) {
     const auto colors = UseTheme().colors;
     return Column {content(dialog)}.With(CrossAlign(CrossAxisAlignment::Stretch),
-        Background(colors.surface_container_low), CornerRadius(12.0F), Border{colors.outline}, ClipChildren{},
+        Background(colors.surface_container), CornerRadius(12.0F), Border{colors.outline}, ClipChildren{},
         Shadow{.color = Color::Rgb(0, 0, 0, 0.36F), .offset = {0.0F, 12.0F}, .blur_radius = 36.0F})
         .Key("preview-dialog-surface");
   }}, std::move(options));
 }
 
-inline huxerui::ThemeSpec PreviewTheme(huxerui::ThemeBrightness brightness) {
-  using huxerui::Color;
-  const bool dark = brightness == huxerui::ThemeBrightness::Dark;
-  auto theme = dark ? huxerui::MaterialDarkThemeSpec() : huxerui::MaterialLightThemeSpec();
+inline huxerui::ThemeSpec PreviewTheme(PreviewPalette palette, huxerui::ThemeBrightness brightness) {
+  using namespace huxerui;
+  struct Tones {
+    std::uint32_t surface;
+    std::uint32_t shell;
+    std::uint32_t raised;
+    std::uint32_t inset;
+    std::uint32_t outline;
+    std::uint32_t ink;
+    std::uint32_t muted;
+    std::uint32_t accent;
+  };
+  const auto color = [](std::uint32_t rgb) { return Color::Rgba32((rgb << 8U) | 0xffU); };
+  constexpr std::array dark_palettes{
+      Tones{0x181a1f, 0x111318, 0x202329, 0x292d35, 0x363b45, 0xebeef4, 0xaab3c2, 0xa4bedf},
+      Tones{0x1b1c25, 0x14151d, 0x232534, 0x2c2e40, 0x393c50, 0xeeeef6, 0xb0b2c6, 0xbcbff1},
+      Tones{0x1a201e, 0x131916, 0x222b27, 0x2b362f, 0x36443c, 0xe9efeb, 0xaebdb3, 0xa5cdb7},
+      Tones{0x211d1b, 0x181512, 0x2b2522, 0x362e29, 0x483c35, 0xf1e9e2, 0xc3b3a9, 0xe2b694},
+  };
+  constexpr std::array light_palettes{
+      Tones{0xf9fafc, 0xeff2f6, 0xffffff, 0xeef2f7, 0xd9e0e8, 0x232a35, 0x526070, 0x365574},
+      Tones{0xf9f8fc, 0xf0eef6, 0xffffff, 0xeeedf7, 0xdedcea, 0x292b3d, 0x585b71, 0x504296},
+      Tones{0xf9faf8, 0xeff3ef, 0xffffff, 0xebf1ec, 0xd9e2dc, 0x26342d, 0x506257, 0x33624d},
+      Tones{0xfbf9f5, 0xf3eee7, 0xfffefd, 0xf2ece3, 0xe4dbd1, 0x362b23, 0x68594d, 0x804627},
+  };
+  const auto index = static_cast<std::size_t>(palette);
+  const bool dark = brightness == ThemeBrightness::Dark;
+  const auto tones = (dark ? dark_palettes : light_palettes).at(index);
+  auto theme = dark ? MaterialDarkThemeSpec() : MaterialLightThemeSpec();
   theme.typography.body_large = 14.0F;
   theme.typography.body_small = 13.0F;
   auto& colors = theme.colors;
-  colors.surface = dark ? Color::Rgb(20, 21, 24) : Color::Rgb(249, 247, 244);
+  colors.surface = color(tones.surface);
   colors.background = colors.surface;
-  colors.surface_container_low = dark ? Color::Rgb(25, 27, 31) : Color::Rgb(242, 239, 235);
-  colors.surface_container = dark ? Color::Rgb(30, 32, 37) : Color::Rgb(255, 253, 249);
-  colors.surface_container_high = dark ? Color::Rgb(37, 39, 45) : Color::Rgb(235, 231, 225);
-  colors.surface_container_highest = dark ? Color::Rgb(46, 49, 56) : Color::Rgb(227, 222, 214);
-  colors.on_surface = dark ? Color::Rgb(239, 240, 243) : Color::Rgb(40, 37, 32);
-  colors.on_surface_variant = dark ? Color::Rgb(171, 174, 184) : Color::Rgb(88, 80, 71);
-  colors.outline = dark ? Color::Rgb(52, 55, 63) : Color::Rgb(217, 211, 201);
-  colors.primary = dark ? Color::Rgb(224, 183, 138) : Color::Rgb(128, 84, 47);
-  colors.on_primary = dark ? Color::Rgb(42, 32, 22) : Color::White();
-  colors.primary_container = dark ? Color::Rgb(49, 42, 38) : Color::Rgb(234, 220, 201);
-  colors.on_primary_container = dark ? Color::Rgb(246, 212, 174) : Color::Rgb(98, 59, 28);
-  colors.error = dark ? Color::Rgb(255, 180, 189) : Color::Rgb(150, 50, 64);
-  theme.interactions.focus_ring = huxerui::FocusRing{colors.primary, 1.0F, 2.0F};
+  colors.on_surface = color(tones.ink);
+  colors.on_surface_variant = color(tones.muted);
+  colors.primary = color(tones.accent);
+  colors.on_primary = dark ? colors.surface : Color::White();
+  colors.surface_container_low = color(tones.shell);
+  colors.surface_container = color(tones.raised);
+  colors.surface_container_high = color(tones.inset);
+  colors.surface_container_highest = PreviewTint(colors.surface_container_high, colors.on_surface, dark ? 0.09F : 0.07F);
+  colors.outline = color(tones.outline);
+  colors.primary_container = PreviewTint(colors.surface_container, colors.primary, dark ? 0.12F : 0.10F);
+  colors.on_primary_container = dark ? PreviewTint(colors.primary, colors.on_surface, 0.28F) : colors.primary;
+  colors.secondary = colors.on_surface_variant;
+  colors.on_secondary = colors.on_primary;
+  colors.secondary_container = colors.surface_container_highest;
+  colors.on_secondary_container = colors.on_surface;
+  colors.tertiary_container = PreviewTint(colors.surface, PreviewWarning(brightness), dark ? 0.21F : 0.12F);
+  colors.on_tertiary_container = PreviewWarning(brightness);
+  colors.inverse_surface = color((dark ? light_palettes : dark_palettes).at(index).surface);
+  colors.inverse_on_surface = color((dark ? light_palettes : dark_palettes).at(index).ink);
+  colors.scrim = Color::Rgb(0, 0, 0, dark ? 0.58F : 0.37F);
+  colors.error = dark ? color(0xffb7c0) : color(0xa32840);
+  theme.interactions.focus_ring = FocusRing{colors.primary, 1.0F, 2.0F};
+  theme.interactions.indication = PreviewRowIndication(theme, 7.0F);
+  theme.interactions.indication.focus = IndicationLayer{.border = Border{colors.primary, 1.0F}, .corner_radii = CornerRadii{7.0F}};
   return theme;
 }
 
@@ -188,9 +242,27 @@ inline huxerui::View PreviewControlsTheme(huxerui::View content) {
     const auto& theme = UseTheme();
     const auto& colors = theme.colors;
     ThemeDefinition overrides;
+    auto button = PreviewSecondaryButton(UseEnvironment<ButtonStyle>(), colors);
+    button.indication = PreviewRowIndication(theme, 7.0F);
+    overrides.Set(std::move(button));
     overrides.Set(PreviewFormFieldStyle(UseEnvironment<TextFieldStyle>(), colors));
+    overrides.Set(DividerStyle{colors.outline});
+    auto menu = UseEnvironment<MenuStyle>();
+    menu.background = colors.surface_container;
+    menu.foreground = colors.on_surface;
+    menu.icon_tint = colors.on_surface_variant;
+    menu.separator_color = colors.outline;
+    menu.item_indication = PreviewRowIndication(theme, 6.0F);
+    overrides.Set(std::move(menu));
+    auto tooltip = UseEnvironment<TooltipStyle>();
+    tooltip.background = colors.inverse_surface;
+    tooltip.text_style.foreground = colors.inverse_on_surface;
+    overrides.Set(std::move(tooltip));
+    auto scroll = UseEnvironment<ScrollBarStyle>();
+    scroll.thumb_color = PreviewTint(colors.surface, colors.on_surface, 0.34F);
+    overrides.Set(std::move(scroll));
     auto select = UseEnvironment<SelectStyle>();
-    select.background = colors.surface;
+    select.background = colors.surface_container;
     select.foreground = colors.on_surface;
     select.border = Border{colors.outline, 1.0F};
     select.indicator = colors.on_surface_variant;
@@ -202,10 +274,14 @@ inline huxerui::View PreviewControlsTheme(huxerui::View content) {
     select.popup_corner_radii = CornerRadii{8.0F};
     select.active_item_background = colors.surface_container_high;
     select.selected_item_background = colors.primary_container;
+    select.indication = PreviewRowIndication(theme, 7.0F);
+    select.item_indication = PreviewRowIndication(theme, 6.0F);
+    select.validation_error = colors.error;
+    select.validation_text_style.foreground = colors.error;
     overrides.Set(std::move(select));
     auto dialog = UseEnvironment<DialogStyle>();
-    dialog.scrim = Color::Rgb(9, 11, 15, theme.brightness == ThemeBrightness::Dark ? 0.56F : 0.40F);
-    dialog.background = colors.surface_container_low;
+    dialog.scrim = colors.scrim;
+    dialog.background = colors.surface_container;
     dialog.title_style = {Font::System(20.0F).WithWeight(FontWeight::SemiBold), colors.on_surface};
     dialog.message_style = {Font::System(14.0F), colors.on_surface_variant};
     dialog.positive_action_style.foreground = colors.on_primary;

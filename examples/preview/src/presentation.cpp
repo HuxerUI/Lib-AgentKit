@@ -225,13 +225,9 @@ std::string Diagram(const SlideOutline& slide, SlideLayout layout) {
   const auto count = static_cast<int>(slide.bullets.size());
   const bool flow = layout == SlideLayout::Flow;
   const int columns = flow ? count : 2;
-  const int gap = flow ? 380000 : 290000;
-  const int width = (10432000 - gap * (columns - 1)) / columns;
-  const int height = !flow && count > 2 ? 1490000 : 2070000;
   std::string shapes;
   for (int i = 0; i < count; ++i) {
-    const int x = 880000 + (i % columns) * (width + gap);
-    const int y = 2740000 + (i / columns) * (height + gap);
+    const auto [x, y, width, height] = ClassicDiagramCard(layout, count, i);
     const auto& point = slide.bullets[i];
     const bool compact = point.size() > 72;
     const bool alternate = layout == SlideLayout::Comparison && i == 1;

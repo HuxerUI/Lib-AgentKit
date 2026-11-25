@@ -30,14 +30,14 @@ inline View ChatControlWithIcons(View button, ButtonStyle style, Color ink, Chat
 }
 
 inline View ChatSendAction(StringVariant label, std::string key, std::function<void()> send, bool enabled, const ColorScheme& colors,
-                           IconButtonStyle style) {
+                           IconButtonStyle style, ImageResource glyph = huxerui_agentkit::images::send) {
   style.icon_size = 20.0F;
   style.minimum_interactive_size = 38.0F;
   style.state_layer_size = 38.0F;
   style.corner_radius = 11.0F;
   style.foreground = colors.on_primary;
   style.disabled_foreground = colors.on_surface_variant;
-  return ProvideEnvironment(style, IconButton(huxerui_agentkit::images::send, label).OnClick(std::move(send))
+  return ProvideEnvironment(style, IconButton(glyph, label).OnClick(std::move(send))
       .With(Enabled(enabled), Background(enabled ? colors.primary : colors.surface_container_high),
           CornerRadius(11.0F), Tooltip(label)).Key(std::move(key)));
 }

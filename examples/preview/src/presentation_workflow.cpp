@@ -67,6 +67,13 @@ bool OutlineReviewLine(std::string_view line) {
   return line == "Review the outline first" || line == "\xe5\x85\x88\xe5\xae\xa1\xe9\x98\x85\xe5\xa4\xa7\xe7\xba\xb2";
 }
 
+bool HasOutlineReviewRequest(std::string_view input) {
+  for (auto line : input | std::views::split('\n')) {
+    if (OutlineReviewLine(std::string_view(line.begin(), line.end()))) return true;
+  }
+  return false;
+}
+
 } // namespace
 
 std::string PresentationTopic(std::string_view input) {
@@ -78,20 +85,6 @@ std::string PresentationTopic(std::string_view input) {
     topic.append(text);
   }
   return topic;
-}
-
-bool HasOutlineReviewRequest(std::string_view input) {
-  for (auto line : input | std::views::split('\n')) {
-    if (OutlineReviewLine(std::string_view(line.begin(), line.end()))) return true;
-  }
-  return false;
-}
-
-std::string ToggleOutlineReviewRequest(std::string input, std::string_view label) {
-  if (HasOutlineReviewRequest(input)) return PresentationTopic(input);
-  if (!input.empty() && !input.ends_with('\n')) input.push_back('\n');
-  input.append(label);
-  return input;
 }
 
 kit::Async<kit::RunCompletion> RunPresentation(

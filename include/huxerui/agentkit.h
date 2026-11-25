@@ -206,6 +206,21 @@ struct AgentChatLayoutStyle {
   bool operator==(const AgentChatLayoutStyle&) const = default;
 };
 
+/// @brief Lets an application supply the header for a visible artifact review.
+/// Provide around AgentChat() when the app owns review navigation and actions.
+struct AgentChatReviewHeader {
+  /// Builds the header for the visible version and its review request. The back action is empty in a detached review.
+  using Render = std::function<View(const ArtifactPreview&, const AgentChatReviewRequest&, std::function<void()>)>;
+  /// Optional application-owned renderer. An empty pointer uses the default layout.
+  std::shared_ptr<const Render> render;
+
+  /// Keeps the default review header.
+  static AgentChatReviewHeader Default() { return {}; }
+
+  /// Compares the installed header renderers.
+  bool operator==(const AgentChatReviewHeader&) const = default;
+};
+
 /// @brief Optional mount point for popups opened by host composer controls.
 /// Read it with UseEnvironment() from AgentChatRunControls::render descendants. A standalone
 /// host composer can provide its own anchor with ProvideEnvironment().

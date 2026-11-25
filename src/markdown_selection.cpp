@@ -81,10 +81,13 @@ View ReadOnlyCodePanel(StringVariant language, std::string code, View body, mark
     const auto tasks = UseTaskScope();
     const auto copied = UseState(std::optional<bool>{});
     auto button_style = UseEnvironment<ButtonStyle>();
+    const auto label_font = style.body.font.WithSize(12.0F).WithWeight(FontWeight::Medium);
     button_style.background = Color::Transparent();
-    button_style.label_style = {style.body.font.WithSize(12.0F).WithWeight(FontWeight::Medium), style.muted};
-    button_style.padding = EdgeInsets::Symmetric(8.0F, 2.0F);
-    button_style.minimum_height = 26.0F;
+    button_style.disabled_background = Color::Transparent();
+    button_style.label_style = {label_font, style.muted};
+    button_style.padding = EdgeInsets::Symmetric(6.0F, 2.0F);
+    button_style.minimum_height = 24.0F;
+    button_style.indication = Indication{.focus = UseTheme().interactions.indication.focus};
     const auto copy = [clipboard, tasks, copied, code] {
       if (!clipboard) return;
       auto write = clipboard->WriteItemAsync({.text = code});
@@ -95,11 +98,12 @@ View ReadOnlyCodePanel(StringVariant language, std::string code, View body, mark
     auto label = copied.Get() ? (*copied.Get() ? ui_code_copied : ui_code_copy_failed) : ui_copy_code;
     return Column{
         Row{Text(language, TextRole::Label)
-                .Style({style.body.font.WithSize(12.0F).WithWeight(FontWeight::Medium), style.muted})
+                .Style({label_font, style.muted})
                 .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow()),
-            ProvideEnvironment(button_style, Button(label).OnClick(copy).With(Enabled(bool(clipboard) && !code.empty())))
+            ProvideEnvironment(button_style, Button(label).OnClick(copy)
+                .With(Enabled(bool(clipboard) && !code.empty()), PointerCursor(PointerCursorKind::Hand)))
                 .Key("markdown-copy-code"),
-        }.With(Frame{.min_height = 34.0F}, Padding(EdgeInsets::Symmetric(12.0F, 2.0F)),
+        }.With(Frame{.min_height = 30.0F}, Padding(EdgeInsets{.right = 6.0F, .left = style.code_padding}),
             Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)),
         ProvideEnvironment(DividerStyle{style.border}, Divider()),
         body,
@@ -160,6 +164,57 @@ void AppendSourceRange(MarkdownSourceExcerpt& excerpt, std::size_t begin, std::s
 }
 
 #ifdef HUXERUI_MARKDOWN_SOURCE_MAPPING
+struct InlineCodeBackground {
+  class Extension;
+  AttributedText text;
+  TextStyle style;
+  TextAlign alignment;
+  std::vector<TextRange> spans;
+  Color fill;
+
+  bool operator==(const InlineCodeBackground&) const = default;
+};
+
+class InlineCodeBackground::Extension final : public NodeExtension {
+public:
+  Extension(ViewNode&, const InlineCodeBackground& spec) : spec_(spec) {}
+
+  void Update(ViewNode&, const InlineCodeBackground& spec) {
+    if (spec_ == spec) return;
+    spec_ = spec;
+    bounds_.reset();
+  }
+
+  PaintInvalidation PrepareGeometry(ViewNode& node, TextMeasurer& measurer) override {
+    const auto bounds = node.ContentBounds();
+    if (bounds_ == bounds) return PaintInvalidation::None;
+    bounds_ = bounds;
+    rects_.clear();
+    if (bounds.IsEmpty()) return PaintInvalidation::Content;
+    const auto layout = measurer.CreateTextLayout(spec_.text, spec_.style, bounds.width, {.align = spec_.alignment});
+    constexpr float horizontal_inset = 3.0F;
+    for (const auto& span : spec_.spans) {
+      for (auto rect : layout.RangeRects(span)) {
+        if (rect.IsEmpty()) continue;
+        rect.x += bounds.x - horizontal_inset;
+        rect.width += 2.0F * horizontal_inset;
+        rect.y += bounds.y;
+        rects_.push_back(rect);
+      }
+    }
+    return PaintInvalidation::Content;
+  }
+
+  void PaintBehindContent(const ViewNode&, PaintContext& painter) const override {
+    for (const auto& rect : rects_) painter.DrawRect(rect, spec_.fill, CornerRadii{4.0F});
+  }
+
+private:
+  InlineCodeBackground spec_;
+  std::optional<Rect> bounds_;
+  std::vector<Rect> rects_;
+};
+
 void CollectSourceExcerpt(const markdown::MarkdownNode& node, std::size_t begin, std::size_t end,
                           MarkdownSourceExcerpt& excerpt) {
   using markdown::NodeKind;
@@ -581,9 +636,21 @@ View SelectableMarkdown(markdown::MarkdownDocument document, markdown::MarkdownO
   }
 #ifdef HUXERUI_MARKDOWN_SOURCE_MAPPING
   if (changed) options.selectable = false;
-  options.decorate_text = [selectable = static_cast<bool>(changed), load = std::move(load), reading_owner = std::move(reading_owner)](
+  const auto code_style = options.style;
+  if (options.style) options.style->code_background = Color::Transparent();
+  options.decorate_text = [selectable = static_cast<bool>(changed), code_style,
+                           load = std::move(load), reading_owner = std::move(reading_owner)](
       View view, const markdown::MarkdownNode& node, const AttributedText& text, const TextStyle& style, TextAlign alignment,
       std::span<const markdown::MarkdownSourceSegment> source) {
+    if (code_style && code_style->code_background.alpha > 0.0F) {
+      std::vector<TextRange> spans;
+      for (const auto& run : text.StyleRanges()) {
+        if (run.style.font == code_style->code.font && run.style.background == Color::Transparent())
+          spans.push_back(run.range);
+      }
+      if (!spans.empty()) view = std::move(view).With(InlineCodeBackground{
+          text, style, alignment, std::move(spans), code_style->code_background});
+    }
     auto paragraph = DecorateParagraph(std::move(view), node, text, style, alignment, source, selectable, load);
     if (source.empty()) return paragraph;
     return std::move(paragraph).LayoutValue<ChatReadingPositionKey>({reading_owner, source.front().source_begin});

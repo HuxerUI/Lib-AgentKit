@@ -1814,12 +1814,11 @@ View NavigationAction(StringVariant label, NavigationSymbol symbol, std::functio
     action();
     return true;
   })
-      .With(Frame{.height = new_conversation ? 42.0F : folder_heading ? 34.0F : 36.0F},
+      .With(Frame{.height = new_conversation ? 38.0F : folder_heading ? 34.0F : 36.0F},
             Padding(EdgeInsets{.right = inset + trailing_space, .left = inset}), Spacing(folder_heading ? 6.0F : 9.0F),
-            CrossAlign(CrossAxisAlignment::Center), CornerRadius(9.0F), Focusable{}, Enabled(enabled),
-            agentkit_preview::PreviewRowIndication(theme, 9.0F), PointerCursor(PointerCursorKind::Hand),
+            CrossAlign(CrossAxisAlignment::Center), CornerRadius(7.0F), Focusable{}, Enabled(enabled),
+            agentkit_preview::PreviewRowIndication(theme, 7.0F), PointerCursor(PointerCursorKind::Hand),
             Background(selected ? colors.primary_container : new_conversation ? colors.surface_container_high : Color::Transparent()),
-            Border{new_conversation ? colors.outline : Color::Transparent()},
             Semantics{.role = SemanticRole::Button, .label = label, .value = count, .selected = selected, .expanded = expanded});
 }
 
@@ -1890,7 +1889,7 @@ View SessionRow(kit::SessionSummary item, bool selected, bool grouped, std::func
           .With(Grow()).Key(item.id.value)}.With(Grow())
           .Key(item.pending_interactions ? "pending-session-title/" + item.title : "session-title")};
   if (item.pending_interactions || item.active_run) {
-    const auto dot = item.pending_interactions ? Color::Rgb(181, 113, 56) : theme.on_primary_container;
+    const auto dot = item.pending_interactions ? agentkit_preview::PreviewWarning(spec.brightness) : theme.primary;
     label.push_back(Canvas([dot](PaintContext& context, Size) { context.DrawCircle({3, 3}, 2.5F, dot); })
         .With(Frame{.width = 6.0F, .height = 6.0F}));
   }
@@ -2062,7 +2061,8 @@ View PendingRequests(std::shared_ptr<kit::AgentRuntime> runtime, State<std::shar
 [[huxerui::composable]]
 View PreviewConversation(kit::AgentId agent, std::shared_ptr<kit::Conversation> conversation,
                          std::shared_ptr<kit::AgentRuntime> runtime, kit::AgentChatOptions base_options,
-                         std::optional<agentkit_preview::CodeWorkspace> workspace = {}, std::optional<File> evidence = {}) {
+                         std::optional<agentkit_preview::CodeWorkspace> workspace = {}, std::optional<File> evidence = {},
+                         kit::AgentChatReviewHeader review_header = {}) {
   const auto selection = UseState(std::shared_ptr<const kit::AgentChatTextSelection>{});
   const auto local_draft = UseState(kit::AgentChatDraftSources{});
   const auto draft = base_options.draft_sources.value_or(local_draft);
@@ -2072,6 +2072,12 @@ View PreviewConversation(kit::AgentId agent, std::shared_ptr<kit::Conversation> 
   options.selection = selection;
   options.draft_sources = draft;
   options.composer_focus = focus;
+  options.render_artifact = [runtime, workspace, evidence, fallback = base_options.render_artifact](
+      const kit::ArtifactPreview& preview, std::shared_ptr<kit::Conversation> owner,
+      State<kit::AgentChatDraftSources> sources) -> std::optional<View> {
+    if (auto review = agentkit_preview::RenderWorkspaceChangeReview(preview, owner, runtime, workspace, evidence)) return review;
+    return fallback ? fallback(preview, std::move(owner), sources) : std::nullopt;
+  };
   auto chat = [&]() -> View {
     if (agent == agentkit_preview::DesignAgent)
       return agentkit_preview::DesignChat(conversation, runtime, std::move(options), {}, std::move(evidence));
@@ -2083,6 +2089,10 @@ View PreviewConversation(kit::AgentId agent, std::shared_ptr<kit::Conversation> 
       return agentkit_preview::PresentationChat(conversation, runtime, std::move(options));
     return agentkit_preview::PreviewChat(conversation, std::move(options));
   }();
+  if (review_header.render) {
+    chat = Column{ProvideEnvironment(std::move(review_header), std::move(chat).With(Grow()))}
+        .With(CrossAlign(CrossAxisAlignment::Stretch));
+  }
   return agentkit_preview::PreviewSideChatWorkspace(std::move(chat), std::move(conversation), selection, draft, focus);
 }
 
@@ -2117,7 +2127,6 @@ View DetachedArtifactReview(std::shared_ptr<kit::Conversation> conversation, std
                             kit::AgentId agent, kit::AgentChatReviewRequest request,
                             agentkit_preview::PresentationReviewPages initial_pages,
                             std::optional<State<kit::AgentChatDraftSources>> draft_sources) {
-  const auto window = UseWindow();
   const auto pages = UseState(std::move(initial_pages));
   kit::AgentChatOptions options{
       .draft_sources = draft_sources, .review_request = std::move(request), .review_only = true};
@@ -2126,17 +2135,12 @@ View DetachedArtifactReview(std::shared_ptr<kit::Conversation> conversation, std
   const auto snapshot = conversation->Snapshot();
   auto workspace = service && service->workspaces && snapshot && snapshot->summary.workspace
       ? service->workspaces->Find(*snapshot->summary.workspace) : std::nullopt;
-  const auto theme = agentkit_preview::PreviewTheme(agentkit_preview::PreviewBrightness(
-      service ? service->settings->appearance : agentkit_preview::PreviewAppearance::Dark, UseSystemThemeBrightness()));
+  const auto theme = agentkit_preview::PreviewThemeFor(
+      service ? service->settings.Get() : agentkit_preview::PreviewSettings{}, UseSystemThemeBrightness());
   auto chat = PreviewConversation(std::move(agent), std::move(conversation), std::move(runtime), std::move(options),
-      std::move(workspace), service ? service->workspace_evidence : std::nullopt);
-  auto chrome = std::make_shared<const agentkit_preview::ChatHeader>(
-      [window](const kit::AgentChatPage&, std::optional<View>) -> std::optional<View> {
-        return Row{Button(::app::strings::ui_close_review).OnClick([window] { window.Close(); }), Spacer()}
-            .With(Padding(14.0F));
-      });
-  return MaterialTheme(theme, agentkit_preview::PreviewControlsTheme(ProvideEnvironment(preview_chat_layout,
-      ProvideEnvironment(agentkit_preview::ChatChrome{std::move(chrome)}, std::move(chat).With(Background(theme.colors.surface))))));
+      std::move(workspace), service ? service->workspace_evidence : std::nullopt, agentkit_preview::PreviewArtifactHeader(theme));
+  return MaterialTheme(theme, agentkit_preview::PreviewControlsTheme(
+      ProvideEnvironment(preview_chat_layout, std::move(chat).With(Background(theme.colors.surface)))));
 }
 
 WindowHandle OpenPreviewArtifactReview(const ApplicationHandle& application, std::shared_ptr<kit::Conversation> conversation,
@@ -2931,7 +2935,7 @@ View PreviewShell() {
           .draft = composer.text,
           .run_controls = kit::AgentChatRunControls{composer.next,
               [service, goal_session, conversation_action_style, next = composer.next, skills = composer.skills,
-               error = composer.preference_error, sources = composer.sources, draft = composer.text](
+               error = composer.preference_error, sources = composer.sources](
                   const kit::SessionSummary& summary, std::optional<kit::RunStartBinding> current) {
                 const auto folder = summary.workspace ? service->workspaces->Find(*summary.workspace) : std::nullopt;
                 std::vector<View> actions{
@@ -2942,8 +2946,6 @@ View PreviewShell() {
                 };
                 if (summary.agent.id == agentkit_preview::GeneralAgent)
                   actions.push_back(agentkit_preview::SkillPicker(service->runtime, {summary.id}, skills));
-                if (summary.agent.id == agentkit_preview::PptAgent)
-                  actions.push_back(agentkit_preview::PresentationReviewChoice(draft));
                 auto caps = service->run_settings->Capabilities(next->model, summary.agent.id);
                 if (current) {
                   const auto active = service->run_settings->Capabilities(current->model, summary.agent.id);
@@ -3005,25 +3007,21 @@ View PreviewShell() {
           location += found->name;
         }
       }
+      if (open_review) {
+        open_review = [open = std::move(open_review), review_window_error](kit::AgentChatReviewRequest review) {
+          try {
+            open(std::move(review));
+            review_window_error = "";
+          } catch (const std::exception& failure) {
+            review_window_error = failure.what();
+          }
+        };
+      }
+      auto review_header = agentkit_preview::PreviewArtifactHeader(theme, std::move(open_review), review_window_error);
       auto chrome = std::make_shared<const agentkit_preview::ChatHeader>(
           [actions = std::move(actions), snapshot, location = std::move(location), conversation_action_style,
-           back_to_comparison = std::move(back_to_comparison), open_review = std::move(open_review), review_window_error](
+           back_to_comparison = std::move(back_to_comparison)](
               const kit::AgentChatPage& page, std::optional<View> workspace_actions) -> std::optional<View> {
-            if (const auto* review = std::get_if<kit::AgentChatReviewRequest>(&page)) {
-              if (!open_review) return {};
-              std::vector<View> toolbar{Spacer(), Button(::app::strings::ui_open_in_new_window).OnClick(
-                  [open_review, review = *review, review_window_error] {
-                    try {
-                      open_review(review);
-                      review_window_error = "";
-                    } catch (const std::exception& failure) {
-                      review_window_error = failure.what();
-                    }
-                  })};
-              if (!review_window_error->empty())
-                toolbar.insert(toolbar.begin(), Text(review_window_error.Get(), TextRole::Label));
-              return Row(std::move(toolbar)).With(Padding(EdgeInsets::Symmetric(24.0F, 4.0F)));
-            }
             if (!snapshot || !std::holds_alternative<std::monostate>(page)) return {};
             const auto viewport = UseViewportClass();
             const auto compact = viewport == ViewportClass::Compact;
@@ -3056,7 +3054,7 @@ View PreviewShell() {
           });
       auto code_workspace = snapshot && snapshot->summary.workspace ? service->workspaces->Find(*snapshot->summary.workspace) : std::nullopt;
       auto chat = PreviewConversation(agent, selection.conversation, service->runtime, std::move(options),
-          std::move(code_workspace), service->workspace_evidence);
+          std::move(code_workspace), service->workspace_evidence, std::move(review_header));
       const auto run = snapshot && snapshot->summary.active_run ? snapshot->summary.run_state : std::nullopt;
       return agentkit_preview::SessionWorkspace(selection.conversation,
           ProvideEnvironment(preview_chat_layout,
@@ -3162,6 +3160,7 @@ View PreviewShell() {
         }, ready.Get()),
     };
     std::vector<View> compose;
+    std::optional<View> folder_report;
     std::optional<View> controls;
     if (ready.Get()) {
       std::optional<View> draft_action;
@@ -3181,20 +3180,19 @@ View PreviewShell() {
               .With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center), Padding(EdgeInsets::Symmetric(8.0F, 0.0F)),
                     Background(colors.surface_container_high), CornerRadius(6.0F)));
         } else {
-          if (auto control = BrowserDraftReport(service, project, workspace, native_workspace, new_report)) {
-            compose.push_back(std::move(*control));
+          folder_report = BrowserDraftReport(service, project, workspace, native_workspace, new_report);
+          if (picker && picker->CanOpenFiles()) {
+            draft_action = agentkit_preview::ImportReportControl(service->runtime, project,
+                [new_report](agentkit_preview::ImportedPresentationReport report) { new_report = std::move(report); }, draft_error)
+                .Key("draft-report/" + project.value);
           }
-          draft_action = agentkit_preview::ImportReportControl(service->runtime, project,
-              [new_report](agentkit_preview::ImportedPresentationReport report) { new_report = std::move(report); }).Key(project.value);
         }
-        auto review = agentkit_preview::PresentationReviewChoice(draft);
-        if (draft_action) draft_action = Row{std::move(*draft_action), std::move(review)}.With(Spacing(6.0F));
-        else draft_action = std::move(review);
       }
       if (!new_sources->attachments.empty()) compose.push_back(kit::AgentChatAttachmentChips(new_sources));
       const auto caps = service->run_settings->Capabilities(new_start->model, new_agent);
       if (auto picker = PreviewAttachmentAction(service, new_agent, new_start, new_sources, caps)) {
-        if (draft_action) draft_action = Row{std::move(*draft_action), std::move(*picker)}.With(Spacing(8.0F));
+        if (draft_action) draft_action = Flow{std::move(*draft_action), std::move(*picker)}
+            .With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center));
         else draft_action = std::move(*picker);
       }
       controls = agentkit_preview::RunSettingsControls(service->run_settings, new_start, new_agent, workspace_id,
@@ -3212,6 +3210,7 @@ View PreviewShell() {
     std::vector<View> context{
         Flow(std::move(selectors)).With(Spacing(7.0F), CrossAlign(CrossAxisAlignment::Center)),
     };
+    if (folder_report) context.push_back(std::move(*folder_report));
     std::vector<View> start_page{
         Text(::app::strings::ui_new_conversation, TextRole::Title)
             .Style({Font::FromFamily(theme.typography.family, compact ? 24.0F : 28.0F)
@@ -3354,8 +3353,8 @@ View PreviewShell() {
 
 View App() {
   const auto service = UseService<PreviewService>();
-  const auto brightness = agentkit_preview::PreviewBrightness(service->settings->appearance, UseSystemThemeBrightness());
-  return MaterialTheme(agentkit_preview::PreviewTheme(brightness), agentkit_preview::PreviewControlsTheme(PreviewShell()));
+  const auto theme = agentkit_preview::PreviewThemeFor(service->settings.Get(), UseSystemThemeBrightness());
+  return MaterialTheme(theme, agentkit_preview::PreviewControlsTheme(PreviewShell()));
 }
 
 ApplicationHook MakePreviewInstaller(std::optional<File> database, bool read_model_configuration) {

@@ -66,6 +66,8 @@ struct SlideElement {
   bool bold = false;
   bool centered = false;
   std::optional<std::size_t> excerpt;
+  bool vertically_centered = false;
+  int corner_radius = 0;
 };
 
 struct SlideScene {
@@ -73,6 +75,7 @@ struct SlideScene {
   std::vector<SlideElement> elements;
   std::optional<SlideRect> image;
   std::optional<SlideRect> chart;
+  std::optional<SlideRect> screenshot;
 };
 
 inline constexpr bool UsesSlideScene(SlideLayout layout, const SlideOutline& slide) {
@@ -80,7 +83,10 @@ inline constexpr bool UsesSlideScene(SlideLayout layout, const SlideOutline& sli
       layout == SlideLayout::Editorial || (layout == SlideLayout::Flow && slide.media.has_value());
 }
 
-SlideScene ComposeSlide(const PresentationOutline& outline, std::size_t page);
+// Coordinates in PowerPoint English Metric Units, shared by the preview and the editable export.
+SlideRect ClassicDiagramCard(SlideLayout layout, int count, int index);
+
+SlideScene ComposeSlide(const PresentationOutline& outline, std::size_t page, bool has_screenshot = false);
 
 huxerui::agentkit::JsonSchema PresentationOutlineSchema(SlideLayoutField layout = SlideLayoutField::Omit, bool include_evidence = false);
 huxerui::agentkit::AgentResult<PresentationOutline> ReadPresentationOutline(const huxerui::agentkit::JsonValue& value);

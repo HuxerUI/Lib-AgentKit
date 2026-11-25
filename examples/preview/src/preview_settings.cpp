@@ -22,6 +22,19 @@ constexpr std::size_t instruction_limit = 4096;
 const std::array appearance_labels{::app::strings::ui_dark, ::app::strings::ui_light, ::app::strings::ui_follow_system};
 const std::array tone_labels{::app::strings::ui_default, ::app::strings::ui_concise, ::app::strings::ui_friendly, ::app::strings::ui_formal};
 
+struct PaletteChoice {
+  PreviewPalette palette;
+  std::string_view id;
+  StringResource label;
+};
+
+const std::array palettes{
+    PaletteChoice{PreviewPalette::Graphite, "graphite", ::app::strings::ui_palette_graphite},
+    PaletteChoice{PreviewPalette::Indigo, "indigo", ::app::strings::ui_palette_indigo},
+    PaletteChoice{PreviewPalette::Forest, "forest", ::app::strings::ui_palette_forest},
+    PaletteChoice{PreviewPalette::Sandstone, "sandstone", ::app::strings::ui_palette_sandstone},
+};
+
 enum class SettingsSection { Models, Personalization, Appearance, Permissions, Storage };
 
 struct SettingsCategory {
@@ -74,26 +87,43 @@ View ModelRoleField(StringVariant label, std::vector<ModelChoice> choices, Strin
       });
 }
 
+class SettingsFieldRow final : public Layout<SettingsFieldRow> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext& context, ViewNode& node, Constraints constraints) {
+    auto& label = node.ChildAt(0);
+    auto& control = node.ChildAt(1);
+    const float lane = std::min(constraints.max_width, 820.0F);
+    const float gap = std::min(20.0F, lane * 0.05F);
+    const float control_width = std::min(282.0F, lane * 0.45F);
+    const float label_width = lane - control_width - gap;
+    const auto label_size = context.Measure(label, constraints.Loose().TightWidth(label_width));
+    const auto control_size = context.Measure(control, constraints.Loose().TightWidth(control_width));
+    const auto size = constraints.Constrain({lane, std::max(label_size.height, control_size.height)});
+    return LayoutResult{}.SetSize(size)
+        .Place(label, {0.0F, (size.height - label_size.height) / 2.0F})
+        .Place(control, {label_width + gap, (size.height - control_size.height) / 2.0F});
+  }
+};
+
 View SettingsRow(StringVariant label, StringVariant help, View control, bool stacked, const ColorScheme& colors) {
   auto copy = Column{
       Text(label).Style({Font::System(14.0F).WithWeight(FontWeight::Medium), colors.on_surface}),
       Text(help).Style({Font::System(13.0F), colors.on_surface_variant}),
   }.With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch));
-  if (stacked) return Column{std::move(copy), std::move(control)}.With(Padding(14.0F), Spacing(9.0F),
+  if (stacked) return Column{std::move(copy), std::move(control)}.With(Padding(EdgeInsets::Symmetric(0.0F, 14.0F)), Spacing(9.0F),
       CrossAlign(CrossAxisAlignment::Stretch));
-  return Row{std::move(copy).With(Grow()), std::move(control).With(Frame{.width = 282.0F})}
-      .With(Padding(16.0F), Spacing(20.0F), CrossAlign(CrossAxisAlignment::Center));
+  return SettingsFieldRow{std::move(copy), std::move(control)}.With(Padding(EdgeInsets::Symmetric(0.0F, 15.0F)));
 }
 
 View SettingsPanel(std::vector<View> rows, const ColorScheme& colors) {
   std::vector<View> content;
   for (auto& row : rows) {
-    if (!content.empty()) content.push_back(
-        ProvideEnvironment(DividerStyle{colors.outline}, Divider().With(Padding(EdgeInsets::Symmetric(18.0F, 0.0F)))));
+    content.push_back(ProvideEnvironment(DividerStyle{colors.outline}, Divider()));
     content.push_back(std::move(row));
   }
-  return Column(std::move(content)).With(CrossAlign(CrossAxisAlignment::Stretch),
-      CornerRadius(10.0F), Background(colors.surface_container_low), Border{colors.outline});
+  return Column(std::move(content)).With(CrossAlign(CrossAxisAlignment::Stretch));
 }
 
 [[huxerui::composable]]
@@ -102,21 +132,20 @@ View SettingsCategoryLink(SettingsCategory category, State<SettingsSection> acti
   const auto& colors = theme.colors;
   const auto select = [active, section = category.section] { active = section; };
   const bool selected = active.Get() == category.section;
-  return Row{
-      Canvas([ink = selected ? colors.primary : Color::Transparent()](PaintContext& context, Size size) {
-        context.DrawRect({0.0F, 0.0F, size.width, size.height}, ink, CornerRadii{1.0F});
-      }).With(Frame{.width = 2.0F, .height = 14.0F}),
+  return Column{
       Text(category.title).Style({Font::System(13.0F).WithWeight(selected ? FontWeight::SemiBold : FontWeight::Medium),
-          selected ? colors.on_primary_container : colors.on_surface_variant}),
+          selected ? colors.on_surface : colors.on_surface_variant})
+          .With(Padding(EdgeInsets::Symmetric(9.0F, 8.0F))),
+      Column{}.With(Frame{.height = 2.0F}, CornerRadius(1.0F),
+          Background(selected ? colors.primary : Color::Transparent())),
   }
       .OnClick(select).On<ViewEvents::KeyDown>([select](const KeyEvent& event) {
         if (event.key != Key::Enter && event.key != Key::Space) return false;
         select();
         return true;
       })
-      .With(Focusable{}, Padding(EdgeInsets::Symmetric(10.0F, 0.0F)), Frame{.height = 38.0F}, Spacing(7.0F),
-          CrossAlign(CrossAxisAlignment::Center), CornerRadius(9.0F),
-          Background(selected ? colors.primary_container : Color::Transparent()), PreviewRowIndication(theme, 9.0F),
+      .With(Focusable{}, CrossAlign(CrossAxisAlignment::Stretch),
+          Indication{.focus = theme.interactions.indication.focus},
           PointerCursor(PointerCursorKind::Hand),
           Semantics{.role = SemanticRole::Button, .label = category.title, .selected = selected});
 }
@@ -132,6 +161,8 @@ kit::Async<PreviewSettings> ReadPreviewSettings(File file) {
   try {
     const auto doc = Json::parse(raw.Value());
     const auto appearance = doc.value("appearance", std::size_t{});
+    const auto palette = doc.value("palette", std::string("graphite"));
+    const auto choice = std::ranges::find(palettes, palette, &PaletteChoice::id);
     const auto tone = doc.value("tone", std::size_t{});
     auto instructions = doc.value("instructions", std::string{});
     if (appearance >= appearance_labels.size() || tone >= tone_labels.size() || instructions.size() > instruction_limit) {
@@ -148,7 +179,8 @@ kit::Async<PreviewSettings> ReadPreviewSettings(File file) {
       if (file_access.revision.empty() || file_access.directories.size() > 64)
         throw std::invalid_argument("Invalid file access settings");
     }
-    co_return Result::Success({.appearance = static_cast<PreviewAppearance>(appearance), .tone = static_cast<ReplyTone>(tone),
+    co_return Result::Success({.appearance = static_cast<PreviewAppearance>(appearance),
+        .palette = choice == palettes.end() ? PreviewPalette::Graphite : choice->palette, .tone = static_cast<ReplyTone>(tone),
         .instructions = std::move(instructions), .daily_model = ReadModel(doc, "daily_model"),
         .image_model = ReadModel(doc, "image_model"), .review_model = ReadModel(doc, "review_model"),
         .image_endpoint = ReadModel(doc, "image_endpoint"), .image_generation_model = std::move(image_generation_model), .file_access = std::move(file_access)});
@@ -166,7 +198,9 @@ kit::Async<void> SavePreviewSettings(File file, PreviewSettings settings) {
       settings.image_generation_model.find_first_of(" \t\r\n") != std::string::npos)
     co_return Result::Failure({.code = kit::ErrorCode::InvalidArgument, .message = "Enter a single image generation model ID."});
   auto temporary = file.Parent()->Child(kit::NewCommandId().value + ".settings-pending");
+  const auto palette = std::ranges::find(palettes, settings.palette, &PaletteChoice::palette);
   auto contents = Json{{"appearance", static_cast<std::size_t>(settings.appearance)},
+      {"palette", palette == palettes.end() ? palettes.front().id : palette->id},
       {"tone", static_cast<std::size_t>(settings.tone)}, {"instructions", std::move(settings.instructions)},
       {"daily_model", ModelRecord(settings.daily_model)}, {"image_model", ModelRecord(settings.image_model)},
       {"review_model", ModelRecord(settings.review_model)}, {"image_endpoint", ModelRecord(settings.image_endpoint)},
@@ -193,12 +227,10 @@ std::string WithReplyPreferences(std::string instructions, const PreviewSettings
   return instructions;
 }
 
-ThemeBrightness PreviewBrightness(PreviewAppearance appearance, ThemeBrightness system) {
-  switch (appearance) {
-  case PreviewAppearance::Light: return ThemeBrightness::Light;
-  case PreviewAppearance::System: return system;
-  default: return ThemeBrightness::Dark;
-  }
+ThemeSpec PreviewThemeFor(const PreviewSettings& settings, ThemeBrightness system) {
+  const auto brightness = settings.appearance == PreviewAppearance::System ? system :
+      settings.appearance == PreviewAppearance::Light ? ThemeBrightness::Light : ThemeBrightness::Dark;
+  return PreviewTheme(settings.palette, brightness);
 }
 
 [[huxerui::composable]]
@@ -280,7 +312,7 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
     std::erase_if(vision, [](const auto& item) { return !item.capabilities.image_input; });
     std::vector<View> catalog;
     if (choices.empty()) catalog.push_back(Text(::app::strings::ui_no_models_configured)
-        .Style({Font::System(13.0F), colors.on_surface_variant}).With(Padding(16.0F)));
+        .Style({Font::System(13.0F), colors.on_surface_variant}).With(Padding(EdgeInsets::Symmetric(0.0F, 13.0F))));
     const auto token_display = [unknown = UseString(::app::strings::ui_model_limit_unknown)](auto value) {
       return value ? std::to_string(*value) : unknown;
     };
@@ -296,7 +328,7 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
       std::vector<View> row{std::move(details)};
       if (edit_model && model.editable) row.push_back(ProvideEnvironment(secondary, Button(::app::strings::ui_edit_model)
           .OnClick([dialog, model, edit_model] { ShowEditModel(dialog, model, edit_model); }).Key("settings-edit-model/" + model.ref.id.value)));
-      catalog.push_back(Row(std::move(row)).With(Padding(EdgeInsets::Symmetric(16.0F, 10.0F)),
+      catalog.push_back(Row(std::move(row)).With(Padding(EdgeInsets::Symmetric(0.0F, 10.0F)),
           Spacing(12.0F), CrossAlign(CrossAxisAlignment::Center)).Key(model.ref.id.value));
     }
     content.push_back(SettingsPanel(std::move(catalog), colors).Key("settings-model-list"));
@@ -346,18 +378,32 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
                   value.instructions = text.text;
                   draft = std::move(value);
                 }).Key("settings-instructions")),
-        }.With(Padding(16.0F), Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch)),
+        }.With(Padding(EdgeInsets::Symmetric(0.0F, 15.0F)), Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch)),
     }, colors));
     break;
   case SettingsSection::Appearance:
     content.push_back(SettingsPanel({
-        SettingsRow(::app::strings::ui_theme, ::app::strings::ui_applies_as_soon_as_you_save,
+        SettingsRow(::app::strings::ui_theme_brightness, ::app::strings::ui_applies_as_soon_as_you_save,
             Select(appearance_labels, static_cast<std::size_t>(draft->appearance), [](const StringResource& label) { return Text(label); })
-              .Label(::app::strings::ui_theme).OnChanged([draft](std::size_t index) {
+              .Label(::app::strings::ui_theme_brightness).OnChanged([draft](std::size_t index) {
                 auto value = draft.Get();
                 value.appearance = static_cast<PreviewAppearance>(index);
                 draft = std::move(value);
               }).Key("settings-theme"), stack_fields, colors),
+        SettingsRow(::app::strings::ui_theme_palette, ::app::strings::ui_theme_palette_help,
+            Select(palettes, static_cast<std::size_t>(draft->palette), [](const PaletteChoice& choice) {
+                const auto light = PreviewTheme(choice.palette, ThemeBrightness::Light).colors;
+                const auto dark = PreviewTheme(choice.palette, ThemeBrightness::Dark).colors;
+                return Row{
+                    Column{}.With(Frame{.width = 11.0F, .height = 11.0F}, CornerRadius(3.0F), Background(light.primary)),
+                    Column{}.With(Frame{.width = 11.0F, .height = 11.0F}, CornerRadius(3.0F), Background(dark.primary)),
+                    Text(choice.label),
+                }.With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Center), Semantics{.label = choice.label});
+              }).Label(::app::strings::ui_theme_palette).OnChanged([draft](std::size_t index) {
+                auto value = draft.Get();
+                value.palette = palettes.at(index).palette;
+                draft = std::move(value);
+              }).Key("settings-palette"), stack_fields, colors),
     }, colors));
     break;
   case SettingsSection::Permissions: {
@@ -411,7 +457,7 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
             std::erase(value.file_access.directories, directory);
             draft = std::move(value);
           }).With(Enabled(!busy.Get())))}
-          .With(Padding(EdgeInsets::Symmetric(16.0F, 8.0F)), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center)).Key(directory));
+          .With(Padding(EdgeInsets::Symmetric(0.0F, 8.0F)), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center)).Key(directory));
     }
     content.push_back(SettingsPanel(std::move(rows), colors).Key("settings-file-access"));
     break;
@@ -421,7 +467,7 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
         Column{
             Text(::app::strings::ui_preview_data_folder).Style({Font::System(14.0F).WithWeight(FontWeight::Medium), colors.on_surface}),
             Text(file.ParentPath().value_or(std::string{})).With(Foreground(colors.on_surface_variant)),
-        }.With(Padding(16.0F), Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch)),
+        }.With(Padding(EdgeInsets::Symmetric(0.0F, 15.0F)), Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch)),
     }, colors));
     break;
   }
@@ -444,7 +490,7 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
               Text(::app::strings::ui_settings, TextRole::Title)
                   .Style({Font::System(20.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}).With(Grow()).Key("settings-title"),
           }.With(Padding(EdgeInsets::Symmetric(0.0F, 10.0F)), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center)),
-          Flow(std::move(links)).With(Spacing(5.0F), Padding(EdgeInsets{.bottom = 8.0F})),
+          Flow(std::move(links)).With(Spacing(9.0F)),
       }.With(CrossAlign(CrossAxisAlignment::Stretch))),
       ProvideEnvironment(DividerStyle{colors.outline}, Divider()),
       std::move(content_area),

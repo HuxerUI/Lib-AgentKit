@@ -224,16 +224,21 @@ Task<void> JsonToolCalls(TaskScope tasks) {
         "The authorized functions must be described in the prompt");
     std::string content;
     if (server.requests == 1) {
-      content = "```json\n{\"tool\":\"read_files\",\"arguments\":{\"paths\":[\"README.md\"]}}";
+      content = "```json\n{\"tool\":\"read_files\",\"arguments\":{\"paths\":[\"README.md\"]},"
+          "\"progress\":\"I will check the README.\"}";
     } else if (server.requests == 2) {
-      const auto call = Json::parse(messages[2]["content"].get<std::string>()).at("tool_requests").at(0);
+      const auto exchange = Json::parse(messages[2]["content"].get<std::string>());
+      const auto& call = exchange.at("tool_requests").at(0);
       const auto result = Json::parse(messages[3]["content"].get<std::string>()).at("tool_result");
-      Check(messages[3]["role"] == "user" && call["tool"] == "read_files" &&
+      Check(messages[2]["role"] == "assistant" && exchange["progress"] == "I will check the README." &&
+          messages[3]["role"] == "user" && call["tool"] == "read_files" &&
           call["id"] == result["id"] && result["data"]["contents"] == "Fixture README",
           "JSON tool requests and results must round-trip with the same call identity");
       content = R"({"answer":"Read Fixture README"})";
+    } else if (server.requests == 3) {
+      content = R"({"tool":"read_files","arguments":{}})";
     } else {
-      content = R"({"tool":"unoffered","arguments":{}})";
+      content = R"({"tool":"unoffered","arguments":{},"progress":"This must not be published"})";
     }
     const auto mid = content.size() / 2;
     return Frame(Choice({{"content", content.substr(0, mid)}})) + Frame(Choice({{"content", content.substr(mid)}})) +
@@ -246,14 +251,18 @@ Task<void> JsonToolCalls(TaskScope tasks) {
   request.tools = {{{{"read_files"}, 1, {}}, "read_files", "Read files", {kit::detail::FromWireJson({{"type", "object"}})}}};
   auto stream = Take(co_await model.provider->StartTurnAsync(request));
   auto events = co_await Collect(*stream);
-  const auto& started = std::get<kit::ModelToolStarted>(events.front());
-  const auto& arguments = std::get<kit::ModelToolArguments>(events[1]);
-  Check(events.size() == 4 && started.name == "read_files" && arguments.provider_call_id == started.provider_call_id &&
+  Check(events.size() == 5, "JSON progress and tool events must all be emitted");
+  const auto& progress = std::get<kit::ModelTextDelta>(events.front());
+  const auto& started = std::get<kit::ModelToolStarted>(events[1]);
+  const auto& arguments = std::get<kit::ModelToolArguments>(events[2]);
+  Check(progress.utf8 == "I will check the README." && progress.show_in_transcript &&
+      started.name == "read_files" && arguments.provider_call_id == started.provider_call_id &&
       Json::parse(arguments.bytes)["paths"] == Json::array({"README.md"}) &&
-      std::get<kit::ModelToolFinished>(events[2]).provider_call_id == started.provider_call_id &&
+      std::get<kit::ModelToolFinished>(events[3]).provider_call_id == started.provider_call_id &&
       std::get<kit::ModelFinished>(events.back()).reason == kit::ModelFinishReason::ToolCalls,
-      "Fenced JSON must produce a complete tool call without transcript text");
+      "Fenced JSON must publish only the public update before the complete tool call");
   request.turn = {"fixture-next-turn"};
+  request.items.emplace_back(kit::ModelContent{kit::ModelContent::Role::Assistant, progress.utf8});
   request.items.emplace_back(kit::ModelToolCall{started.provider_call_id, started.name,
       kit::detail::FromWireJson(Json::parse(arguments.bytes))});
   request.items.emplace_back(kit::ModelToolResult{started.provider_call_id, kit::ToolCallId{"local-read"},
@@ -263,6 +272,10 @@ Task<void> JsonToolCalls(TaskScope tasks) {
   Check(answer.size() == 2 && std::get<kit::ModelTextDelta>(answer.front()).utf8 == "Read Fixture README" &&
       std::get<kit::ModelFinished>(answer.back()).reason == kit::ModelFinishReason::Completed,
       "The transcript must receive the answer without the JSON envelope");
+  auto legacy = Take(co_await model.provider->StartTurnAsync(request));
+  const auto legacy_events = co_await Collect(*legacy);
+  Check(legacy_events.size() == 4 && std::holds_alternative<kit::ModelToolStarted>(legacy_events.front()),
+      "The JSON tool request still accepts an omitted progress field");
   auto rejected = Take(co_await model.provider->StartTurnAsync(std::move(request)));
   ErrorIs(co_await rejected->ReadAsync(), kit::ErrorCode::ProtocolError);
 }

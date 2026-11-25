@@ -1,6 +1,7 @@
 #pragma once
 
 #include <huxerui/agentkit.h>
+#include <huxerui/theme.h>
 
 namespace agentkit_preview {
 
@@ -14,6 +15,10 @@ struct ChatChrome {
 
   bool operator==(const ChatChrome&) const = default;
 };
+
+huxerui::agentkit::AgentChatReviewHeader PreviewArtifactHeader(const huxerui::ThemeSpec& theme,
+    std::function<void(huxerui::agentkit::AgentChatReviewRequest)> open_window = {},
+    std::optional<huxerui::State<std::string>> error = {});
 
 huxerui::View PreviewDraftComposer(huxerui::State<huxerui::TextEditingValue> draft, huxerui::ViewHandle focus,
     huxerui::State<bool> focused, huxerui::StringVariant placeholder, const char* input_key,

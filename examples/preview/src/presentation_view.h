@@ -23,7 +23,8 @@ using PresentationReviewPages = std::map<std::pair<huxerui::agentkit::ArtifactId
 using OpenPresentationLocation = std::function<void(PresentationLocation)>;
 
 huxerui::View ImportReportControl(std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime,
-    huxerui::agentkit::ProjectId project, std::function<void(ImportedPresentationReport)> imported);
+    huxerui::agentkit::ProjectId project, std::function<void(ImportedPresentationReport)> imported,
+    std::optional<huxerui::State<std::string>> draft_error = {});
 huxerui::View SharedReportsDialog(huxerui::DialogContext dialog,
     std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime, huxerui::agentkit::ProjectId project);
 
@@ -42,8 +43,6 @@ huxerui::agentkit::Async<std::shared_ptr<huxerui::agentkit::Conversation>> OpenP
 void ConfigurePreviewArtifactReview(huxerui::agentkit::AgentChatOptions& options,
     std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime, huxerui::State<PresentationReviewPages> pages,
     OpenPresentationLocation open = {}, std::shared_ptr<CodeWorkspaces> workspaces = {});
-
-huxerui::View PresentationReviewChoice(huxerui::State<huxerui::TextEditingValue> draft);
 
 huxerui::View PresentationChat(std::shared_ptr<huxerui::agentkit::Conversation> conversation,
     std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime, huxerui::agentkit::AgentChatOptions options = {});

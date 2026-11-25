@@ -191,7 +191,8 @@ View DesignDetails(const ReviewedDesign& design, const std::vector<kit::Artifact
         .Style({Font::System(19.0F).WithWeight(FontWeight::SemiBold), colors.on_surface})
         .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow(), Tooltip(board.title)));
   }
-  if (detach) navigation.push_back(Button(::app::strings::ui_open_in_new_window).OnClick(std::move(detach)));
+  if (detach) navigation.push_back(PreviewChromeAction(::app::images::open_external, ::app::strings::ui_open_in_new_window,
+      std::move(detach), theme).Key("review-open-in-new-window"));
   std::vector<View> revisions;
   std::vector<View> decisions;
   if (design.artifact) {
@@ -260,9 +261,6 @@ View DesignDetails(const ReviewedDesign& design, const std::vector<kit::Artifact
 View DesignChat(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<kit::AgentRuntime> runtime,
                 kit::AgentChatOptions base_options, std::optional<DesignReviewLocation> window_review,
                 std::optional<File> evidence) {
-  const auto settings = UseService<State<PreviewSettings>>();
-  const auto brightness = PreviewBrightness(settings ? settings->Get().appearance : PreviewAppearance::Dark,
-      UseSystemThemeBrightness());
   const auto tasks = UseTaskScope();
   const auto application = UseApplication();
   const auto window = UseWindow();
@@ -585,10 +583,13 @@ View DesignChat(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr
     details = IndexedPages({details, impact_review}, target ? 1U : 0U).With(Grow());
   }
   if (window_review) {
-    if (visible) return MaterialTheme(PreviewTheme(brightness), std::move(details));
+    const auto settings = UseService<State<PreviewSettings>>();
+    const auto theme = PreviewThemeFor(settings ? settings->Get() : PreviewSettings{}, UseSystemThemeBrightness());
+    if (visible) return MaterialTheme(theme, PreviewControlsTheme(std::move(details).With(Background(theme.colors.surface))));
     const auto message = !error->empty() ? error.Get() : review->board ? "Design review unavailable" : "Opening design review...";
-    return MaterialTheme(PreviewTheme(brightness),
-        Column{Button(::app::strings::ui_close_review).OnClick(close), Text(message)}.With(Grow(), Padding(24.0F), Spacing(12.0F)));
+    return MaterialTheme(theme, PreviewControlsTheme(
+        Column{Button(::app::strings::ui_close_review).OnClick(close), Text(message)}
+            .With(Grow(), Padding(24.0F), Spacing(12.0F), Background(theme.colors.surface))));
   }
   return IndexedPages({
       Column(std::move(conversation_page)).With(Grow(), Spacing(8.0F)),

@@ -165,10 +165,10 @@ View SlideScreenshot(std::shared_ptr<kit::AgentRuntime> runtime, kit::ArtifactRe
   }, runtime, artifact, page);
   if (!error->empty()) return Text(error.Get());
   if (const auto picture = screenshot.Get()) {
-    std::vector<View> body{Image(picture->image).Fit(ImageFit::Contain).With(Frame{.max_height = 220.0F},
+    std::vector<View> body{Image(picture->image).Fit(ImageFit::Contain).With(Grow(),
         Semantics{.label = std::string(PresentationScreenshotLabel)})};
     if (picture->selectable) body.push_back(Button(::app::strings::ui_select_implementation_screenshot).OnClick(std::move(select)));
-    return Column(std::move(body)).With(Spacing(6.0F));
+    return Column(std::move(body)).With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch));
   }
   return Text(::app::strings::ui_loading_implementation_screenshot, TextRole::Label);
 }
@@ -268,51 +268,6 @@ View OutlineSlideIndex(const FormDraft& draft, std::function<void(std::size_t)> 
   }
   return ScrollView(Column(std::move(rows)).With(Spacing(2.0F), Padding(4.0F), CrossAlign(CrossAxisAlignment::Stretch)))
       .With(ScrollBar(), CornerRadius(8.0F), Border{colors.outline}, Background(colors.surface)).Key("outline-slide-index");
-}
-
-Color SlideInk(SlideLayout layout, bool heading) {
-  if (layout == SlideLayout::Cover) return heading ? Color::Rgb(246, 251, 249) : Color::Rgb(201, 226, 217);
-  return heading ? Color::Rgb(23, 43, 48) : Color::Rgb(51, 71, 75);
-}
-
-View PresentationPoints(SlideLayout layout, std::vector<View> points) {
-  const bool flow = layout == SlideLayout::Flow;
-  if (layout == SlideLayout::List || layout == SlideLayout::Cover) {
-    if (layout == SlideLayout::List) {
-      for (auto& point : points) {
-        point = Row{
-            Text("\xe2\x80\xa2").Style({Font::System(14.0F), Color::Rgb(22, 111, 98)}),
-            Row{std::move(point)}.With(Grow()),
-        }.With(Spacing(7.0F), CrossAlign(CrossAxisAlignment::Center));
-      }
-    }
-    return Column(std::move(points)).With(Spacing(7.0F), CrossAlign(CrossAxisAlignment::Stretch));
-  }
-  const auto columns = flow ? points.size() : 2U;
-  std::vector<View> rows;
-  for (std::size_t start = 0; start < points.size(); start += columns) {
-    std::vector<View> cells;
-    for (std::size_t index = start; index < points.size() && index < start + columns; ++index) {
-      const bool alternate = layout == SlideLayout::Comparison && index == 1;
-      const auto fill = alternate ? Color::Rgb(232, 238, 248) : flow ? Color::Rgb(228, 239, 235) : Color::Rgb(234, 241, 238);
-      std::vector<View> cell;
-      if (!flow) {
-        cell.push_back(Spacer().With(Frame{.width = 15.0F, .height = 2.0F},
-            Background(alternate ? Color::Rgb(83, 116, 172) : Color::Rgb(40, 135, 121))));
-      }
-      cell.push_back(std::move(points[index]));
-      cells.push_back(Column(std::move(cell)).With(Frame{.min_height = flow ? 54.0F : 62.0F},
-          Padding(8.0F), Spacing(6.0F), MainAlign(MainAxisAlignment::Center),
-          CornerRadius(4.0F), Background(fill), Grow()).Key("presentation-point/" + std::to_string(index)));
-      if (flow && index + 1 < points.size()) {
-        cells.push_back(Column{Text("\xe2\x86\x92").Style({Font::System(15.0F), Color::Rgb(22, 111, 98)})}
-            .With(MainAlign(MainAxisAlignment::Center)));
-      }
-    }
-    if (!flow && cells.size() == 1) cells.push_back(Spacer().With(Grow()));
-    rows.push_back(Row(std::move(cells)).With(Spacing(7.0F), CrossAlign(CrossAxisAlignment::Stretch)));
-  }
-  return Column(std::move(rows)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch)).Key("presentation-diagram");
 }
 
 constexpr float InlineSlideHeight = 368.0F;
@@ -417,11 +372,33 @@ void DrawSlideChart(PaintContext& context, const SlideRect& area, const Presenta
   }
 }
 
+SlideScene FitSlideText(SlideScene scene, TextMeasurer& measurer) {
+  for (auto& element : scene.elements) {
+    if (element.shape != SlideShape::Text || element.size <= 0) continue;
+    const auto weight = element.bold ? FontWeight::Bold : FontWeight::Regular;
+    const auto fits = [&](int size) {
+      const TextStyle style{Font::Named("Aptos", static_cast<float>(size)).WithWeight(weight), Color::Black()};
+      return measurer.MeasureText(element.text, style, static_cast<float>(element.bounds.width)).size.height <= element.bounds.height;
+    };
+    if (fits(element.size)) continue;
+    int lower = 1;
+    int upper = element.size;
+    while (upper - lower > 1) {
+      const auto middle = (lower + upper) / 2;
+      if (fits(middle)) lower = middle;
+      else upper = middle;
+    }
+    element.size = lower;
+  }
+  return scene;
+}
+
 [[huxerui::composable]]
 View VisualPresentationSlide(SlideScene scene, std::optional<PresentationChart> chart,
     std::shared_ptr<kit::AgentRuntime> runtime, std::optional<kit::ArtifactRef> artifact, std::size_t page,
-    std::function<void(std::size_t)> select, float height_limit = 490.0F) {
+    std::function<void(std::size_t)> select, float height_limit = 490.0F, std::optional<View> screenshot = {}) {
   const auto tasks = UseTaskScope();
+  const auto fitted_scene = FitSlideText(scene, UseTextMeasurer());
   const auto temporary = PictureReviewDirectory(UseApplication());
   const auto image = UseState(std::shared_ptr<const ImageAsset>{});
   const auto failed = UseState(false);
@@ -438,7 +415,7 @@ View VisualPresentationSlide(SlideScene scene, std::optional<PresentationChart> 
     return [load] { if (load) load->Cancel(); };
   }, runtime, artifact, page, illustrated);
   std::vector<View> elements;
-  elements.push_back(Canvas([scene, chart, asset = image.Get()](PaintContext& context, Size size) {
+  elements.push_back(Canvas([scene = fitted_scene, chart, asset = image.Get()](PaintContext& context, Size size) {
     if (size.width <= 0 || size.height <= 0) return;
     const auto scale = size.width / 1280;
     context.DrawRect({0, 0, size.width, size.height}, SlideColor(scene.background));
@@ -462,12 +439,13 @@ View VisualPresentationSlide(SlideScene scene, std::optional<PresentationChart> 
       switch (element.shape) {
       case SlideShape::Text: {
         auto style = TextStyle{Font::Named("Aptos", element.size * scale).WithWeight(element.bold ? FontWeight::Bold : FontWeight::Regular), color};
-        auto options = TextLayoutOptions{.align = element.centered ? TextAlign::Center : TextAlign::Leading};
+        auto options = TextLayoutOptions{.align = element.centered ? TextAlign::Center : TextAlign::Leading,
+            .vertical_align = element.vertically_centered ? TextVerticalAlign::Center : TextVerticalAlign::Top};
         context.DrawText(bounds, element.text, style, options);
         break;
       }
       case SlideShape::Rectangle:
-        context.DrawRect(bounds, color);
+        context.DrawRect(bounds, color, CornerRadii{element.corner_radius * scale});
         break;
       case SlideShape::Circle:
         context.DrawCircle({bounds.x + bounds.width / 2, bounds.y + bounds.height / 2}, bounds.width / 2, color);
@@ -485,8 +463,12 @@ View VisualPresentationSlide(SlideScene scene, std::optional<PresentationChart> 
         : "presentation-point/" + std::to_string(index - 1);
     View text = Text(element.text).Style({Font::System(14), Color::Transparent()}).Key(key);
     if (select) {
-      text = std::move(text).OnClick([select, index] { select(index); })
-          .With(Focusable{}, PointerCursor(PointerCursorKind::Hand), Semantics{.role = SemanticRole::Button, .label = element.text});
+      const auto activate = [select, index] { select(index); };
+      text = std::move(text).OnClick(activate).On<ViewEvents::KeyDown>([activate](const KeyEvent& event) {
+        if (event.key != Key::Enter && event.key != Key::Space) return false;
+        if (!event.repeat) activate();
+        return true;
+      }).With(Focusable{}, PointerCursor(PointerCursorKind::Hand), Semantics{.role = SemanticRole::Button, .label = element.text});
     }
     elements.push_back(std::move(text).LayoutValue<SlideElementBounds>(element.bounds));
   }
@@ -496,47 +478,9 @@ View VisualPresentationSlide(SlideScene scene, std::optional<PresentationChart> 
     elements.push_back(Text(status, TextRole::Label).With(Foreground(SlideColor(0x655D54)), Padding(12))
         .LayoutValue<SlideElementBounds>(*scene.image));
   }
+  if (scene.screenshot && screenshot)
+    elements.push_back(View(*screenshot).LayoutValue<SlideElementBounds>(*scene.screenshot));
   auto surface = SlideSceneLayout(std::move(elements)).With(ClipChildren{}, CornerRadius(5.0F)).Key("presentation-slide");
-  return PresentationViewport{std::move(surface)}.LayoutValue<SlideHeightLimit>(height_limit);
-}
-
-View PresentationSlide(std::string deck, SlideLayout layout, View title, std::vector<View> points,
-                       std::optional<View> screenshot, float height_limit = 490.0F) {
-  const bool cover = layout == SlideLayout::Cover;
-  const auto accent = cover ? Color::Rgb(141, 226, 198) : Color::Rgb(22, 111, 98);
-  const auto background = cover ? Color::Rgb(16, 44, 44) : Color::Rgb(247, 249, 247);
-  auto name = Row{
-      Spacer().With(Frame{.width = 2.0F, .height = 10.0F}, Background(accent)),
-      Text(std::move(deck)).Style({Font::System(10.5F).WithWeight(FontWeight::SemiBold), accent})
-          .LineLimit(1).Overflow(TextOverflow::Ellipsis),
-  }.With(Spacing(7.0F), CrossAlign(CrossAxisAlignment::Center));
-  std::vector<View> content{std::move(title)};
-  if (!cover) {
-    content.push_back(Spacer().With(Frame{.height = 1.0F}, Background(Color::Rgb(209, 222, 218))));
-  }
-  if (!points.empty() || screenshot) {
-    auto body = PresentationPoints(layout, std::move(points));
-    if (screenshot)
-      body = Row{std::move(body).With(Grow()), Column{std::move(*screenshot)}.With(Grow(), CrossAlign(CrossAxisAlignment::Stretch))}
-          .With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch));
-    content.push_back(std::move(body));
-  }
-  auto body = Column(std::move(content)).With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch),
-      MainAlign(cover ? MainAxisAlignment::Center : MainAxisAlignment::Start), Grow());
-  auto surface = Stack{
-      Canvas([cover, background, accent](PaintContext& context, Size size) {
-        if (!cover || size.width < 325.0F) return;
-        const Point center{size.width * 0.80F, size.height * 0.48F};
-        const float radius = size.height * 0.20F;
-        context.DrawCircle(center, radius, Color::Rgb(29, 75, 72));
-        context.DrawCircle(center, radius * 0.77F, background);
-        context.DrawCircle(center, radius * 0.32F, Color::Rgb(38, 90, 81));
-        context.DrawCircle({center.x + radius * 0.74F, center.y - radius * 0.66F}, radius * 0.16F, accent);
-      }).With(Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch)),
-      Column{std::move(name), std::move(body)}
-          .With(Padding(18.0F), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch),
-              Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch)),
-  }.With(ClipChildren{}, CornerRadius(5.0F), Background(background)).Key("presentation-slide");
   return PresentationViewport{std::move(surface)}.LayoutValue<SlideHeightLimit>(height_limit);
 }
 
@@ -948,33 +892,11 @@ View StagedPresentationReview(PresentationOutline outline, std::optional<std::si
   }
   const auto part = SlidePart(index);
   const auto& slide = outline.slides[index];
-  const auto layout = ResolveSlideLayout(outline, index, screenshot_page == index + 1);
   const auto select_field = [selection, artifact, part](std::size_t offset, std::size_t size) {
     selection = kit::SourceSlice{artifact, {}, kit::SourceTextRange{part, offset, offset + size}};
   };
   const auto colors = UseTheme().colors;
   const auto navigation = PresentationNavigationStyle(UseEnvironment<ButtonStyle>(), colors.on_surface_variant);
-  auto slide_title = UseEnvironment<ButtonStyle>();
-  slide_title.background = Color::Transparent();
-  slide_title.label_style = {Font::System(layout == SlideLayout::Cover ? 29.0F : 23.0F).WithWeight(FontWeight::SemiBold),
-      SlideInk(layout, true)};
-  slide_title.padding = {};
-  slide_title.minimum_height = 32.0F;
-  auto slide_bullet = slide_title;
-  slide_bullet.label_style = {Font::System(14.0F), SlideInk(layout, false)};
-  slide_bullet.minimum_height = 25.0F;
-  auto title = ProvideEnvironment(slide_title, Row{
-          Button(slide.title).OnClick([select_field, size = slide.title.size()] { select_field(0, size); }).Key("slide-title"),
-          Spacer()}.With(CrossAlign(CrossAxisAlignment::Center)));
-  auto offset = slide.title.size() + 1;
-  std::vector<View> points;
-  for (std::size_t i = 0; i < slide.bullets.size(); ++i) {
-    const auto& bullet = slide.bullets[i];
-    points.push_back(ProvideEnvironment(slide_bullet,
-        Button(bullet).OnClick([select_field, offset, size = bullet.size()] { select_field(offset, size); })
-            .Key("slide-bullet-" + std::to_string(i))));
-    offset += bullet.size() + 1;
-  }
   std::optional<View> screenshot;
   if (screenshot_page == index + 1) {
     const auto picture = PresentationScreenshotPart(index + 1);
@@ -1004,18 +926,14 @@ View StagedPresentationReview(PresentationOutline outline, std::optional<std::si
       }});
     })));
   }
-  auto slide_view = [&]() -> View {
-    if (!UsesSlideScene(layout, slide))
-      return PresentationSlide(outline.title, layout, std::move(title), std::move(points), std::move(screenshot));
-    const auto* chart = ChartFor(outline, slide);
-    return VisualPresentationSlide(ComposeSlide(outline, index), chart ? std::optional{*chart} : std::nullopt,
-        runtime, artifact, index + 1, [select_field, slide](std::size_t field) {
-          if (field == 0) { select_field(0, slide.title.size()); return; }
-          auto begin = slide.title.size() + 1;
-          for (std::size_t i = 1; i < field; ++i) begin += slide.bullets[i - 1].size() + 1;
-          select_field(begin, slide.bullets[field - 1].size());
-        });
-  }();
+  const auto* chart = ChartFor(outline, slide);
+  auto slide_view = VisualPresentationSlide(ComposeSlide(outline, index, screenshot_page == index + 1),
+      chart ? std::optional{*chart} : std::nullopt, runtime, artifact, index + 1, [select_field, slide](std::size_t field) {
+        if (field == 0) { select_field(0, slide.title.size()); return; }
+        auto begin = slide.title.size() + 1;
+        for (std::size_t i = 1; i < field; ++i) begin += slide.bullets[i - 1].size() + 1;
+        select_field(begin, slide.bullets[field - 1].size());
+      }, 490.0F, std::move(screenshot)).Key(part.value);
   std::vector<View> content{
       PreviewSlideControls(outline, index, [pages, version, selection](std::size_t value) {
         selection = std::nullopt;
@@ -1178,30 +1096,21 @@ std::optional<View> RenderForm(const kit::InteractionSnapshot& interaction,
   } else if (preview) {
     const auto& slide = outline.slides[draft.page];
     const bool has_screenshot = draft.page + 1 == outline.slides.size() && data->contains("screenshot_id") && data->contains("screenshot_version");
-    const auto layout = ResolveSlideLayout(outline, draft.page, has_screenshot);
-    auto title = Text(slide.title, TextRole::Title)
-        .Style({Font::System(layout == SlideLayout::Cover ? 29.0F : 23.0F).WithWeight(FontWeight::SemiBold), SlideInk(layout, true)});
-    std::vector<View> points;
-    for (const auto& bullet : slide.bullets)
-      points.push_back(Text(bullet).Style({Font::System(14.0F), SlideInk(layout, false)}));
     std::optional<View> screenshot;
     if (has_screenshot) {
       kit::ArtifactRef ref{{ReadString(*data, "screenshot_id")},
           static_cast<kit::Revision>(std::get<std::int64_t>(data->at("screenshot_version").value))};
-      screenshot = ScreenshotPreview(std::move(runtime), ref).Key(ref.id.value);
+      screenshot = ScreenshotPreview(runtime, ref).Key(ref.id.value);
     }
-    if (UsesSlideScene(layout, slide)) {
-      std::optional<kit::ArtifactRef> staged;
-      if (data->contains("pptx_id") && data->contains("pptx_version")) {
-        staged = kit::ArtifactRef{{ReadString(*data, "pptx_id")},
-            static_cast<kit::Revision>(std::get<std::int64_t>(data->at("pptx_version").value))};
-      }
-      const auto* chart = ChartFor(outline, slide);
-      fields.push_back(VisualPresentationSlide(ComposeSlide(outline, draft.page), chart ? std::optional{*chart} : std::nullopt,
-          runtime, std::move(staged), draft.page + 1, {}, InlineSlideHeight));
-    } else {
-      fields.push_back(PresentationSlide(outline.title, layout, std::move(title), std::move(points), std::move(screenshot), InlineSlideHeight));
+    std::optional<kit::ArtifactRef> staged;
+    if (data->contains("pptx_id") && data->contains("pptx_version")) {
+      staged = kit::ArtifactRef{{ReadString(*data, "pptx_id")},
+          static_cast<kit::Revision>(std::get<std::int64_t>(data->at("pptx_version").value))};
     }
+    const auto* chart = ChartFor(outline, slide);
+    fields.push_back(VisualPresentationSlide(ComposeSlide(outline, draft.page, has_screenshot),
+        chart ? std::optional{*chart} : std::nullopt, runtime, std::move(staged), draft.page + 1, {}, InlineSlideHeight,
+        std::move(screenshot)).Key(SlidePart(draft.page).value));
     action = ::app::strings::ui_review_export;
   } else {
     fields.push_back(Text(::app::strings::ui_presentation_brief, TextRole::Title));
@@ -1443,13 +1352,14 @@ View SharedReportsDialog(DialogContext dialog, std::shared_ptr<kit::AgentRuntime
 
 [[huxerui::composable]]
 View ImportReportControl(std::shared_ptr<kit::AgentRuntime> runtime, kit::ProjectId project,
-    std::function<void(ImportedPresentationReport)> imported) {
+    std::function<void(ImportedPresentationReport)> imported, std::optional<State<std::string>> draft_error) {
   const auto picker = UseService<FilePicker>();
   const auto tasks = UseTaskScope();
   const auto busy = UseState(false);
-  const auto error = UseState(std::string{});
+  const auto local_error = UseState(std::string{});
+  const auto error = draft_error.value_or(local_error);
   if (!picker || !picker->CanOpenFiles()) return View{};
-  std::vector<View> body{Button(::app::strings::ui_import_report_into_project).OnClick([picker, tasks, busy, error, runtime, project, imported] {
+  auto pick = [picker, tasks, busy, error, runtime, project, imported] {
     if (busy.Get()) return;
     busy = true;
     error = "";
@@ -1462,9 +1372,19 @@ View ImportReportControl(std::shared_ptr<kit::AgentRuntime> runtime, kit::Projec
       }
       busy = false;
     });
-  }).With(Enabled(!busy.Get()))};
-  if (!error->empty()) body.push_back(Text(error.Get(), TextRole::Label));
-  return Column(std::move(body)).With(Spacing(6.0F));
+  };
+  if (draft_error) {
+    auto style = UseEnvironment<IconButtonStyle>();
+    style.foreground = UseTheme().colors.on_surface_variant;
+    style.icon_size = 16.0F;
+    style.minimum_interactive_size = style.state_layer_size = 32.0F;
+    const auto label = ::app::strings::ui_add_report;
+    return ProvideEnvironment(style, IconButton(::app::images::add, label).OnClick(std::move(pick))
+        .With(Enabled(!busy.Get()), Tooltip(label)).Key("attach-report"));
+  }
+  auto action = Button(::app::strings::ui_import_report_into_project).OnClick(std::move(pick)).With(Enabled(!busy.Get()));
+  if (error->empty()) return action;
+  return Column{std::move(action), Text(error.Get(), TextRole::Label)}.With(Spacing(6.0F));
 }
 
 #ifdef __EMSCRIPTEN__
@@ -1616,20 +1536,6 @@ void ConfigurePreviewArtifactReview(kit::AgentChatOptions& options, std::shared_
     if (kind == data->end() || kind->second != JsonValue{std::string(VerificationEvidence)}) return {};
     return VerificationReportSummary(preview, std::move(session), runtime, open);
   };
-}
-
-[[huxerui::composable]]
-View PresentationReviewChoice(State<TextEditingValue> draft) {
-  const auto colors = UseTheme().colors;
-  const auto label = UseString(::app::strings::ui_review_outline_first);
-  const auto selected = HasOutlineReviewRequest(draft->text);
-  const auto style = PresentationNavigationStyle(UseEnvironment<ButtonStyle>(),
-      selected ? colors.on_primary_container : colors.on_surface_variant);
-  return ProvideEnvironment(style, Button(label).OnClick([draft, label] {
-    if (draft->composition) return;
-    draft = TextEditingValue::FromText(ToggleOutlineReviewRequest(draft->text, label));
-  }).With(Enabled(!draft->composition && !draft->text.empty()), Semantics{.selected = selected}))
-      .Key("ppt-outline-choice");
 }
 
 [[huxerui::composable]]

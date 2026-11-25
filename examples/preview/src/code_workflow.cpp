@@ -390,9 +390,16 @@ static std::function<void()> ObserveCodeSession(std::shared_ptr<kit::Conversatio
   return [load, subscription] { load.Cancel(); subscription->reset(); };
 }
 
+static View WorkspaceFileReview(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<kit::AgentRuntime> runtime,
+    kit::ToolCallSnapshot call, std::optional<CodeWorkspace> workspace, File evidence, kit::ArtifactRef artifact);
+
 [[huxerui::composable]]
-View CodeRevertReview(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_ptr<kit::Conversation> conversation,
-    kit::ToolCallSnapshot original, std::optional<CodeWorkspace> workspace, std::optional<File> evidence) {
+static View CodeChangeReview(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_ptr<kit::Conversation> conversation,
+    kit::ToolCallSnapshot original, std::optional<CodeWorkspace> workspace, std::optional<File> evidence,
+    std::optional<kit::ArtifactRef> artifact) {
+  const auto theme = UseTheme();
+  const bool has_diffs = artifact && evidence;
+  const auto revert_open = UseState(false);
   std::vector<kit::TargetBaseline> targets;
   for (const auto& effect : original.effects) {
     if (effect.state == kit::ResourceEffectState::Applied && effect.undo && effect.after)
@@ -458,6 +465,7 @@ View CodeRevertReview(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
     if (selection.Get().at(i) && !reverted.contains(targets[i].target)) selected.push_back(targets[i]);
   }
   const bool enabled = current && !selected.empty() && !preparing.Get() && !waiting;
+  const bool show_revert = !has_diffs || revert_open.Get();
   std::vector<View> content;
   if (IsCodePatchTool(original.tool.id) && (original.reconciliation || original.state == kit::ToolCallState::PartiallyApplied)) {
     for (const auto& effect : original.effects) {
@@ -490,8 +498,22 @@ View CodeRevertReview(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
       content.push_back(Text(label + File(effect.resource.value).Name(), TextRole::Label));
     }
   }
-  content.push_back(ScrollView(Column(std::move(files)).With(Spacing(6.0F))).With(Grow()));
-  if (current && !unresolved) content.push_back(
+  if (has_diffs)
+    content.push_back(WorkspaceFileReview(conversation, runtime, original, workspace, *evidence, *artifact).With(Grow()));
+  if (show_revert && !files.empty()) {
+    auto list = ScrollView(Column(std::move(files)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch)));
+    content.push_back(has_diffs ? std::move(list).With(Frame{.max_height = 112.0F}, ScrollBar()) : std::move(list).With(Grow()));
+  }
+  std::vector<View> actions;
+  if (has_diffs && !targets.empty() && !unresolved && !waiting && !preparing.Get()) {
+    actions.push_back(ProvideEnvironment(PreviewSecondaryButton(UseEnvironment<ButtonStyle>(), theme.colors),
+        Button(show_revert ? ::app::strings::ui_cancel : ::app::strings::ui_select_files_to_revert)
+            .OnClick([revert_open, selection, size = targets.size()] {
+              if (revert_open.Get()) selection = std::vector<bool>(size, true);
+              revert_open = !revert_open.Get();
+            }).Key("workspace-revert-scope")));
+  }
+  if (current && !unresolved && show_revert) actions.push_back(
       Button(::app::strings::ui_prepare_revert).OnClick([runtime, tasks, session = current->summary.id, call = original.id, selected = std::move(selected),
                                            preparing, submitted, status, waiting] {
         if (selected.empty() || preparing.Get() || waiting) return;
@@ -508,6 +530,11 @@ View CodeRevertReview(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
           else status = "The reverse patch request could not be tracked.";
         });
       }).With(Enabled(enabled)));
+  if (!actions.empty()) {
+    actions.insert(actions.begin(), Spacer());
+    content.push_back(Row(std::move(actions)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center))
+        .Key("workspace-revert-actions"));
+  }
   if (!status.Get().empty()) content.push_back(Text(status.Get(), TextRole::Label));
   else if (submission && submission->state == kit::QueueItemState::Rejected) {
     content.push_back(Text(submission->reason ? StringVariant{submission->reason->message} : StringVariant{::app::strings::ui_the_reverse_patch_could_not_start}, TextRole::Label)
@@ -518,7 +545,31 @@ View CodeRevertReview(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_pt
     const bool queued = submission && submission->state == kit::QueueItemState::Queued && current->summary.active_run;
     content.push_back(Text(queued ? ::app::strings::ui_the_reverse_patch_is_queued : ::app::strings::ui_preparing_the_reverse_patch, TextRole::Label));
   }
-  return Column(std::move(content)).With(Grow(), Spacing(12.0F));
+  return Column(std::move(content)).With(Grow(), Spacing(9.0F), CrossAlign(CrossAxisAlignment::Stretch));
+}
+
+[[huxerui::composable]]
+View CodeRevertReview(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_ptr<kit::Conversation> conversation,
+    kit::ToolCallSnapshot original, std::optional<CodeWorkspace> workspace, std::optional<File> evidence) {
+  return CodeChangeReview(std::move(runtime), std::move(conversation), std::move(original), std::move(workspace),
+      std::move(evidence), {});
+}
+
+std::optional<View> RenderWorkspaceChangeReview(const kit::ArtifactPreview& preview,
+    std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<kit::AgentRuntime> runtime,
+    std::optional<CodeWorkspace> workspace, std::optional<File> evidence) {
+  if (preview.type != ImplementationEvidence) return {};
+  const auto snapshot = conversation->Snapshot();
+  if (!snapshot) return {};
+  const auto original = std::ranges::find_if(snapshot->tools, [&](const auto& tool) {
+    return std::ranges::find(tool.artifacts, preview.artifact) != tool.artifacts.end() &&
+        std::ranges::any_of(tool.effects, [](const auto& effect) {
+          return effect.state == kit::ResourceEffectState::Applied && effect.after;
+        });
+  });
+  if (original == snapshot->tools.end()) return {};
+  return CodeChangeReview(std::move(runtime), std::move(conversation), *original, std::move(workspace),
+      std::move(evidence), preview.artifact).Key(preview.artifact.id.value + "/" + std::to_string(preview.artifact.version));
 }
 
 [[huxerui::composable]]
@@ -613,6 +664,7 @@ struct CodeDiffText {
       const auto line = std::string_view(text).substr(start, end - start);
       CodeDiffLine row{.start = start, .end = end};
       if (start != 0 && line.starts_with("@@ -")) {
+        row.change = '@';
         before = 0;
         after = 0;
         const auto next = line.find(" +", 4);
@@ -660,14 +712,16 @@ struct CodeDiffText {
 
 [[huxerui::composable]]
 static View SelectableCodeDiff(std::shared_ptr<kit::Conversation> conversation, kit::ArtifactRef artifact,
-    kit::PartId part, std::shared_ptr<const CodeDiffText> diff, std::optional<State<kit::AgentChatDraftSources>> draft) {
+    kit::PartId part, std::shared_ptr<const CodeDiffText> diff, std::optional<State<kit::AgentChatDraftSources>> draft,
+    std::optional<float> viewport_height) {
   namespace ce = huxerui::codeeditor;
   constexpr float font_size = 13.0F;
   const auto theme = UseTheme();
   const auto& colors = theme.colors;
   const bool dark = theme.brightness == ThemeBrightness::Dark;
-  const auto added = dark ? Color::Rgb(36, 61, 46) : Color::Rgb(228, 243, 231);
-  const auto removed = dark ? Color::Rgb(67, 42, 51) : Color::Rgb(250, 231, 233);
+  const auto success = PreviewSuccess(theme.brightness);
+  const auto added = PreviewTint(colors.surface_container, success, dark ? 0.20F : 0.10F);
+  const auto removed = PreviewTint(colors.surface_container, colors.error, dark ? 0.20F : 0.10F);
   const auto editor = ce::UseCodeEditor();
   const auto selection = UseState(std::optional<kit::SourceSlice>{});
   const auto offset = UseState(0.0F);
@@ -698,7 +752,8 @@ static View SelectableCodeDiff(std::shared_ptr<kit::Conversation> conversation, 
         selection = std::nullopt;
       }).With(Grow()).Key("artifact-text");
   auto markings = Canvas([editor, diff, scroll = offset.Get(), lane_width, added, removed, number_style, digit_width, metrics,
-                          gutter = colors.surface_container, border = colors.outline](PaintContext& paint, Size size) {
+                          gutter = colors.surface_container, border = colors.outline,
+                          added_mark = success, removed_mark = colors.error](PaintContext& paint, Size size) {
     const float gutter_width = lane_width * 2.0F;
     paint.DrawRect({0, 0, gutter_width, size.height}, gutter);
     const auto top = editor.GetPositionRect({0, 0});
@@ -710,6 +765,9 @@ static View SelectableCodeDiff(std::shared_ptr<kit::Conversation> conversation, 
       const auto& row = diff->lines[i];
       if (row.change == '+' || row.change == '-') {
         paint.DrawRect({0, y, size.width, top->height}, row.change == '+' ? added : removed);
+        paint.DrawRect({0, y, 2.0F, top->height}, row.change == '+' ? added_mark : removed_mark);
+      } else if (row.change == '@') {
+        paint.DrawRect({0, y, size.width, top->height}, gutter);
       }
       const auto draw_number = [&](float x, std::size_t line) {
         if (!line) return;
@@ -732,18 +790,19 @@ static View SelectableCodeDiff(std::shared_ptr<kit::Conversation> conversation, 
   std::vector<View> body{
       Stack{std::move(markings), Row{std::move(field)}
           .With(Grow(), CrossAlign(CrossAxisAlignment::Stretch), Padding(EdgeInsets{.left = lane_width * 2.0F}))}
-          .With(Grow(), Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch), ClipChildren(),
+          .With(Frame{.height = viewport_height}, Grow(viewport_height ? 0.0F : 1.0F),
+              Align(HorizontalAlignment::Stretch, VerticalAlignment::Stretch), ClipChildren(),
               CornerRadius(7.0F), Border{colors.outline}, Background(colors.surface_container_high),
               Semantics{.label = ::app::strings::ui_code_diff, .identifier = "code-diff"}),
   };
   if (draft) body.push_back(PreviewSourceActions(std::move(conversation), std::move(selected), *draft));
-  return Column(std::move(body)).With(Grow(), Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
+  return Column(std::move(body)).With(Grow(viewport_height ? 0.0F : 1.0F), Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
 [[huxerui::composable]]
 static View CodeDiffReview(std::shared_ptr<kit::Conversation> conversation, kit::ArtifactRef artifact,
     std::string path, std::string diff, std::optional<State<kit::AgentChatDraftSources>> draft, std::function<void()> editor,
-    bool show_filename = true) {
+    bool show_filename = true, bool inline_diff = false) {
   const auto theme = UseTheme();
   const auto& colors = theme.colors;
   const auto patch = std::make_shared<const CodeDiffText>(std::move(diff));
@@ -754,51 +813,65 @@ static View CodeDiffReview(std::shared_ptr<kit::Conversation> conversation, kit:
   };
   const auto filename = File(path).Name();
   std::vector<View> metadata;
-  if (path != filename) metadata.push_back(Text(path).Style({Font::Monospace(12.0F), colors.on_surface_variant}));
-  metadata.push_back(change_count("+" + std::to_string(patch->added),
-      dark ? Color::Rgb(178, 224, 190) : Color::Rgb(39, 94, 52),
-      dark ? Color::Rgb(36, 61, 46) : Color::Rgb(228, 243, 231)));
+  if (path != filename && !inline_diff)
+    metadata.push_back(Text(path).Style({Font::Monospace(12.0F), colors.on_surface_variant}).LineLimit(1)
+        .Overflow(TextOverflow::Ellipsis).With(Grow(), Tooltip(path)));
+  const auto success = PreviewSuccess(theme.brightness);
+  metadata.push_back(change_count("+" + std::to_string(patch->added), success,
+      PreviewTint(colors.surface_container, success, dark ? 0.20F : 0.10F)));
   metadata.push_back(change_count("-" + std::to_string(patch->removed), colors.error,
-      dark ? Color::Rgb(67, 42, 51) : Color::Rgb(250, 231, 233)));
+      PreviewTint(colors.surface_container, colors.error, dark ? 0.20F : 0.10F)));
   std::vector<View> details;
   if (show_filename) details.push_back(Text(filename, TextRole::Title)
-      .Style({Font::System(27.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}));
+      .Style({Font::System(16.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}));
   details.push_back(Flow(std::move(metadata)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)));
   if (editor) details.push_back(Row{Button(::app::strings::ui_open_editor_source).OnClick(std::move(editor)), Spacer()});
-  details.push_back(SelectableCodeDiff(std::move(conversation), artifact, kit::PartId{std::move(path)}, patch, draft));
-  return Column(std::move(details)).With(Grow(), Spacing(9.0F), CrossAlign(CrossAxisAlignment::Stretch));
+  const auto viewport_height = inline_diff
+      ? std::optional{std::clamp(24.0F + static_cast<float>(patch->lines.size()) * 19.0F, 144.0F, 360.0F)} : std::nullopt;
+  details.push_back(SelectableCodeDiff(std::move(conversation), artifact, kit::PartId{std::move(path)}, patch, draft, viewport_height));
+  return Column(std::move(details)).With(Grow(inline_diff ? 0.0F : 1.0F), Spacing(9.0F),
+      CrossAlign(CrossAxisAlignment::Stretch));
 }
 
 View AppliedFileDiff(kit::ArtifactRef artifact, kit::PartId file, std::string diff) {
   return CodeDiffReview({}, std::move(artifact), std::move(file.value), std::move(diff), {}, {});
 }
 
+static std::string WorkspaceFileLabel(const kit::ResourceId& resource, const std::optional<CodeWorkspace>& workspace) {
+  if (workspace && !workspace->root.empty()) {
+    const auto relative = std::filesystem::u8path(resource.value).lexically_relative(workspace->root);
+    if (!relative.empty() && *relative.begin() != "..") {
+      const auto path = relative.generic_u8string();
+      return {path.begin(), path.end()};
+    }
+  }
+  return File(resource.value).Name();
+}
+
 [[huxerui::composable]]
-View WorkspaceChangeActivity(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<kit::AgentRuntime> runtime,
-    kit::ToolCallSnapshot call, std::optional<CodeWorkspace> workspace, File evidence) {
+static View WorkspaceDiffContent(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<kit::AgentRuntime> runtime,
+    const kit::ToolCallSnapshot& call, File evidence, kit::ResourceRef resource, bool inline_diff,
+    std::optional<kit::ArtifactRef> pinned = {}) {
   struct OpenedDiff {
     kit::ArtifactRef artifact;
-    kit::ResourceRef resource;
     kit::PartId part;
     kit::Revision access;
     std::string text;
   };
 
-  const auto theme = UseTheme();
   const auto tasks = UseTaskScope();
-  const auto selected = UseState(std::optional<kit::ResourceRef>{});
-  const auto loaded = UseState(std::optional<OpenedDiff>{});
-  const auto busy = UseState(false);
+  const auto loaded = UseState(std::shared_ptr<const OpenedDiff>{});
+  const auto busy = UseState(true);
   const auto snapshot = conversation->Snapshot();
   const auto access = snapshot ? std::optional{snapshot->access_revision} : std::nullopt;
-  const auto resource = selected.Get();
-  Lifecycle([conversation, runtime, tasks, call, evidence, resource, access, loaded, busy] {
-    loaded = std::nullopt;
-    busy = resource && access;
-    if (!busy.Get()) return std::function<void()>{[] {}};
-    auto worker = tasks.Launch([conversation, runtime, call, evidence, resource = *resource, access = *access,
+  Lifecycle([conversation, runtime, tasks, call, evidence, resource, access, pinned, loaded, busy] {
+    loaded = std::shared_ptr<const OpenedDiff>{};
+    busy = access.has_value();
+    if (!access) return std::function<void()>{[] {}};
+    auto worker = tasks.Launch([conversation, runtime, call, evidence, resource, access = *access, pinned,
         loaded, busy]() -> Task<void> {
       for (const auto& ref : call.artifacts) {
+        if (pinned && ref != *pinned) continue;
         auto record = co_await runtime->Artifacts().ReadAsync(ref);
         auto current = conversation->Snapshot();
         if (!current || current->access_revision != access) break;
@@ -815,54 +888,115 @@ View WorkspaceChangeActivity(std::shared_ptr<kit::Conversation> conversation, st
         if (!current || current->access_revision != access) break;
         const auto visible = std::ranges::find(current->tools, call.id, &kit::ToolCallSnapshot::id);
         if (diff.Succeeded() && visible != current->tools.end() && std::ranges::find(visible->artifacts, ref) != visible->artifacts.end()) {
-          loaded = OpenedDiff{ref, resource, part, access, std::move(diff).Value()};
+          loaded = std::make_shared<const OpenedDiff>(OpenedDiff{ref, part, access, std::move(diff).Value()});
           break;
         }
       }
       busy = false;
     });
     return std::function<void()>{[worker] { worker.Cancel(); }};
-  }, conversation, call.id, resource, access, call.artifacts);
+  }, conversation, call.id, resource, access, pinned, call.artifacts);
 
+  const auto result = loaded.Get();
+  if (result && result->access == access && std::ranges::find(call.artifacts, result->artifact) != call.artifacts.end()) {
+    return CodeDiffReview({}, result->artifact, result->part.value, result->text, {}, {}, false, inline_diff)
+        .Key("workspace-applied-diff/" + result->part.value);
+  }
+  const auto& colors = UseTheme().colors;
+  return Row{Text(busy.Get() ? ::app::strings::ui_loading_file_diff : ::app::strings::ui_file_diff_unavailable,
+      TextRole::Label).Style({Font::System(13.0F), colors.on_surface_variant})}
+      .With(Padding(12.0F), CornerRadius(7.0F), Background(colors.surface_container_low),
+          Frame{.min_height = 44.0F}, CrossAlign(CrossAxisAlignment::Center));
+}
+
+static View WorkspaceDiffFileRow(std::string label, StringResource status, bool selected, std::function<void()> open,
+                                 const ThemeSpec& theme, bool inline_diff) {
+  const auto& colors = theme.colors;
+  const Frame icon_size{.width = 14.0F, .height = 14.0F};
+  std::vector<View> cells{
+      Image(::app::images::code).Tint(colors.on_surface_variant).With(icon_size),
+      Text(label).Style({Font::System(13.0F).WithWeight(selected ? FontWeight::SemiBold : FontWeight::Medium), colors.on_surface})
+          .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow()),
+      Text(status, TextRole::Label).Style({Font::System(11.0F), colors.on_surface_variant}),
+  };
+  if (open) cells.push_back(Image(inline_diff && selected ? ::app::images::chevron_down : ::app::images::chevron_right)
+      .Tint(colors.on_surface_variant).With(icon_size));
+  auto row = Row(std::move(cells)).With(Padding(EdgeInsets::Symmetric(9.0F, 6.0F)), Frame{.min_height = 33.0F}, Spacing(7.0F),
+      CornerRadius(6.0F), CrossAlign(CrossAxisAlignment::Center),
+      Background(selected ? colors.surface_container_high : Color::Transparent()), Tooltip(label));
+  if (!open) return row;
+  return std::move(row).OnClick(open).On<ViewEvents::KeyDown>([open](const KeyEvent& event) {
+    if (event.key != Key::Enter && event.key != Key::Space) return false;
+    if (!event.repeat) open();
+    return true;
+  }).With(Focusable{}, PointerCursor(PointerCursorKind::Hand),
+      inline_diff ? Indication{.focus = theme.interactions.indication.focus} : PreviewRowIndication(theme, 6.0F),
+      Semantics{.role = SemanticRole::Button, .label = label, .selected = selected,
+          .expanded = inline_diff ? std::optional{selected} : std::nullopt});
+}
+
+[[huxerui::composable]]
+static View WorkspaceFileReview(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<kit::AgentRuntime> runtime,
+    kit::ToolCallSnapshot call, std::optional<CodeWorkspace> workspace, File evidence, kit::ArtifactRef artifact) {
+  const auto theme = UseTheme();
+  const bool compact = UseViewportClass() == ViewportClass::Compact;
+  const auto first = std::ranges::find_if(call.effects, [](const auto& effect) {
+    return effect.state == kit::ResourceEffectState::Applied && effect.after;
+  });
+  const auto selected = UseState(first == call.effects.end() ? std::optional<kit::ResourceRef>{} : first->after);
+  if (!selected.Get()) return Text(::app::strings::ui_file_diff_unavailable);
   std::vector<View> rows;
-  const auto button = PreviewSecondaryButton(UseEnvironment<ButtonStyle>(), theme.colors);
   for (const auto& effect : call.effects) {
-    auto name = File(effect.resource.value).Name();
-    if (workspace && !workspace->root.empty()) {
-      const auto relative = std::filesystem::u8path(effect.resource.value).lexically_relative(workspace->root);
-      if (!relative.empty() && *relative.begin() != "..") {
-        const auto path = relative.generic_u8string();
-        name.assign(path.begin(), path.end());
-      }
-    }
+    if (effect.state != kit::ResourceEffectState::Applied || !effect.after) continue;
+    auto label = WorkspaceFileLabel(effect.resource, workspace);
+    rows.push_back(WorkspaceDiffFileRow(label, ::app::strings::ui_workspace_file_applied, selected.Get() == effect.after,
+        [selected, version = *effect.after] { selected = version; }, theme, false).Key("workspace-review-file/" + label));
+  }
+  auto files = Column{
+      Text(::app::strings::ui_changed_files, TextRole::Label)
+          .Style({Font::System(12.0F).WithWeight(FontWeight::SemiBold), theme.colors.on_surface_variant})
+          .With(Padding(EdgeInsets{.top = 4.0F, .left = 8.0F})),
+      ScrollView(Column(std::move(rows)).With(Spacing(2.0F), CrossAlign(CrossAxisAlignment::Stretch)))
+          .With(Grow(), ScrollBar()),
+  }.With(Spacing(5.0F), Padding(6.0F), CrossAlign(CrossAxisAlignment::Stretch), CornerRadius(7.0F),
+      Background(theme.colors.surface_container_low), Border{theme.colors.outline}).Key("workspace-review-files");
+  const auto& version = *selected.Get();
+  auto diff = WorkspaceDiffContent(std::move(conversation), std::move(runtime), call, std::move(evidence), version, false, artifact)
+      .With(Grow()).Key(version.id.value + "/" + version.version);
+  if (compact) return Column{std::move(files).With(Frame{.max_height = 122.0F}), std::move(diff)}
+      .With(Grow(), Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
+  return Row{std::move(files).With(Frame{.width = 208.0F}), std::move(diff)}
+      .With(Grow(), Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch));
+}
+
+[[huxerui::composable]]
+View WorkspaceChangeActivity(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<kit::AgentRuntime> runtime,
+    kit::ToolCallSnapshot call, std::optional<CodeWorkspace> workspace, File evidence) {
+  const auto theme = UseTheme();
+  const auto selected = UseState(std::optional<kit::ResourceRef>{});
+  std::vector<View> rows;
+  std::optional<kit::ResourceRef> active_file;
+  for (const auto& effect : call.effects) {
+    const auto name = WorkspaceFileLabel(effect.resource, workspace);
     const bool applied = effect.state == kit::ResourceEffectState::Applied;
-    const bool expanded = resource && resource == effect.after;
+    const bool expanded = effect.after && selected.Get() == effect.after && !call.artifacts.empty();
     const bool skipped = effect.state == kit::ResourceEffectState::Unchanged && call.state == kit::ToolCallState::PartiallyApplied;
     const auto status = applied ? ::app::strings::ui_workspace_file_applied : skipped ? ::app::strings::ui_workspace_file_skipped :
         effect.state == kit::ResourceEffectState::Unchanged ? ::app::strings::ui_workspace_file_unchanged :
         ::app::strings::ui_workspace_file_unverified;
-    std::vector<View> cells {
-        Text(name).Style({Font::Monospace(12.0F), theme.colors.on_surface}).With(Grow()),
-        Text(status, TextRole::Label),
+    std::function<void()> toggle;
+    if (applied && effect.after && !call.artifacts.empty()) toggle = [selected, after = *effect.after] {
+      selected = selected.Get() == after ? std::nullopt : std::optional{after};
     };
-    if (applied && effect.after && !call.artifacts.empty()) {
-      cells.push_back(ProvideEnvironment(button, Button(expanded ? ::app::strings::ui_hide_file_diff : ::app::strings::ui_view_diff)
-          .OnClick([selected, after = *effect.after] { selected = selected.Get() == after ? std::nullopt : std::optional{after}; })
-          .Key("workspace-file-diff/" + name)));
-    }
-    rows.push_back(Row(std::move(cells)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)).Key(effect.resource.value));
-    if (!expanded) continue;
-    const auto result = loaded.Get();
-    if (result && result->resource == resource && result->access == access &&
-        std::ranges::find(call.artifacts, result->artifact) != call.artifacts.end()) {
-      rows.push_back(AppliedFileDiff(result->artifact, result->part, result->text)
-          .With(Frame{.height = 210.0F}).Key("workspace-applied-diff/" + result->part.value));
-    } else {
-      rows.push_back(Text(busy.Get() ? ::app::strings::ui_loading_file_diff : ::app::strings::ui_file_diff_unavailable,
-          TextRole::Label));
-    }
+    rows.push_back(Column{WorkspaceDiffFileRow(name, status, expanded, std::move(toggle), theme, true)
+        .Key("workspace-file-diff/" + name)}.With(CrossAlign(CrossAxisAlignment::Stretch)).Key(effect.resource.value));
+    if (expanded) active_file = effect.after;
   }
-  return Column(std::move(rows)).With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Stretch));
+  if (active_file) rows.push_back(WorkspaceDiffContent(std::move(conversation), std::move(runtime), call, std::move(evidence),
+      *active_file, true).With(Padding(EdgeInsets{.right = 8.0F, .bottom = 6.0F, .left = 8.0F}))
+      .Key(active_file->id.value + "/diff"));
+  return Column(std::move(rows)).With(Spacing(3.0F), Padding(3.0F), CrossAlign(CrossAxisAlignment::Stretch),
+      CornerRadius(7.0F), Background(theme.colors.surface_container_low));
 }
 
 [[huxerui::composable]]
@@ -884,7 +1018,7 @@ View CodeChat(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<k
     if (!form || form->presentation != JsonValue{std::string(scope_form)}) return {};
     return ScopeView(request, std::move(session), editor, tasks, workspace);
   };
-  options.render_artifact = [runtime, fallback = base_options.render_artifact, open_editor, workspace, evidence](
+  options.render_artifact = [fallback = base_options.render_artifact, open_editor, workspace](
                             const kit::ArtifactPreview& preview, std::shared_ptr<kit::Conversation> session,
                             State<kit::AgentChatDraftSources> draft) -> std::optional<View> {
     if (auto design = RenderDesignArtifact(preview)) return design;
@@ -895,19 +1029,6 @@ View CodeChat(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<k
       return found == object->end() ? nullptr : std::get_if<std::string>(&found->second.value);
     };
     const auto* kind = string_field("kind");
-    if (kind && *kind == ImplementationEvidence) {
-      const auto snapshot = session->Snapshot();
-      if (snapshot) {
-        const auto original = std::ranges::find_if(snapshot->tools, [&](const auto& tool) {
-          return std::ranges::find(tool.artifacts, preview.artifact) != tool.artifacts.end() &&
-              std::ranges::any_of(tool.effects, [](const auto& effect) {
-                return effect.state == kit::ResourceEffectState::Applied && effect.undo && effect.after;
-              });
-        });
-        if (original != snapshot->tools.end())
-          return CodeRevertReview(runtime, session, *original, workspace, evidence).Key(preview.artifact.id.value);
-      }
-    }
     const auto* path = string_field("path");
     const auto* diff = string_field("diff");
     if (!kind || *kind != CodePatchPreview || !path || !diff)

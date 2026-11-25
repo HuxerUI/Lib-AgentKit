@@ -8,10 +8,12 @@
 namespace agentkit_preview {
 
 enum class PreviewAppearance { Dark, Light, System };
+enum class PreviewPalette;
 enum class ReplyTone { Default, Concise, Friendly, Formal };
 
 struct PreviewSettings {
   PreviewAppearance appearance = PreviewAppearance::Dark;
+  PreviewPalette palette{};
   ReplyTone tone = ReplyTone::Default;
   std::string instructions;
   std::optional<huxerui::agentkit::ModelProviderRef> daily_model;
@@ -27,7 +29,7 @@ struct PreviewSettings {
 huxerui::agentkit::Async<PreviewSettings> ReadPreviewSettings(huxerui::File file);
 huxerui::agentkit::Async<void> SavePreviewSettings(huxerui::File file, PreviewSettings settings);
 std::string WithReplyPreferences(std::string instructions, const PreviewSettings& settings);
-huxerui::ThemeBrightness PreviewBrightness(PreviewAppearance appearance, huxerui::ThemeBrightness system);
+huxerui::ThemeSpec PreviewThemeFor(const PreviewSettings& settings, huxerui::ThemeBrightness system);
 
 huxerui::View PreviewSettingsPage(huxerui::State<PreviewSettings> current, huxerui::State<PreviewSettings> applied,
     std::shared_ptr<RunSettings> models, huxerui::File file, AddModelProfile add_model, EditModelProfile edit_model,

@@ -85,6 +85,39 @@ void Verify(const huxerui::File& destination) {
   Check(!invalid.Succeeded() && invalid.Error().code == kit::ErrorCode::InvalidArgument,
         "invalid XML control characters were accepted");
 }
+void VerifyPreviewLayout() {
+  using namespace agentkit_preview;
+  const PresentationOutline outline{"Preview layout", {
+      {"Cover", {"Introduction"}, SlideLayout::Cover},
+      {"Cards", {"Transparency", "Collaboration", "Sharing", "Governance"}, SlideLayout::Cards},
+      {"Comparison", {"Before", "After"}, SlideLayout::Comparison},
+      {"Classic flow", {"Plan", "Build", "Review", "Release"}, SlideLayout::Flow},
+      {"List", {"First", "Second", "Third", "Fourth", "Fifth", "Sixth"}, SlideLayout::List},
+      {"Relationship", {"Plan", "Build", "Review", "Release"}, SlideLayout::Relationship},
+      {"Editorial", {"Thesis", "Evidence", "Result"}, SlideLayout::Editorial},
+      {"Photo", {"One", "Two"}, SlideLayout::Image, "embedded-close"},
+  }};
+  for (std::size_t page = 0; page < outline.slides.size(); ++page) {
+    const auto scene = ComposeSlide(outline, page);
+    std::vector<SlideRect> text;
+    for (const auto& element : scene.elements) {
+      const auto& box = element.bounds;
+      Check(box.x >= 0 && box.y >= 0 && box.x + box.width <= 1280 && box.y + box.height <= 720,
+          "a slide preview element extended past the edge of the canvas");
+      if (element.excerpt && *element.excerpt > 0) text.push_back(box);
+    }
+    Check(text.size() == outline.slides[page].bullets.size(), "the slide preview did not place all body text");
+    if (outline.slides[page].layout == SlideLayout::Cards) {
+      Check(text[0].y == text[1].y && text[2].y == text[3].y &&
+          text[0].y + text[0].height < text[2].y && text[0].x == text[2].x && text[1].x == text[3].x &&
+          text[0].x + text[0].width < text[1].x, "the card preview did not keep both rows and columns visible");
+    }
+  }
+  const auto evidence = ComposeSlide(outline, 4, true);
+  Check(evidence.screenshot.has_value() && !evidence.image,
+      "an implementation screenshot did not have a dedicated region in the slide preview");
+}
+
 void VerifyEditableVisuals(const huxerui::File& folder) {
   using namespace agentkit_preview;
   auto user_data = ReadSuppliedChart("Source: https://example.org/report\n| Quarter | Requests |\n| --- | --- |\n| Q1 | -12 |\n| Q2 | 24.5 |\n");
@@ -149,6 +182,7 @@ int main(int argc, char** argv) {
     const huxerui::File file(path.u8string());
     Verify(file);
     VerifyEditableVisuals(*file.Parent());
+    VerifyPreviewLayout();
     if (!keep) static_cast<void>(file.Delete());
     std::cout << "PPTX outline, parts, and no-overwrite behavior passed\n";
     return 0;
