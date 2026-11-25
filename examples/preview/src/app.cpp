@@ -345,6 +345,8 @@ struct PreviewService {
   using Started = kit::AgentResult<std::shared_ptr<kit::AgentRuntime>>;
   std::optional<Started> startup;
   std::vector<CallbackCompletion<Started>> listeners;
+  std::optional<WindowHandle> main_window;
+  bool tray_enabled = false;
 };
 
 [[huxerui::composable]]
@@ -812,7 +814,7 @@ Task<void> LoadModelProfiles(const std::shared_ptr<PreviewService>& service, con
       auto model = MakeProfileModel(profile, ModelKeyEnvironment(profile.api_key), std::move(revision));
       if (std::ranges::find(models, model.ref, &kit::ModelRegistration::ref) == models.end()) {
         service->model_revisions.emplace(model.ref, file);
-        service->run_settings->AddModel(model, {}, profile.limits, true);
+        service->run_settings->AddModel(model, {}, profile.limits, true, profile.reasoning_summary);
         models.push_back(std::move(model));
       }
     } catch (const std::exception&) {
@@ -891,7 +893,7 @@ kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewServic
     if (persist) static_cast<void>(co_await target.DeleteAsync());
     co_return Result::Failure(registered.Error());
   }
-  service->run_settings->AddModel(model, {}, profile.limits, true);
+  service->run_settings->AddModel(model, {}, profile.limits, true, profile.reasoning_summary);
   if (persist) service->model_revisions.emplace(model.ref, target);
   else service->model_revisions.emplace(model.ref, std::move(profile));
   if (previous) {
@@ -910,8 +912,7 @@ kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewServic
 }
 
 kit::Async<kit::ModelProviderRef> UpdateModelProfile(std::shared_ptr<PreviewService> service,
-    kit::ModelProviderRef previous, std::string endpoint, std::optional<std::string> new_key,
-    agentkit_preview::ModelLimits limits, bool image_input) {
+    kit::ModelProviderRef previous, agentkit_preview::ModelProfileEdit edit) {
   using Result = kit::AgentResult<kit::ModelProviderRef>;
   const auto resources = UseService<Resources>();
   const auto found = service->model_revisions.find(previous);
@@ -930,16 +931,28 @@ kit::Async<kit::ModelProviderRef> UpdateModelProfile(std::shared_ptr<PreviewServ
   } else {
     profile = std::get<agentkit_preview::ModelProfileInput>(found->second);
   }
-  endpoint = TrimModelField(std::move(endpoint));
-  while (endpoint.ends_with('/')) endpoint.pop_back();
-  if (new_key) *new_key = TrimModelField(std::move(*new_key));
-  if (service->run_settings->CurrentModel(previous) == previous && endpoint == profile.base_url &&
-      (!new_key || *new_key == profile.api_key) && limits == profile.limits && image_input == profile.image_input)
+  edit.base_url = TrimModelField(std::move(edit.base_url));
+  while (edit.base_url.ends_with('/')) edit.base_url.pop_back();
+  if (edit.new_key) *edit.new_key = TrimModelField(std::move(*edit.new_key));
+  auto next_protocol = edit.protocol ? TrimModelField(std::move(*edit.protocol)) : profile.protocol;
+  auto next_provider = edit.provider ? TrimModelField(std::move(*edit.provider)) : profile.provider;
+  const bool next_image = agentkit_preview::SupportsImageInput(next_protocol) && edit.image_input;
+  const bool next_file = (next_protocol == "generate-content" || next_protocol == "interactions") && edit.file_input;
+  const bool next_reasoning = next_protocol == "responses" && next_provider == "openai" && edit.reasoning_summary;
+  if (service->run_settings->CurrentModel(previous) == previous && edit.base_url == profile.base_url &&
+      next_protocol == profile.protocol && next_provider == profile.provider &&
+      (!edit.new_key || *edit.new_key == profile.api_key) && edit.limits == profile.limits &&
+      next_image == profile.image_input && next_file == profile.file_input &&
+      next_reasoning == profile.reasoning_summary)
     co_return Result::Success(std::move(previous));
-  profile.base_url = std::move(endpoint);
-  if (new_key) profile.api_key = std::move(*new_key);
-  profile.limits = std::move(limits);
-  profile.image_input = image_input;
+  profile.base_url = std::move(edit.base_url);
+  profile.protocol = std::move(next_protocol);
+  profile.provider = std::move(next_provider);
+  if (edit.new_key) profile.api_key = std::move(*edit.new_key);
+  profile.limits = std::move(edit.limits);
+  profile.image_input = next_image;
+  profile.file_input = next_file;
+  profile.reasoning_summary = next_reasoning;
   co_return co_await SaveModelProfile(std::move(service), std::move(profile), std::move(previous));
 }
 
@@ -1067,9 +1080,8 @@ agentkit_preview::AddModelProfile AddModelAction(const std::shared_ptr<PreviewSe
 
 agentkit_preview::EditModelProfile EditModelAction(const std::shared_ptr<PreviewService>& service) {
 #ifndef __EMSCRIPTEN__
-  if (service->model_profiles) return [service](kit::ModelProviderRef ref, std::string endpoint,
-      std::optional<std::string> key, agentkit_preview::ModelLimits limits, bool image_input) {
-    return UpdateModelProfile(service, std::move(ref), std::move(endpoint), std::move(key), std::move(limits), image_input);
+  if (service->model_profiles) return [service](kit::ModelProviderRef ref, agentkit_preview::ModelProfileEdit edit) {
+    return UpdateModelProfile(service, std::move(ref), std::move(edit));
   };
 #endif
   return {};
@@ -2143,6 +2155,14 @@ std::optional<View> PreviewAttachmentAction(const std::shared_ptr<PreviewService
   return {};
 }
 
+constexpr bool custom_preview_chrome =
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)) || \
+    (defined(__APPLE__) && !defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__))
+    true;
+#else
+    false;
+#endif
+
 } // namespace
 
 [[huxerui::composable]]
@@ -2162,8 +2182,24 @@ View DetachedArtifactReview(std::shared_ptr<kit::Conversation> conversation, std
       service ? service->settings.Get() : agentkit_preview::PreviewSettings{}, UseSystemThemeBrightness());
   auto chat = PreviewConversation(std::move(agent), std::move(conversation), std::move(runtime), std::move(options),
       std::move(workspace), service ? service->workspace_evidence : std::nullopt, agentkit_preview::PreviewArtifactHeader(theme));
-  return MaterialTheme(theme, agentkit_preview::PreviewControlsTheme(
-      ProvideEnvironment(preview_chat_layout, std::move(chat).With(Background(theme.colors.surface)))));
+  auto body = ProvideEnvironment(preview_chat_layout, std::move(chat).With(Grow(), Background(theme.colors.surface)));
+  if (custom_preview_chrome) {
+    const auto review_title = snapshot ? snapshot->summary.title : std::string("Artifact review");
+    body = Column{
+        WindowTitleBar{
+            PreviewWordmark(theme.colors),
+            Text("\xc2\xb7", TextRole::Label).With(Foreground(theme.colors.on_surface_variant)),
+            Text(review_title, TextRole::Label)
+                .Style({Font::System(13.0F).WithWeight(FontWeight::Medium), theme.colors.on_surface_variant})
+                .LineLimit(1).Overflow(TextOverflow::Ellipsis),
+            Spacer().With(Grow()),
+        }.With(Padding(EdgeInsets::Symmetric(14.0F, 0.0F)), Spacing(8.0F),
+            Frame{.min_height = 46.0F}, Background(theme.colors.surface_container_low)).Key("review-title-bar"),
+        ProvideEnvironment(DividerStyle{theme.colors.outline}, Divider()),
+        std::move(body),
+    }.With(CrossAlign(CrossAxisAlignment::Stretch), Background(theme.colors.surface));
+  }
+  return MaterialTheme(theme, agentkit_preview::PreviewControlsTheme(std::move(body)));
 }
 
 WindowHandle OpenPreviewArtifactReview(const ApplicationHandle& application, std::shared_ptr<kit::Conversation> conversation,
@@ -2174,17 +2210,13 @@ WindowHandle OpenPreviewArtifactReview(const ApplicationHandle& application, std
   return application.OpenWindow([runtime = std::move(runtime), conversation = std::move(conversation), agent = std::move(agent),
       request = std::move(request), initial_pages = std::move(initial_pages), draft_sources] {
     return DetachedArtifactReview(conversation, runtime, agent, request, initial_pages, draft_sources);
-  }, {.title = title + " - Review", .initial_size = {900.0F, 760.0F}});
+  }, {.title = title + " - Review", .initial_size = {900.0F, 760.0F},
+      .minimum_size = custom_preview_chrome ? std::optional{Size{460.0F, 520.0F}} : std::nullopt,
+      .chrome_mode = custom_preview_chrome ? WindowChromeMode::Custom : WindowChromeMode::System,
+      .title_bar_height = 46.0F});
 }
 
 namespace {
-
-constexpr bool custom_preview_chrome =
-#ifdef _WIN32
-    true;
-#else
-    false;
-#endif
 
 bool CanPickPreviewFolder(const std::shared_ptr<FilePicker>& picker) {
 #ifdef __EMSCRIPTEN__
@@ -2246,17 +2278,18 @@ std::optional<View> BrowserDraftReport(const std::shared_ptr<PreviewService>& se
 } // namespace
 
 [[huxerui::composable]]
-static View WorkbenchColumns(View sidebar, View pages, ViewportClass viewport, float sidebar_width) {
+static View WorkbenchColumns(View sidebar, View pages, ViewportClass viewport, float sidebar_width, bool sidebar_collapsed = false) {
   using PaneSizing = std::pair<Frame, Grow>;
   const auto split = UseState(std::optional<std::array<PaneSizing, 2>>{});
   const bool compact = viewport == ViewportClass::Compact;
+  const bool hide_sidebar = compact || sidebar_collapsed;
   auto sizing = split.Get().value_or(std::array{
       PaneSizing{Frame{.width = sidebar_width, .min_width = 160.0F, .max_width = 340.0F}, Grow(0.0F)},
       PaneSizing{Frame{}, Grow()},
   });
-  sizing[1].first.min_width = compact ? std::nullopt : std::optional{viewport == ViewportClass::Medium ? 360.0F : 600.0F};
+  sizing[1].first.min_width = hide_sidebar ? std::nullopt : std::optional{viewport == ViewportClass::Medium ? 360.0F : 600.0F};
   return SplitLayout({
-      compact ? View{} : View(sidebar).With(sizing[0].first, sizing[0].second),
+      hide_sidebar ? View{} : View(sidebar).With(sizing[0].first, sizing[0].second),
       View(pages).With(sizing[1].first, sizing[1].second),
   }).OnChanged([split, sizing](const std::vector<SplitChange>& changes) mutable {
     for (const auto& change : changes) sizing[change.index] = {change.frame, change.grow};
@@ -2297,6 +2330,7 @@ View PreviewShell() {
   const auto review_window_error = UseState(std::string{});
   const auto pending_retry = UseState(std::uint64_t{0});
   const auto navigation_open = UseState(false);
+  const auto sidebar_collapsed = UseState(false);
   const auto workspace_expansion = UseState(std::map<kit::WorkspaceId, bool>{});
   const auto showing_settings = UseState(false);
   const auto viewport_class = UseViewportClass();
@@ -2423,7 +2457,23 @@ View PreviewShell() {
     return [task, subscription] { task.Cancel(); subscription->reset(); };
   }, ready.Get(), pending_retry.Get());
 
-  UseWindow().OnLifecycleChanged([service, ready](WindowLifecycleState state) {
+  const auto window = UseWindow();
+  if (service->tray_enabled) {
+    const bool tray_available = application.SystemTray().IsAvailable();
+    Lifecycle([service, window] {
+      service->main_window = window;
+      return [service] { service->main_window.reset(); };
+    });
+    Lifecycle([window, tray_available] {
+      if (!tray_available) window.Show();
+    }, tray_available);
+    window.OnCloseRequest([window, tray_available] {
+      if (!tray_available) return false;
+      window.Hide();
+      return true;
+    }, tray_available);
+  }
+  window.OnLifecycleChanged([service, ready](WindowLifecycleState state) {
     if (state != WindowLifecycleState::Active || !ready.Get() || service->navigation_failure.Get()) return;
     service->reload_navigation = true;
     SaveNavigation(service);
@@ -3359,18 +3409,102 @@ View PreviewShell() {
       : View(Spacer());
   auto pages = IndexedPages({Column(std::move(content)).With(CrossAlign(CrossAxisAlignment::Stretch)),
       std::move(settings)}, showing_settings.Get() ? 1U : 0U).Key("workbench-main");
-  auto columns = WorkbenchColumns(sidebar, std::move(pages), viewport_class, sidebar_width);
+  auto columns = WorkbenchColumns(sidebar, std::move(pages), viewport_class, sidebar_width, sidebar_collapsed.Get());
   auto workbench = ProvideEnvironment(drawer_style, (compact
       ? DrawerLayout(std::move(columns), StartDrawer(std::move(sidebar)).Open(navigation_open.Get())
           .OnOpenChanged([navigation_open](bool open) { navigation_open = open; }))
       : DrawerLayout(std::move(columns))).With(Grow(), Background(colors.surface)));
   if (!custom_preview_chrome) return workbench;
+  auto titlebar_icon_style = agentkit_preview::PreviewChromeIconStyle(theme);
+  titlebar_icon_style.indication = agentkit_preview::PreviewRowIndication(theme, 7.0F);
   std::vector<View> chrome;
-  if (compact) chrome.push_back(navigation_button());
+  if (compact) {
+    chrome.push_back(navigation_button());
+  } else {
+    chrome.push_back(ProvideEnvironment(titlebar_icon_style,
+        IconButton(::app::images::sidebar, ::app::strings::ui_conversations)
+            .OnClick([sidebar_collapsed] { sidebar_collapsed = !sidebar_collapsed.Get(); })
+            .With(PointerCursor(PointerCursorKind::Hand), Tooltip(::app::strings::ui_conversations)))
+        .Key("titlebar-toggle-sidebar"));
+  }
   chrome.push_back(PreviewWordmark(colors));
   chrome.push_back(Spacer().With(Grow()));
+  if (!compact) {
+    std::string context_text;
+    if (showing_settings.Get()) {
+      context_text = UseString(::app::strings::ui_settings);
+    } else if (showing_pending.Get()) {
+      context_text = UseString(::app::strings::ui_pending_requests);
+    } else if (active_snapshot) {
+      std::string prefix;
+      if (active_snapshot->summary.workspace && ready.Get()) {
+        if (const auto folder_entry = service->workspaces->Find(*active_snapshot->summary.workspace)) {
+          prefix = folder_name(*folder_entry);
+        }
+      }
+      context_text = prefix.empty() ? active_snapshot->summary.title
+                                    : prefix + " \xc2\xb7 " + active_snapshot->summary.title;
+    } else {
+      const auto draft_label = UseString(::app::strings::ui_new_conversation);
+      context_text = workspace ? folder_name(*workspace) + " \xc2\xb7 " + draft_label : draft_label;
+    }
+    const bool run_active = active_snapshot && active_snapshot->summary.active_run.has_value();
+    std::vector<View> pill_items;
+    if (run_active) {
+      pill_items.push_back(Column{}.With(Frame{.width = 7.0F, .height = 7.0F},
+          CornerRadius(3.5F), Background(colors.primary)));
+    }
+    pill_items.push_back(Text(std::move(context_text))
+        .Style({Font::System(12.5F).WithWeight(FontWeight::Medium), colors.on_surface_variant})
+        .LineLimit(1).Overflow(TextOverflow::Ellipsis));
+    chrome.push_back(Row(std::move(pill_items))
+        .With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Center),
+            Padding(EdgeInsets::Symmetric(10.0F, 4.0F)),
+            Frame{.max_width = 360.0F},
+            Background(colors.surface_container), Border{colors.outline}, CornerRadius(8.0F))
+        .Key("titlebar-context"));
+    chrome.push_back(Spacer().With(Grow()));
+  }
+  chrome.push_back(ProvideEnvironment(titlebar_icon_style,
+      IconButton(::app::images::new_conversation, ::app::strings::ui_new_conversation)
+          .OnClick([start_draft] { start_draft(std::nullopt, {}); })
+          .With(PointerCursor(PointerCursorKind::Hand), Tooltip(::app::strings::ui_new_conversation)))
+      .Key("titlebar-new-conversation"));
+  if (ready.Get() && !pending_count.Get().empty()) {
+    chrome.push_back(Row{
+        Image(::app::images::inbox).Tint(colors.on_primary_container).With(Frame{.width = 14.0F, .height = 14.0F}),
+        Text(pending_count.Get(), TextRole::Label)
+            .Style({Font::System(12.0F).WithWeight(FontWeight::SemiBold), colors.on_primary_container}),
+    }.OnClick(open_pending)
+        .On<ViewEvents::KeyDown>([open_pending](const KeyEvent& event) {
+          if (event.key != Key::Enter && event.key != Key::Space) return false;
+          open_pending();
+          return true;
+        })
+        .With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Center),
+            Padding(EdgeInsets::Symmetric(8.0F, 4.0F)),
+            Background(colors.primary_container), CornerRadius(7.0F),
+            Focusable{}, agentkit_preview::PreviewRowIndication(theme, 7.0F),
+            PointerCursor(PointerCursorKind::Hand),
+            Semantics{.role = SemanticRole::Button, .label = ::app::strings::ui_pending_requests},
+            Tooltip(::app::strings::ui_pending_requests))
+        .Key("titlebar-pending"));
+  }
+  if (settings_available) {
+    auto settings_style = titlebar_icon_style;
+    if (showing_settings.Get()) settings_style.foreground = colors.on_primary_container;
+    chrome.push_back(ProvideEnvironment(settings_style,
+        IconButton(::app::images::settings, ::app::strings::ui_settings)
+            .OnClick([showing_settings, show_settings] {
+              if (showing_settings.Get()) showing_settings = false;
+              else show_settings();
+            })
+            .With(Background(showing_settings.Get() ? colors.primary_container : Color::Transparent()),
+                CornerRadius(7.0F), PointerCursor(PointerCursorKind::Hand), Tooltip(::app::strings::ui_settings)))
+        .Key("titlebar-settings"));
+  }
   return Column{
-      WindowTitleBar(std::move(chrome)).With(Padding(EdgeInsets::Symmetric(14.0F, 0.0F)), Spacing(7.0F),
+      WindowTitleBar(std::move(chrome)).With(Padding(EdgeInsets::Symmetric(10.0F, 0.0F)), Spacing(8.0F),
           Frame{.min_height = 46.0F}, Background(colors.surface_container_low)).Key("preview-title-bar"),
       ProvideEnvironment(DividerStyle{colors.outline}, Divider()),
       std::move(workbench),
@@ -3446,14 +3580,42 @@ ApplicationHook MakeCodeTestInstaller(File database, File workspace, kit::ModelR
 #endif
 
 #if !defined(AGENTKIT_PREVIEW_TEST)
+void InstallPreviewTray(ApplicationContext&) {
+  const auto service = UseService<PreviewService>();
+  const auto application = UseApplication();
+  const auto tray = application.SystemTray();
+  service->tray_enabled = true;
+  const auto show_window = [service] {
+    if (!service->main_window) return;
+    service->main_window->Show();
+    service->main_window->Activate();
+  };
+  const auto hide_window = [service] {
+    if (service->main_window) service->main_window->Hide();
+  };
+  tray.OnActivate([service, show_window, hide_window] {
+    if (!service->main_window) return;
+    if (service->main_window->LifecycleState() == WindowLifecycleState::Active) hide_window();
+    else show_window();
+  });
+  tray.Show(::app::images::tray_icon, {
+      .tooltip = ::app::strings::app_name,
+      .menu = {
+          MenuItem(::app::strings::ui_tray_show_window, show_window),
+          MenuItem(::app::strings::ui_tray_hide_window, hide_window),
+          MenuSection{},
+          MenuItem(::app::strings::ui_tray_quit, [application] { application.Quit(); }),
+      },
+  });
+}
+
 const Application application{
     App,
     {.window = {.title = "GanWork", .initial_size = {1080.0F, 760.0F},
-#ifdef _WIN32
-        .minimum_size = Size{460.0F, 560.0F}, .chrome_mode = WindowChromeMode::Custom, .title_bar_height = 46.0F
-#endif
-     },
+        .minimum_size = custom_preview_chrome ? std::optional{Size{460.0F, 560.0F}} : std::nullopt,
+        .chrome_mode = custom_preview_chrome ? WindowChromeMode::Custom : WindowChromeMode::System,
+        .title_bar_height = 46.0F},
      .show_debug_overlay = false,
-     .application_hooks = {MakePreviewInstaller({}, true)}},
+     .application_hooks = {MakePreviewInstaller({}, true), InstallPreviewTray}},
 };
 #endif

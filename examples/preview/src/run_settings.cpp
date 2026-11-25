@@ -175,7 +175,8 @@ bool SupportsImageInput(std::string_view protocol) {
   return protocol.empty() || protocol == "chat-completions" || protocol == "generate-content" || protocol == "interactions";
 }
 
-void RunSettings::AddModel(const kit::ModelRegistration& registration, std::string label, ModelLimits limits, bool editable) {
+void RunSettings::AddModel(const kit::ModelRegistration& registration, std::string label, ModelLimits limits,
+                           bool editable, bool reasoning_summary) {
   if (std::ranges::find(models_, registration.ref, &ModelChoice::ref) != models_.end()) return;
   const auto& endpoint = registration.endpoint;
   auto name = label.empty() ? endpoint.model : std::move(label);
@@ -190,7 +191,7 @@ void RunSettings::AddModel(const kit::ModelRegistration& registration, std::stri
   }
   const auto caps = registration.provider->Capabilities();
   models_.push_back({registration.ref, name, std::move(name), registration.ref != DemoModel,
-      caps.text_stream && caps.structured_output, caps, std::move(location), endpoint, limits, editable});
+      caps.text_stream && caps.structured_output, caps, std::move(location), endpoint, limits, editable, reasoning_summary});
   auto& version = model_versions_[registration.ref.id];
   version = std::max(version, registration.ref.version);
   model_revision_ = model_revision_.Get() + 1;
@@ -343,6 +344,14 @@ constexpr std::array model_api_formats{
     ModelApiFormat{"Gemini GenerateContent", "generate-content", "gemini"},
     ModelApiFormat{"Gemini Interactions", "interactions", "gemini"},
 };
+
+std::size_t ModelFormatIndex(std::string_view protocol) {
+  if (protocol.empty()) return 0;
+  for (std::size_t i = 0; i < model_api_formats.size(); ++i) {
+    if (protocol == model_api_formats[i].protocol) return i;
+  }
+  return 0;
+}
 
 #ifdef _WIN32
 constexpr bool saves_direct_api_keys = true;
@@ -631,11 +640,14 @@ View AddModelDialog(DialogContext dialog, AddModelProfile add_model, std::functi
 
 [[huxerui::composable]]
 View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile edit_model) {
+  const auto format = UseState(ModelFormatIndex(current.connection.protocol));
   const auto endpoint = UseState(TextEditingValue::FromText(current.connection.base_url.value_or(std::string{})));
   const auto key = UseState(TextEditingValue::FromText({}));
   const auto clear_key = UseState(false);
   const auto limits = UseState(EditLimits(current.limits));
   const auto image_input = UseState(current.capabilities.image_input);
+  const auto file_input = UseState(current.capabilities.file_input);
+  const auto reasoning_summary = UseState(current.reasoning_summary);
   const auto saving = UseState(false);
   const auto error = UseState(std::string{});
   const auto tasks = UseApplicationTaskScope();
@@ -644,7 +656,8 @@ View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile
   auto fields = UseEnvironment<TextFieldStyle>();
   fields.show_label = false;
   const auto invalid_limits = UseString(::app::strings::ui_model_token_limit_invalid);
-  const auto save = [dialog, current, edit_model, endpoint, key, clear_key, limits, image_input, saving, error, tasks, invalid_limits] {
+  const auto save = [dialog, current, edit_model, format, endpoint, key, clear_key, limits,
+                     image_input, file_input, reasoning_summary, saving, error, tasks, invalid_limits] {
     if (saving.Get() || TrimModelField(endpoint->text).empty()) return;
     ModelLimits updated_limits;
     try { updated_limits = ReadLimits(limits.Get()); }
@@ -653,41 +666,73 @@ View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile
     std::optional<std::string> updated_key;
     if (clear_key.Get()) updated_key = std::string{};
     else if (!text.empty()) updated_key = std::move(text);
+    const auto api = model_api_formats.at(format.Get());
+    ModelProfileEdit edit{
+        .base_url = endpoint->text,
+        .protocol = api.protocol,
+        .provider = api.provider,
+        .new_key = std::move(updated_key),
+        .limits = updated_limits,
+        .image_input = SupportsImageInput(api.protocol) && image_input.Get(),
+        .file_input = std::string_view(api.provider) == "gemini" && file_input.Get(),
+        .reasoning_summary = std::string_view(api.protocol) == "responses" && reasoning_summary.Get(),
+    };
     saving = true;
     error = "";
-    tasks.Launch([dialog, edit_model, ref = current.ref, url = endpoint->text, updated_key = std::move(updated_key),
-                  updated_limits, images = image_input.Get(), key, saving, error]() mutable -> Task<void> {
-      auto result = co_await edit_model(std::move(ref), std::move(url), std::move(updated_key), updated_limits, images);
+    tasks.Launch([dialog, edit_model, ref = current.ref, edit = std::move(edit), key, saving, error]() mutable -> Task<void> {
+      auto result = co_await edit_model(std::move(ref), std::move(edit));
       saving = false;
       if (!result.Succeeded()) { error = result.Error().message; co_return; }
       key = TextEditingValue::FromText({});
       dialog.Dismiss();
     });
   };
+  const auto api = model_api_formats.at(format.Get());
+  const auto placeholder = std::string_view(api.provider) == "gemini" ? "https://generativelanguage.googleapis.com/v1beta" :
+      std::string_view(api.provider) == "anthropic" ? "https://api.anthropic.com/v1" : "https://provider.example/v1";
+  const auto format_label = ::app::strings::ui_api_format;
   const auto endpoint_label = ::app::strings::ui_api_base_url;
   const auto key_label = ::app::strings::ui_api_key;
   const bool ready = !saving.Get();
   std::vector<View> content{
       Text(current.label).Style({Font::System(15.0F).WithWeight(FontWeight::SemiBold), color.on_surface}),
-      PreviewLabeledField(endpoint_label, TextField(endpoint).Label(endpoint_label).Variant(TextFieldVariant::Outlined)
-          .OnChanged([endpoint](const TextEditingValue& value) { endpoint = value; })
+      Text(::app::strings::ui_model_connection_heading, TextRole::Label)
+          .Style({Font::System(14.0F).WithWeight(FontWeight::SemiBold), color.on_surface}),
+      PreviewLabeledField(format_label, Select(model_api_formats, format, [](const ModelApiFormat& item) {
+        return Text(item.label).LineLimit(1).Overflow(TextOverflow::Ellipsis);
+      }).Label(format_label).OnChanged([format](std::size_t index) { format = index; })
+          .With(Enabled(ready)).Key("edit-model-api"), color),
+      PreviewLabeledField(endpoint_label, TextField(endpoint).Label(endpoint_label).Placeholder(placeholder)
+          .Variant(TextFieldVariant::Outlined).OnChanged([endpoint](const TextEditingValue& value) { endpoint = value; })
           .With(Enabled(ready)).Key("edit-model-url"), color),
       PreviewLabeledField(key_label, TextField(key).Label(key_label).Placeholder(::app::strings::ui_keep_saved_model_key)
           .Variant(TextFieldVariant::Outlined).Secure().OnChanged([key](const TextEditingValue& value) { key = value; })
           .With(Enabled(ready && !clear_key.Get())).Key("edit-model-key"), color),
       Checkbox(::app::strings::ui_clear_saved_model_key, clear_key.Get())
           .OnChanged([clear_key](bool checked) { clear_key = checked; }).With(Enabled(ready && key->text.empty())),
-      ModelLimitFields(limits.Get(), ready, color, [limits](std::size_t i, TextEditingValue value) {
-        auto next = limits.Get();
-        next[i] = std::move(value);
-        limits = std::move(next);
-      }),
   };
-  if (SupportsImageInput(current.connection.protocol))
-    content.push_back(Checkbox(::app::strings::ui_image_input, image_input.Get())
-        .OnChanged([image_input](bool on) { image_input = on; }).With(Enabled(ready)).Key("edit-model-image-input"));
   if (!saves_direct_api_keys && !key->text.empty() && !key->text.starts_with("${"))
     content.push_back(Text(::app::strings::ui_direct_keys_are_available_until_preview_closes, TextRole::Label));
+  content.push_back(ProvideEnvironment(DividerStyle{color.outline}, Divider()));
+  content.push_back(ModelLimitFields(limits.Get(), ready, color, [limits](std::size_t i, TextEditingValue value) {
+    auto next = limits.Get();
+    next[i] = std::move(value);
+    limits = std::move(next);
+  }));
+  if (SupportsImageInput(api.protocol)) {
+    std::vector<View> media{Checkbox(::app::strings::ui_image_input, image_input.Get())
+        .OnChanged([image_input](bool on) { image_input = on; }).Key("edit-model-image-input")};
+    if (std::string_view(api.provider) == "gemini") {
+      media.push_back(Checkbox(::app::strings::ui_pdf_input, file_input.Get())
+          .OnChanged([file_input](bool on) { file_input = on; }).Key("edit-model-pdf-input"));
+    }
+    content.push_back(Flow(std::move(media)).With(Spacing(12.0F), Enabled(ready)));
+  }
+  if (std::string_view(api.protocol) == "responses") {
+    content.push_back(Checkbox(::app::strings::ui_request_reasoning_summary, reasoning_summary.Get())
+        .OnChanged([reasoning_summary](bool on) { reasoning_summary = on; })
+        .With(Enabled(ready)).Key("edit-model-reasoning-summary"));
+  }
   if (!error->empty()) content.push_back(Text(error.Get()).With(Foreground(color.error)).Key("edit-model-error"));
   auto body = ScrollView(Column(std::move(content)).With(Spacing(12.0F), Padding(EdgeInsets::Symmetric(20.0F, 15.0F)),
       CrossAlign(CrossAxisAlignment::Stretch))).With(Frame{.max_height = 520.0F}, ScrollBar());

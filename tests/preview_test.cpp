@@ -9626,7 +9626,8 @@ void VerifyModelEditing(const File& root, const std::string& server) {
             co_await Delay(10ms);
           }
           if (!root.Child("original-started").Exists()) throw std::runtime_error("The first Run did not open the original connection");
-          const auto revision = LiveTake(co_await save(first, updated, "revision-fixture-key-updated", {65536, 49152, 8192}, false));
+          const auto revision = LiveTake(co_await save(first, {.base_url = updated, .new_key = "revision-fixture-key-updated",
+              .limits = {65536, 49152, 8192}, .image_input = false}));
           if (revision != kit::ModelProviderRef{first.id, 2} || !session->Snapshot()->summary.active_run)
             throw std::runtime_error("Editing did not retain the active Run and stable model identity");
           WriteFixture(root.Child("release-original"), "ready");
