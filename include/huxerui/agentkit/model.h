@@ -106,11 +106,17 @@ struct ModelInput {
   std::string instruction;
   /// Additional source selections to resolve and authorize.
   std::vector<SourceSlice> context;
-  /// Explicit subset of authorized agent tools and built-in Skill tools for an unstructured completion.
-  /// An empty list offers no tools.
+  /// Explicit tool IDs for an unstructured completion, including built-in Skill tools.
+  /// An empty list with include_catalog_tools set to false offers no tools.
   std::vector<ToolId> allowed_tools;
   /// Expected result schema for a structured completion.
   std::optional<JsonSchema> output_schema;
+  /// Also offer every authorized tool in the running agent's AgentDefinition::tool_catalogs, including MCP catalogs.
+  /// The runtime discovers the current catalog entries each model round. Run restrictions, current permissions,
+  /// and any required approvals still apply. Individual catalog tool IDs need not appear in allowed_tools.
+  /// Use with a model that supports tool calls and leave output_schema unset. Recovered steps keep their saved
+  /// catalog opt-in and recheck current permissions.
+  bool include_catalog_tools = false;
 };
 
 /// @brief One content item to encode in a model turn.

@@ -165,6 +165,7 @@ public:
   /// @param input Per-turn instructions, sources, output schema and tool restrictions.
   /// @return The committed reply, including any visible artifacts published by this completion.
   /// @note The effective model and budget come from the Run binding. The supplied tools and sources are checked before use.
+  /// @see ModelInput::allowed_tools, ModelInput::include_catalog_tools
   Async<ModelReply> CompleteAsync(ModelInput input);
 
   /// @brief Records a form request with a stable command ID for later waiting or recovery.

@@ -9389,6 +9389,106 @@ void VerifyLiveSettings(const File& root, const std::string& url, const std::str
   }
 }
 
+void VerifyExtensions(const File& root, const std::string& endpoint) {
+  const auto database = root.Child("sessions.sqlite3");
+  const auto package = root.Child("release-notes");
+  if (!package.CreateDirectories() || !package.Child("references").CreateDirectories())
+    throw std::runtime_error("Could not create the Skill package fixture");
+  const auto file = package.Child("SKILL.md");
+  const auto reference = package.Child("references").Child("checklist.md");
+  constexpr auto header = "---\nname: release-notes\ndescription: >-\n  Check the release notes.\n---\n";
+  WriteFixture(file, std::string(header) + "Use the first release checklist.");
+  WriteFixture(reference, "Check the version.");
+  std::exception_ptr failure;
+  bool completed = false;
+  {
+    const Application import{[]() -> View { return Spacer(); },
+        {.window = {.activatable = false}, .quit_on_last_window_closed = false,
+         .application_hooks = {[&](ApplicationContext&) {
+          const auto app = UseApplication();
+          UseApplicationTaskScope().Launch([&, app]() -> Task<void> {
+            try {
+              agentkit_preview::ImportedSkillSource source(root.Child("skills.json"));
+              LiveTake(co_await source.Import(package));
+              const auto first = source.Entries().at(0).summary.ref;
+              WriteFixture(file, std::string(header) + "Use the revised release checklist.");
+              LiveTake(co_await source.Import(package));
+              const auto next = source.Entries().at(0).summary.ref;
+              const auto previous = LiveTake(co_await source.LoadAsync({}, first));
+              if (next.version != first.version + 1 || previous.instructions != "Use the first release checklist." ||
+                  previous.resources.size() != 1 ||
+                  (co_await source.OpenResourceAsync({}, first, "../SKILL.md")).Succeeded())
+                throw std::runtime_error("Skill import did not retain immutable resources and instructions");
+              LiveTake(co_await source.SetEnabled(next.id, false));
+              if (source.HasEnabled() || (co_await source.LoadAsync({}, first)).Succeeded())
+                throw std::runtime_error("Disabling the Skill kept an old version available");
+              LiveTake(co_await source.SetEnabled(next.id, true));
+              completed = true;
+            } catch (...) { failure = std::current_exception(); }
+            app.Quit();
+          });
+        }}}};
+    static_cast<void>(RunApplication());
+  }
+  if (failure) std::rethrow_exception(failure);
+  if (!completed) throw std::runtime_error("Skill import test did not finish");
+
+  {
+    const Application application{App, {.application_hooks = {MakePreviewInstaller(database, false)}}};
+    UiTest ui(application, {.viewport = {1440.0F, 960.0F}});
+    const auto tap = [&](const char* key) {
+      const auto control = ui.Find(UiSelector::Key(key));
+      Wait(ui, [&] { return control.Exists() && control.One().in_viewport && control.One().enabled; }, key);
+      control.Tap();
+    };
+    tap("open-settings");
+    tap("settings-section-skills");
+    Wait(ui, [&] { return ui.Find(UiSelector::Key("settings-imported-skills")).Exists(); }, "Imported Skill did not reopen in Settings");
+    tap("settings-section-mcp");
+    tap("settings-add-mcp");
+    tap("mcp-server-name");
+    ui.Find(UiSelector::Key("mcp-server-name")).ReplaceText("Release tools");
+    tap("mcp-server-url");
+    ui.Find(UiSelector::Key("mcp-server-url")).ReplaceText(endpoint);
+    if (endpoint.ends_with("/mcp-legacy")) tap("mcp-server-legacy");
+    tap("mcp-server-save");
+    Wait(ui, [&] { return !ui.Find(UiSelector::Key("mcp-server-dialog")).Exists(); }, "The MCP server form did not close");
+    tap("settings-save");
+    tap("close-settings");
+    Wait(ui, [&] { return root.Child("settings.json").Exists(); }, "MCP settings were not saved");
+  }
+
+  completed = false;
+  const Application run{[]() -> View { return Spacer(); },
+      {.window = {.activatable = false}, .quit_on_last_window_closed = false,
+       .application_hooks = {MakeModelEditingTestInstaller(database, [&](auto started, auto) -> Task<void> {
+    const auto app = UseApplication();
+    try {
+      const auto runtime = LiveTake(std::move(started));
+      const auto listed = LiveTake(co_await runtime->ListSkillsAsync({agentkit_preview::GeneralAgent}));
+      const auto skill = std::ranges::find_if(listed, [](const auto& item) { return item.ref.source == agentkit_preview::ImportedSkills; });
+      if (skill == listed.end() || skill->ref.version != 2) throw std::runtime_error("The updated Skill was not discoverable after restart");
+      auto created = LiveTake(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
+          .options = {.agent = agentkit_preview::GeneralAgent, .title = "Extension acceptance"},
+          .initial = kit::SendInput{.text = "Use the release tools.", .skills = {skill->ref}}}));
+      auto session = LiveTake(co_await runtime->Sessions().OpenAsync(std::get<kit::SessionCreated>(created.outcome).session));
+      auto observation = co_await LiveObserve(session);
+      auto approval = co_await LiveInteraction(session, "Release tools / get_release_count", {}, 15s);
+      if (root.Child("mcp-called").Exists()) throw std::runtime_error("The MCP tool ran before approval");
+      WriteFixture(root.Child("mcp-approved"), "approved");
+      co_await LiveApprove(session, approval);
+      co_await LiveRunCompleted(session);
+      if (!root.Child("mcp-called").Exists()) throw std::runtime_error("The approved MCP request did not reach the server");
+      LiveTake(co_await runtime->CloseAsync());
+      completed = true;
+    } catch (...) { failure = std::current_exception(); }
+    app.Quit();
+  })}}};
+  static_cast<void>(RunApplication());
+  if (failure) std::rethrow_exception(failure);
+  if (!completed) throw std::runtime_error("MCP acceptance did not finish");
+}
+
 void VerifyModelEditing(const File& root, const std::string& server) {
   const auto database = root.Child("sessions.sqlite3");
   const auto original = server + "/original/v1";
@@ -9683,6 +9783,12 @@ void VerifyLocalization(const File& root) {
 } // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 4 && std::string_view(argv[1]) == "--extensions") {
+    try {
+      VerifyExtensions(File(std::filesystem::absolute(std::filesystem::u8path(argv[2])).u8string()), argv[3]);
+      return 0;
+    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+  }
 #ifdef _WIN32
   if (argc == 3 && std::string_view(argv[1]) == "--open-html-artifact") {
     try {

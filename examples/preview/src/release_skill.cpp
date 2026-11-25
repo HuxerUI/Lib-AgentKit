@@ -57,7 +57,8 @@ View SkillPicker(std::shared_ptr<kit::AgentRuntime> runtime, kit::SkillCatalogQu
       error = "";
       std::vector<MenuEntry> items;
       for (auto& skill : available.Value()) {
-        auto label = skill.ref.id == ReleasePresentationSkill ? StringVariant{::app::strings::ui_release_presentation} :
+        auto label = skill.ref.source == PreviewSkills && skill.ref.id == ReleasePresentationSkill ?
+            StringVariant{::app::strings::ui_release_presentation} :
             StringVariant{std::move(skill.name)};
         items.emplace_back(MenuItem(std::move(label), [selection, ref = skill.ref] {
           selection = std::vector{ref};
@@ -71,7 +72,8 @@ View SkillPicker(std::shared_ptr<kit::AgentRuntime> runtime, kit::SkillCatalogQu
     });
   };
   const auto label = selected.empty() ? StringVariant{::app::strings::ui_skills} :
-      selected.front().id == ReleasePresentationSkill ? StringVariant{::app::strings::ui_skill_release_presentation} :
+      selected.front().source == PreviewSkills && selected.front().id == ReleasePresentationSkill ?
+      StringVariant{::app::strings::ui_skill_release_presentation} :
       StringVariant::Format(::app::strings::ui_skill_name, selected.front().id.value);
   auto button = Button(label).OnClick(choose).With(anchor).Key("composer-skills");
   if (error->empty()) return button;

@@ -248,6 +248,7 @@ struct HostedModelStep {
   std::optional<std::size_t> input_index;
   std::vector<ToolId> allowed_tools;
   std::map<ToolCallId, std::vector<ArtifactRef>> published;
+  bool include_catalog_tools = false;
 };
 
 inline const ToolId DelegationToolId{"agentkit_delegate"};
@@ -310,8 +311,8 @@ struct RunExecution {
   ModelHistory model_history;
 
   bool UsingHostedModelTools() const {
-    return host_model_busy && host_model_step && std::ranges::any_of(host_model_step->allowed_tools,
-        [](const ToolId& id) { return !SkillTool(id.value); });
+    return host_model_busy && host_model_step && (host_model_step->include_catalog_tools ||
+        std::ranges::any_of(host_model_step->allowed_tools, [](const ToolId& id) { return !SkillTool(id.value); }));
   }
 
   bool ExecutingTool() const {

@@ -326,7 +326,10 @@ struct PreviewService {
   std::optional<File> settings_file;
   State<agentkit_preview::PreviewSettings> settings{agentkit_preview::PreviewSettings{}};
   State<agentkit_preview::PreviewSettings> applied_settings{agentkit_preview::PreviewSettings{}};
+  State<bool> settings_busy{false};
   std::shared_ptr<agentkit_preview::AttachmentImports> attachments;
+  std::shared_ptr<agentkit_preview::ImportedSkillSource> imported_skills;
+  std::shared_ptr<agentkit_preview::McpConnections> mcp;
   std::shared_ptr<agentkit_preview::ComposerPreferences> preferences;
   std::shared_ptr<agentkit_preview::ConversationNavigationStore> navigation_store;
   State<agentkit_preview::NavigationPreferences> navigation{agentkit_preview::NavigationPreferences{}};
@@ -1125,10 +1128,16 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
           co_return kit::AgentResult<kit::PolicyDecision>::Success({kit::AccessDecision::RequireConfirmation, {}});
         }
         if (request.capability == kit::Capability::ActivateSkill && request.skill &&
-            request.skill->source == agentkit_preview::PreviewSkills && request.actor.kind == kit::ActionParty::Kind::Agent) {
+            (request.skill->source == agentkit_preview::PreviewSkills || request.skill->source == agentkit_preview::ImportedSkills) &&
+            request.actor.kind == kit::ActionParty::Kind::Agent) {
           co_return kit::AgentResult<kit::PolicyDecision>::Success({kit::AccessDecision::RequireConfirmation, {}});
         }
         const auto tool = request.tool ? request.tool->id : kit::ToolId{};
+        if (request.tool && request.tool->catalog && request.tool->catalog->value.starts_with("ganwork.mcp/")) {
+          auto decision = request.actor.principal != preview_user ? kit::AccessDecision::Deny :
+              request.capability == kit::Capability::ExecuteTool ? kit::AccessDecision::RequireConfirmation : kit::AccessDecision::Allow;
+          co_return kit::AgentResult<kit::PolicyDecision>::Success({decision, {}});
+        }
 #ifdef _WIN32
         if (agentkit_preview::HostToolLabel(tool)) {
           auto decision = kit::AccessDecision::Allow;
@@ -1222,10 +1231,17 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
     Require(registered->RegisterModel(std::move(model)));
   }
   settings->SetDefaults(general, code);
+  const auto service = host.lock();
+  if (service && service->imported_skills)
+    Require(registered->RegisterSkillSource(agentkit_preview::ImportedSkills, service->imported_skills));
+  const auto catalogs = service && service->mcp ? service->mcp->Register(registered, preferences.mcp_servers)
+                                               : std::vector<kit::ToolCatalogId>{};
   const bool workspace_tests = test_runner.has_value() && (code || can_add_models);
   const auto register_workspace_agent = [&](kit::AgentRegistration agent) {
     auto tools = agentkit_preview::WorkspaceModelTools(workspace_tests);
     agent.definition.tools.insert(agent.definition.tools.end(), tools.begin(), tools.end());
+    if (service && service->imported_skills) agent.definition.skill_sources.push_back(agentkit_preview::ImportedSkills);
+    agent.definition.tool_catalogs = catalogs;
     Require(registered->RegisterAgent(std::move(agent)));
   };
   using SpecialistWorkflow = std::function<kit::Async<kit::RunCompletion>(
@@ -1494,6 +1510,10 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
         std::optional<kit::AgentResult<kit::ModelRegistration>> reviewer;
 #ifndef __EMSCRIPTEN__
         service->settings_file = data.Child("settings.json");
+        service->imported_skills = std::make_shared<agentkit_preview::ImportedSkillSource>(data.Child("skills.json"));
+        service->mcp = std::make_shared<agentkit_preview::McpConnections>(data.Child("mcp-catalogs"));
+        auto skills_restored = co_await service->imported_skills->Restore();
+        if (!skills_restored.Succeeded()) service->model_configuration_error = skills_restored.Error().message;
         auto preferences = co_await agentkit_preview::ReadPreviewSettings(*service->settings_file);
         if (preferences.Succeeded()) {
           service->settings = preferences.Value();
@@ -1571,6 +1591,7 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
             return UseService<Resources>()->GetString(settings->ModelLabel(binding.model));
           }};
         };
+        if (service->mcp) co_await service->mcp->Start();
         auto started = co_await service->runtime->StartAsync();
         service->startup = started.Succeeded() ? PreviewService::Started::Success(service->runtime)
                                                : PreviewService::Started::Failure(started.Error());
@@ -2946,7 +2967,7 @@ View PreviewShell() {
                             .OnClick([goal_session, id = summary.id] { goal_session = id; })
                             .With(Tooltip(::app::strings::ui_goal)).Key("conversation-goal")),
                 };
-                if (summary.agent.id == agentkit_preview::GeneralAgent)
+                if (summary.agent.id == agentkit_preview::GeneralAgent || (service->imported_skills && service->imported_skills->HasEnabled()))
                   actions.push_back(agentkit_preview::SkillPicker(service->runtime, {summary.id}, skills));
                 auto caps = service->run_settings->Capabilities(next->model, summary.agent.id);
                 if (current) {
@@ -3166,10 +3187,11 @@ View PreviewShell() {
     std::optional<View> controls;
     if (ready.Get()) {
       std::optional<View> draft_action;
-      if (new_agent == agentkit_preview::GeneralAgent) {
+      if (new_agent == agentkit_preview::GeneralAgent || (service->imported_skills && service->imported_skills->HasEnabled())) {
         kit::SkillCatalogQuery query{new_agent, ProjectFor(workspace_id), workspace_id};
         draft_action = agentkit_preview::SkillPicker(service->runtime, std::move(query), new_skills);
-      } else if (new_agent == agentkit_preview::PptAgent) {
+      }
+      if (new_agent == agentkit_preview::PptAgent) {
         const auto project = ProjectFor(workspace_id);
         if (const auto report = new_report.Get(); report && report->ref.project == project) {
           auto report_style = UseEnvironment<ButtonStyle>();
@@ -3184,9 +3206,11 @@ View PreviewShell() {
         } else {
           folder_report = BrowserDraftReport(service, project, workspace, native_workspace, new_report);
           if (picker && picker->CanOpenFiles()) {
-            draft_action = agentkit_preview::ImportReportControl(service->runtime, project,
+            auto report_action = agentkit_preview::ImportReportControl(service->runtime, project,
                 [new_report](agentkit_preview::ImportedPresentationReport report) { new_report = std::move(report); }, draft_error)
                 .Key("draft-report/" + project.value);
+            if (draft_action) draft_action = Flow{std::move(*draft_action), std::move(report_action)}.With(Spacing(4.0F));
+            else draft_action = std::move(report_action);
           }
         }
       }
@@ -3331,7 +3355,7 @@ View PreviewShell() {
           [service](agentkit_preview::LocalFilePermissions permissions) -> kit::Async<void> {
             service->local_files->Apply(std::move(permissions));
             co_return co_await service->runtime->RefreshAccessAsync();
-          })
+          }, service->imported_skills, service->mcp, service->runtime, service->settings_busy)
       : View(Spacer());
   auto pages = IndexedPages({Column(std::move(content)).With(CrossAlign(CrossAxisAlignment::Stretch)),
       std::move(settings)}, showing_settings.Get() ? 1U : 0U).Key("workbench-main");

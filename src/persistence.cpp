@@ -363,7 +363,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(HostToolRecord, request, ref, stamp, call, re
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(StoredArtifact, record, handle)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(StoredCollaboration, record, auto_start, scope, steer_message, goal)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DelegatedRun, budget, expected_result, started)
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(HostedModelStep, input_index, allowed_tools, published)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(HostedModelStep, input_index, allowed_tools, published, include_catalog_tools)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ModelHistory, messages, summarized, summary, edited)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(StoredRun, view, principal, input, deadline, prepared_tool,
     tool_approval, tool_plans, items, pending_steers, continuation, continuation_missing, pending_calls, model_boundary,

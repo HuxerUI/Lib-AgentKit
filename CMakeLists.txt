@@ -230,6 +230,8 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HU
             tests/preview_test.cpp
             examples/preview/src/app.cpp
             examples/preview/src/attachment_imports.cpp
+            examples/preview/src/imported_skills.cpp
+            examples/preview/src/mcp_connections.cpp
             examples/preview/src/code_workspace.cpp
             examples/preview/src/code_tools.cpp
             examples/preview/src/code_tests.cpp
@@ -320,6 +322,8 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HU
         if (WIN32)
             add_test(NAME huxerui_agentkit_model_editing_tests COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/model_editing_server.py" $<TARGET_FILE:huxerui_agentkit_preview_tests>)
+            add_test(NAME huxerui_agentkit_preview_extensions_tests COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/preview_extensions_server.py" $<TARGET_FILE:huxerui_agentkit_preview_tests>)
             add_test(NAME huxerui_agentkit_host_tools_tests COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/host_tools_server.py" $<TARGET_FILE:huxerui_agentkit_preview_tests>)
         endif ()

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <set>
 
 namespace agentkit_preview {
 namespace {
@@ -35,7 +36,7 @@ const std::array palettes{
     PaletteChoice{PreviewPalette::Sandstone, "sandstone", ::app::strings::ui_palette_sandstone},
 };
 
-enum class SettingsSection { Models, Personalization, Appearance, Permissions, Storage };
+enum class SettingsSection { Models, Personalization, Appearance, Permissions, Skills, Mcp, Storage };
 
 struct SettingsCategory {
   SettingsSection section;
@@ -48,6 +49,8 @@ const std::array categories{
     SettingsCategory{SettingsSection::Personalization, ::app::strings::ui_personalization, "settings-section-personalization"},
     SettingsCategory{SettingsSection::Appearance, ::app::strings::ui_appearance, "settings-section-appearance"},
     SettingsCategory{SettingsSection::Permissions, ::app::strings::ui_permissions, "settings-section-permissions"},
+    SettingsCategory{SettingsSection::Skills, ::app::strings::ui_skills, "settings-section-skills"},
+    SettingsCategory{SettingsSection::Mcp, ::app::strings::ui_mcp, "settings-section-mcp"},
     SettingsCategory{SettingsSection::Storage, ::app::strings::ui_storage, "settings-section-storage"},
 };
 
@@ -65,6 +68,21 @@ std::optional<kit::ModelProviderRef> ReadModel(const Json& document, const char*
 }
 
 using ModelRole = std::optional<kit::ModelProviderRef> PreviewSettings::*;
+
+std::vector<McpServer> ReadMcpServers(const Json& records) {
+  if (!records.is_array() || records.size() > 12) throw std::invalid_argument("Invalid MCP server list");
+  std::vector<McpServer> servers;
+  std::set<std::string> ids;
+  for (const auto& record : records) {
+    McpServer server{record.at("id").get<std::string>(), record.at("name").get<std::string>(),
+        record.at("url").get<std::string>(), record.value("token_reference", std::string{}),
+        record.value("enabled", true), record.value("legacy", false)};
+    ValidateMcpServer(server);
+    if (!ids.insert(server.id).second) throw std::invalid_argument("Duplicate MCP server identity");
+    servers.push_back(std::move(server));
+  }
+  return servers;
+}
 
 View ModelRoleField(StringVariant label, std::vector<ModelChoice> choices, StringVariant fallback,
     State<PreviewSettings> draft, ModelRole role) {
@@ -127,6 +145,52 @@ View SettingsPanel(std::vector<View> rows, const ColorScheme& colors) {
 }
 
 [[huxerui::composable]]
+View McpServerDialog(DialogContext dialog, McpServer initial, State<PreviewSettings> draft) {
+  const auto name = UseState(TextEditingValue::FromText(initial.name));
+  const auto endpoint = UseState(TextEditingValue::FromText(initial.url));
+  const auto token = UseState(TextEditingValue::FromText(initial.token_reference));
+  const auto legacy = UseState(initial.legacy);
+  const auto error = UseState(std::string{});
+  const auto& colors = UseTheme().colors;
+  const auto style = UseEnvironment<ButtonStyle>();
+  auto fields = UseEnvironment<TextFieldStyle>();
+  fields.show_label = false;
+  const auto save = [initial, name, endpoint, token, legacy, draft, dialog, error] {
+    auto server = initial;
+    server.name = TrimModelField(name->text);
+    server.url = TrimModelField(endpoint->text);
+    server.token_reference = TrimModelField(token->text);
+    server.legacy = legacy.Get();
+    try { ValidateMcpServer(server); }
+    catch (const std::exception& invalid) { error = invalid.what(); return; }
+    auto settings = draft.Get();
+    auto existing = std::ranges::find(settings.mcp_servers, server.id, &McpServer::id);
+    if (existing == settings.mcp_servers.end()) settings.mcp_servers.push_back(std::move(server));
+    else *existing = std::move(server);
+    draft = std::move(settings);
+    dialog.Dismiss();
+  };
+  const auto field = [&colors](StringResource label, State<TextEditingValue> value, std::string key) {
+    return PreviewLabeledField(label, TextField(value).Label(label).Variant(TextFieldVariant::Outlined)
+        .OnChanged([value](const TextEditingValue& next) { value = next; }).Key(std::move(key)), colors);
+  };
+  auto body = Column{
+      field(::app::strings::ui_mcp_name, name, "mcp-server-name"),
+      field(::app::strings::ui_mcp_endpoint, endpoint, "mcp-server-url"),
+      field(::app::strings::ui_mcp_token, token, "mcp-server-token"),
+      Checkbox(::app::strings::ui_mcp_legacy, legacy.Get()).OnChanged([legacy](bool value) { legacy = value; }).Key("mcp-server-legacy"),
+      error->empty() ? View{} : Text(error.Get()).With(Foreground(colors.error)),
+  }.With(Spacing(10.0F), Padding(EdgeInsets::Symmetric(20.0F, 15.0F)), CrossAlign(CrossAxisAlignment::Stretch));
+  auto actions = Row{Spacer(),
+      ProvideEnvironment(PreviewSecondaryButton(style, colors), Button(::app::strings::ui_cancel).OnClick([dialog] { dialog.Dismiss(); })),
+      ProvideEnvironment(PreviewPrimaryButton(style, colors), Button(::app::strings::ui_mcp_save).OnClick(save)
+          .With(Enabled(!name->text.empty() && !endpoint->text.empty())).Key("mcp-server-save")),
+  }.With(Spacing(8.0F));
+  return ProvideEnvironment(fields, PreviewFormDialog(initial.name.empty() ? ::app::strings::ui_mcp_add : ::app::strings::ui_mcp_edit,
+      std::move(body), std::move(actions), colors, 500.0F)).Key("mcp-server-dialog");
+}
+
+[[huxerui::composable]]
 View SettingsCategoryLink(SettingsCategory category, State<SettingsSection> active) {
   const auto theme = UseTheme();
   const auto& colors = theme.colors;
@@ -183,7 +247,8 @@ kit::Async<PreviewSettings> ReadPreviewSettings(File file) {
         .palette = choice == palettes.end() ? PreviewPalette::Graphite : choice->palette, .tone = static_cast<ReplyTone>(tone),
         .instructions = std::move(instructions), .daily_model = ReadModel(doc, "daily_model"),
         .image_model = ReadModel(doc, "image_model"), .review_model = ReadModel(doc, "review_model"),
-        .image_generation_model = image_generation_model, .file_access = std::move(file_access)});
+        .image_generation_model = image_generation_model, .file_access = std::move(file_access),
+        .mcp_servers = ReadMcpServers(doc.value("mcp_servers", Json::array()))});
   } catch (const std::exception&) {
     co_return Result::Failure({.code = kit::ErrorCode::InvalidArgument, .message = "The saved Preview settings are invalid."});
   }
@@ -196,12 +261,16 @@ kit::Async<void> SavePreviewSettings(File file, PreviewSettings settings) {
   }
   auto temporary = file.Parent()->Child(kit::NewCommandId().value + ".settings-pending");
   const auto palette = std::ranges::find(palettes, settings.palette, &PaletteChoice::palette);
+  auto mcp_servers = Json::array();
+  for (const auto& server : settings.mcp_servers)
+    mcp_servers.push_back({{"id", server.id}, {"name", server.name}, {"url", server.url},
+        {"token_reference", server.token_reference}, {"enabled", server.enabled}, {"legacy", server.legacy}});
   auto contents = Json{{"appearance", static_cast<std::size_t>(settings.appearance)},
       {"palette", palette == palettes.end() ? palettes.front().id : palette->id},
       {"tone", static_cast<std::size_t>(settings.tone)}, {"instructions", std::move(settings.instructions)},
       {"daily_model", ModelRecord(settings.daily_model)}, {"image_model", ModelRecord(settings.image_model)},
       {"review_model", ModelRecord(settings.review_model)},
-      {"image_generation_model", ModelRecord(settings.image_generation_model)}, {"file_access", {
+      {"image_generation_model", ModelRecord(settings.image_generation_model)}, {"mcp_servers", std::move(mcp_servers)}, {"file_access", {
         {"full_access", settings.file_access.full_access}, {"directories", std::move(settings.file_access.directories)},
         {"revision", std::move(settings.file_access.revision)}}}}.dump();
   if (!co_await temporary.WriteStringAsync(std::move(contents)) || !co_await temporary.MoveToAsync(file, true)) {
@@ -233,15 +302,26 @@ ThemeSpec PreviewThemeFor(const PreviewSettings& settings, ThemeBrightness syste
 [[huxerui::composable]]
 View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> applied,
     std::shared_ptr<RunSettings> models, File file, AddModelProfile add_model, EditModelProfile edit_model, std::function<void()> close,
-    std::function<kit::Async<void>(LocalFilePermissions)> apply_file_access) {
-  const auto draft = UseState(current.Get());
-  const auto instructions = UseState(TextEditingValue::FromText(current->instructions));
-  const auto busy = UseState(false);
+    std::function<kit::Async<void>(LocalFilePermissions)> apply_file_access, std::shared_ptr<ImportedSkillSource> imported_skills,
+    std::shared_ptr<McpConnections> mcp, std::shared_ptr<kit::AgentRuntime> runtime, State<bool> busy) {
+  const auto baseline = current.Get();
+  const auto draft = UseState(baseline);
+  const auto draft_baseline = UseState(baseline);
+  const auto instructions = UseState(TextEditingValue::FromText(baseline.instructions));
   const auto error = UseState(std::string{});
+  const auto extensions_changed = UseState(std::size_t{0});
   const auto section = UseState(SettingsSection::Models);
   const auto dialog = UseDialog();
   const auto picker = UseService<FilePicker>();
-  const auto tasks = UseTaskScope();
+  const auto tasks = UseApplicationTaskScope();
+  Lifecycle([baseline, draft_baseline, draft, instructions] {
+    if (draft.Get() == draft_baseline.Get()) {
+      draft = baseline;
+      instructions = TextEditingValue::FromText(baseline.instructions);
+    }
+    draft_baseline = baseline;
+    return [] {};
+  }, baseline);
   const auto theme = UseTheme();
   const auto& colors = theme.colors;
   const auto viewport = UseViewportClass();
@@ -250,15 +330,19 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
   auto fields = UseEnvironment<TextFieldStyle>();
   fields.show_label = false;
   const auto secondary = PreviewSecondaryButton(UseEnvironment<ButtonStyle>(), colors);
-  const auto save = [current, draft, file, tasks, error, busy, apply_file_access] {
+  const auto save = [current, draft, file, tasks, error, busy, apply_file_access, mcp] {
     if (busy.Get()) return;
     busy = true;
     error = "";
-    tasks.Launch([current, draft, file, value = draft.Get(), busy, error, apply_file_access]() mutable -> Task<void> {
+    tasks.Launch([current, draft, file, value = draft.Get(), busy, error, apply_file_access, mcp]() mutable -> Task<void> {
       const bool access_changed = value.file_access != current->file_access;
       if (access_changed) value.file_access.revision = kit::NewCommandId().value;
       auto saved = co_await SavePreviewSettings(file, value);
       if (saved.Succeeded()) {
+        if (mcp && value.mcp_servers != current->mcp_servers) {
+          auto updated = co_await mcp->Apply(value.mcp_servers);
+          if (!updated.Succeeded()) error = updated.Error().message;
+        }
         if (access_changed) {
           auto updated = co_await apply_file_access(value.file_access);
           if (!updated.Succeeded()) error = updated.Error().message;
@@ -449,6 +533,107 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
           .With(Padding(EdgeInsets::Symmetric(0.0F, 8.0F)), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Center)).Key(directory));
     }
     content.push_back(SettingsPanel(std::move(rows), colors).Key("settings-file-access"));
+    break;
+  }
+  case SettingsSection::Skills: {
+    static_cast<void>(extensions_changed.Get());
+    const auto import = [imported_skills, runtime, picker, tasks, busy, error, extensions_changed] {
+      if (!imported_skills || !picker || busy.Get()) return;
+      busy = true;
+      error = "";
+      tasks.Launch([imported_skills, runtime, picker, busy, error, extensions_changed]() -> Task<void> {
+        const auto picked = co_await picker->OpenDirectoryAsync();
+        if (picked) {
+          if (const auto folder = picked->AsFile()) {
+            auto result = co_await imported_skills->Import(*folder);
+            if (result.Succeeded()) result = co_await runtime->RefreshAccessAsync();
+            if (!result.Succeeded()) error = result.Error().message;
+            extensions_changed = extensions_changed.Get() + 1;
+          }
+        }
+        busy = false;
+      });
+    };
+    content.push_back(SettingsPanel({
+        SettingsRow(::app::strings::ui_skills, ::app::strings::ui_skill_import_help,
+            ProvideEnvironment(secondary, Button(::app::strings::ui_skill_import).OnClick(import)
+                .With(Enabled(imported_skills && picker && picker->CanOpenDirectories() && !busy.Get()))).Key("settings-import-skill"),
+            stack_fields, colors),
+        Column{Text(::app::strings::ui_release_presentation), Text(::app::strings::ui_skill_builtin, TextRole::Label)
+            .With(Foreground(colors.on_surface_variant))}
+            .With(Padding(EdgeInsets::Symmetric(0.0F, 12.0F)), Spacing(4.0F)),
+    }, colors));
+    if (!imported_skills) break;
+    std::vector<View> rows;
+    for (const auto& entry : imported_skills->Entries()) {
+      rows.push_back(SettingsRow(entry.summary.name, entry.summary.description,
+          Checkbox(::app::strings::ui_extension_enabled, entry.enabled)
+              .OnChanged([imported_skills, runtime, id = entry.summary.ref.id, tasks, busy, error, extensions_changed](bool on) {
+                if (busy.Get()) return;
+                busy = true;
+                error = "";
+                tasks.Launch([imported_skills, runtime, id, busy, error, extensions_changed, on]() -> Task<void> {
+                  auto result = co_await imported_skills->SetEnabled(id, on);
+                  if (result.Succeeded()) result = co_await runtime->RefreshAccessAsync();
+                  if (!result.Succeeded()) error = result.Error().message;
+                  extensions_changed = extensions_changed.Get() + 1;
+                  busy = false;
+                });
+              }).With(Enabled(!busy.Get())), stack_fields, colors).Key(entry.summary.ref.id.value));
+    }
+    if (!rows.empty()) content.push_back(SettingsPanel(std::move(rows), colors).Key("settings-imported-skills"));
+    break;
+  }
+  case SettingsSection::Mcp: {
+    static_cast<void>(extensions_changed.Get());
+    const auto open = [dialog, draft](McpServer server) {
+      ShowPreviewDialog(dialog, DialogFactory{[server = std::move(server), draft](DialogContext context) {
+        return McpServerDialog(std::move(context), server, draft);
+      }});
+    };
+    std::vector<View> rows{SettingsRow(::app::strings::ui_mcp, ::app::strings::ui_mcp_help,
+        ProvideEnvironment(secondary, Button(::app::strings::ui_mcp_add).OnClick([open] {
+          open({.id = kit::NewCommandId().value});
+        }).With(Enabled(mcp && !busy.Get() && draft->mcp_servers.size() < 12))).Key("settings-add-mcp"),
+        stack_fields, colors)};
+    for (const auto& server : draft->mcp_servers) {
+      const auto status = mcp ? mcp->ConnectionStatus(server) : std::nullopt;
+      const auto status_text = !server.enabled ? StringVariant{::app::strings::ui_extension_disabled} :
+          !status ? StringVariant{::app::strings::ui_mcp_pending_restart} :
+          status->error.empty() ? StringVariant::Format(::app::strings::ui_mcp_tools_available, std::to_string(status->tools)) :
+          StringVariant{status->error};
+      const auto change = [draft, id = server.id](std::optional<bool> enabled) {
+        auto value = draft.Get();
+        const auto found = std::ranges::find(value.mcp_servers, id, &McpServer::id);
+        if (found == value.mcp_servers.end()) return;
+        if (enabled) found->enabled = *enabled;
+        else value.mcp_servers.erase(found);
+        draft = std::move(value);
+      };
+      auto buttons = Flow{
+          Checkbox(::app::strings::ui_extension_enabled, server.enabled).OnChanged([change](bool enabled) { change(enabled); }),
+          Button(::app::strings::ui_mcp_edit).OnClick([open, server] { open(server); }),
+          Button(::app::strings::ui_mcp_refresh).OnClick([mcp, id = server.id, tasks, busy, error, extensions_changed] {
+            if (!mcp || busy.Get()) return;
+            busy = true;
+            error = "";
+            tasks.Launch([mcp, id, busy, error, extensions_changed]() -> Task<void> {
+              auto refreshed = co_await mcp->Refresh(id);
+              if (!refreshed.Succeeded()) error = refreshed.Error().message;
+              extensions_changed = extensions_changed.Get() + 1;
+              busy = false;
+            });
+          }).With(Enabled(status.has_value() && server.enabled)),
+          Button(::app::strings::ui_mcp_remove).OnClick([change] { change({}); }),
+      }.With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Center), Enabled(!busy.Get()));
+      rows.push_back(Column{
+          Text(server.name).Style({Font::System(14.0F).WithWeight(FontWeight::Medium), colors.on_surface}),
+          Text(server.url, TextRole::Label).LineLimit(1).Overflow(TextOverflow::Ellipsis),
+          Text(status_text, TextRole::Label).With(Foreground(status && !status->error.empty() ? colors.error : colors.on_surface_variant)),
+          ProvideEnvironment(secondary, std::move(buttons)),
+      }.With(Spacing(4.0F), Padding(EdgeInsets::Symmetric(0.0F, 12.0F)), CrossAlign(CrossAxisAlignment::Stretch)).Key(server.id));
+    }
+    content.push_back(SettingsPanel(std::move(rows), colors).Key("settings-mcp-servers"));
     break;
   }
   case SettingsSection::Storage:

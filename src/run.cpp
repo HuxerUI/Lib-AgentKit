@@ -720,11 +720,12 @@ void QueueModelCalls(RunExecution& run, const Round& round, const std::vector<Mo
 }
 
 Task<std::vector<ModelToolSpec>> DiscoverModelTools(RuntimeState& runtime, const SessionData& session,
-    const RunExecution& run, std::span<const ToolId> filter = {}) {
+    const RunExecution& run, const ModelInput* input = nullptr) {
   std::vector<ModelToolSpec> available;
   for (const auto& registered : runtime.CaptureAgentTools(runtime.agents.at(run.view.agent.id))) {
     const auto& tool = registered.ref;
-    if ((!filter.empty() && std::ranges::find(filter, tool.id) == filter.end()) ||
+    if ((input && !(tool.catalog && input->include_catalog_tools) &&
+          std::ranges::find(input->allowed_tools, tool.id) == input->allowed_tools.end()) ||
         !runtime.AllowsRunTool(run, tool)) continue;
     auto request = runtime.Request(run.principal, Capability::DiscoverTool, &session, &run);
     request.tool = tool;
@@ -782,8 +783,9 @@ Async<ModelReply> RuntimeState::RunHostModel(RunId id, ModelInput input) {
   const auto caps = model.provider->Capabilities();
   std::ranges::sort(input.allowed_tools);
   input.allowed_tools.erase(std::ranges::unique(input.allowed_tools).begin(), input.allowed_tools.end());
-  const bool allow_tools = !input.allowed_tools.empty();
-  const bool ordinary_tools = std::ranges::any_of(input.allowed_tools, [](const ToolId& id) { return !SkillTool(id.value); });
+  const bool allow_tools = input.include_catalog_tools || !input.allowed_tools.empty();
+  const bool ordinary_tools = input.include_catalog_tools ||
+      std::ranges::any_of(input.allowed_tools, [](const ToolId& id) { return !SkillTool(id.value); });
   if (run.host_model_busy) co_return Fail<ModelReply>(ErrorCode::Busy, "A model turn is already open");
   if (run.deadline && Now() >= *run.deadline) co_return Fail<ModelReply>(ErrorCode::DeadlineExceeded, "Run expired");
   if (allow_tools && (!caps.tool_calls || input.output_schema)) {
@@ -800,15 +802,27 @@ Async<ModelReply> RuntimeState::RunHostModel(RunId id, ModelInput input) {
     const auto index = *step.input_index;
     const auto* item = index < run.items.size() ? std::get_if<ModelContent>(&run.items[index]) : nullptr;
     const auto* original = item ? std::get_if<std::string>(&item->body) : nullptr;
-    const bool same_scope = step.allowed_tools.empty() ? !ordinary_tools : step.allowed_tools == input.allowed_tools;
-    if (!allow_tools || !same_scope || !original || item->role != ModelContent::Role::User || *original != input.instruction ||
+    // A recovered step keeps the scope that was persisted before its first tool call.
+    const bool keeps_catalog_scope = !step.include_catalog_tools || input.include_catalog_tools;
+    input.include_catalog_tools = step.include_catalog_tools && input.include_catalog_tools;
+    const auto ordinary = [](const ToolId& id) { return !SkillTool(id.value); };
+    const bool same_scope = std::ranges::equal(step.allowed_tools | std::views::filter(ordinary),
+        input.allowed_tools | std::views::filter(ordinary));
+    if (!allow_tools || !same_scope || !keeps_catalog_scope || !original ||
+        item->role != ModelContent::Role::User || *original != input.instruction ||
         std::ranges::any_of(run.pending_calls, [&](const auto& call) {
-          return call.tool && std::ranges::find(input.allowed_tools, call.tool->id) == input.allowed_tools.end();
+          return call.tool && !(call.tool->catalog && input.include_catalog_tools) &&
+              std::ranges::find(input.allowed_tools, call.tool->id) == input.allowed_tools.end();
         })) {
       co_return Fail<ModelReply>(ErrorCode::Conflict, "Resume the original hosted model step");
     }
+    if (!step.allowed_tools.empty()) {
+      std::erase_if(input.allowed_tools, [&](const ToolId& tool) {
+        return std::ranges::find(step.allowed_tools, tool) == step.allowed_tools.end();
+      });
+    }
   } else if (allow_tools) {
-    run.host_model_step = HostedModelStep{};
+    run.host_model_step = HostedModelStep{.include_catalog_tools = input.include_catalog_tools};
   } else {
     run.host_model_step.reset();
   }
@@ -858,7 +872,7 @@ Async<ModelReply> RuntimeState::RunHostModel(RunId id, ModelInput input) {
     const bool use_continuation = allow_tools && request.items.size() == run.items.size();
     if (!use_continuation) request.continuation.reset();
     if (allow_tools) {
-      request.tools = co_await DiscoverModelTools(*this, session, run, input.allowed_tools);
+      request.tools = co_await DiscoverModelTools(*this, session, run, &input);
       if (run.stop.stop_requested()) co_return Fail<ModelReply>(ErrorCode::AlreadyClosed, "Run closed");
       for (auto& tool : SkillTools(request)) {
         if (std::ranges::find(input.allowed_tools, tool.tool.id) != input.allowed_tools.end())
