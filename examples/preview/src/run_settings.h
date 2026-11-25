@@ -36,6 +36,7 @@ struct ModelChoice {
   huxerui::agentkit::ModelEndpoint connection;
   ModelLimits limits;
   bool editable = false;
+  bool reasoning_summary = false;
 };
 
 struct ModelProfileInput {
@@ -48,6 +49,17 @@ struct ModelProfileInput {
   bool file_input = false;
   bool reasoning_summary = false;
   ModelLimits limits;
+};
+
+struct ModelProfileEdit {
+  std::string base_url;
+  std::optional<std::string> protocol;
+  std::optional<std::string> provider;
+  std::optional<std::string> new_key;
+  ModelLimits limits;
+  bool image_input = false;
+  bool file_input = false;
+  bool reasoning_summary = false;
 };
 
 struct DiscoveredModel {
@@ -66,7 +78,7 @@ bool SupportsImageInput(std::string_view protocol);
 using AddModelProfile = std::function<huxerui::agentkit::Async<huxerui::agentkit::ModelProviderRef>(ModelProfileInput)>;
 
 using EditModelProfile = std::function<huxerui::agentkit::Async<huxerui::agentkit::ModelProviderRef>(
-    huxerui::agentkit::ModelProviderRef, std::string endpoint, std::optional<std::string> new_key, ModelLimits, bool image_input)>;
+    huxerui::agentkit::ModelProviderRef, ModelProfileEdit)>;
 
 void ShowAddModel(const huxerui::DialogHandle& dialog, AddModelProfile add_model,
     std::function<void(huxerui::agentkit::ModelProviderRef)> added);
@@ -76,7 +88,7 @@ void ShowEditModel(const huxerui::DialogHandle& dialog, ModelChoice current, Edi
 class RunSettings {
 public:
   void AddModel(const huxerui::agentkit::ModelRegistration& registration, std::string label = {},
-      ModelLimits limits = {}, bool editable = false);
+      ModelLimits limits = {}, bool editable = false, bool reasoning_summary = false);
   void SetDefaults(huxerui::agentkit::ModelProviderRef general, std::optional<huxerui::agentkit::ModelProviderRef> code);
   std::optional<huxerui::agentkit::ModelProviderRef> DefaultModel(const huxerui::agentkit::AgentId& agent) const;
   std::optional<huxerui::agentkit::ModelProviderRef> CurrentModel(

@@ -5,3 +5,4 @@ Exec=ganwork
 Icon=ganwork
 Categories=Utility;
 Terminal=false
+StartupWMClass=ganwork
