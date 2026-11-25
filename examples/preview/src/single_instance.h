@@ -1,21 +1,46 @@
 #pragma once
 
 #include <functional>
+#include <string>
 
 namespace agentkit_preview::single_instance {
 
-/// Returns true when built as a Debug binary (single-instance enforcement disabled).
+enum class StartStatus {
+  Disabled,
+  Acquired,
+  ActivatedExisting,
+  Failed,
+};
+
+struct StartResult {
+  StartStatus status = StartStatus::Failed;
+  std::string error;
+
+  bool ShouldContinue() const {
+    return status == StartStatus::Disabled || status == StartStatus::Acquired;
+  }
+};
+
+struct Options {
+  std::string instance_id = "ganwork";
+  std::string runtime_dir;
+  bool force_enable = false;
+  int client_read_timeout_ms = 100;
+  int connect_retry_count = 10;
+  int connect_retry_delay_ms = 25;
+};
+
+/// Returns true when built as a Debug binary (single-instance disabled by default).
 bool IsDebugBuild();
 
-/// Returns true when single-instance enforcement is enabled for this build.
+/// Returns true when single-instance enforcement is enabled by default for this build.
 bool IsEnabled();
 
-/// Ensures at most one non-Debug desktop instance is running.
-/// Returns true if this process may continue starting, or false if an
-/// existing instance was signaled to wake its window and this process should exit.
-bool StartOrActivate();
+/// Ensures at most one active desktop instance runs for the given instance_id.
+StartResult StartOrActivate(const Options& options = {});
 
 /// Registers a callback invoked when a secondary instance requests window activation.
+/// If an activation arrived before registration, it is delivered immediately.
 void SetActivationHandler(std::function<void()> handler);
 
 /// Clears the activation callback registered via SetActivationHandler.

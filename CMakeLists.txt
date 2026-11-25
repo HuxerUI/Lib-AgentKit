@@ -220,6 +220,21 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS)
             HuxerUI::AgentKitRuntime HuxerUI::testing nlohmann_json::nlohmann_json)
     agentkit_host_use_sqlite_session_store(huxerui_agentkit_model_tests)
     add_test(NAME huxerui_agentkit_model_tests COMMAND huxerui_agentkit_model_tests)
+
+    if (NOT CMAKE_CROSSCOMPILING AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
+        find_package(Threads REQUIRED)
+        add_executable(huxerui_agentkit_single_instance_tests
+                tests/single_instance_test.cpp
+                examples/preview/src/single_instance.cpp
+        )
+        target_include_directories(huxerui_agentkit_single_instance_tests PRIVATE examples/preview/src)
+        target_compile_definitions(huxerui_agentkit_single_instance_tests PRIVATE
+                $<$<CONFIG:Debug>:AGENTKIT_PREVIEW_DEBUG=1>
+        )
+        target_link_libraries(huxerui_agentkit_single_instance_tests PRIVATE Threads::Threads)
+        add_test(NAME huxerui_agentkit_single_instance_tests COMMAND huxerui_agentkit_single_instance_tests)
+        set_tests_properties(huxerui_agentkit_single_instance_tests PROPERTIES TIMEOUT 30)
+    endif ()
 endif ()
 
 if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HUXERUI_AGENTKIT_BUILD_VIEWS)
