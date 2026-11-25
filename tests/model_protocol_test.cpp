@@ -1656,7 +1656,7 @@ Task<void> GeminiStructuredAndFailures(TaskScope tasks) {
   co_await VerifyCancellation(tasks, server, *model.provider);
 }
 
-kit::ModelAttachment GeminiMedia(kit::ArtifactRef ref, std::string mime, File file, int& opens) {
+kit::ModelAttachment MediaAttachment(kit::ArtifactRef ref, std::string mime, File file, int& opens) {
   return {std::move(ref), std::move(mime),
       [file = std::move(file), &opens]() -> kit::Async<AsyncInputStream> {
         ++opens;
@@ -1664,6 +1664,36 @@ kit::ModelAttachment GeminiMedia(kit::ArtifactRef ref, std::string mime, File fi
         Check(source.Succeeded(), "could not open the attachment fixture");
         co_return kit::AgentResult<AsyncInputStream>::Success(std::move(source).Value());
       }};
+}
+
+Task<void> ChatImageAttachment(TaskScope tasks, const File& file, const kit::ArtifactRef& image) {
+  Script server;
+  server.reply = [](const auto&, const Json& body) {
+    const auto& messages = body.at("messages");
+    const auto& parts = messages.at(1).at("content");
+    Check(messages.size() == 2 && messages.at(1).at("role") == "user" && parts.size() == 2 &&
+        parts.at(0).at("text") == "Hello" && parts.at(1).at("type") == "image_url" &&
+        parts.at(1).at("image_url").at("url") == "data:image/png;base64,AAH+/w==",
+        "Chat Completions kept text and the authorized image together");
+    return Frame(Choice({{"content", "Image accepted"}}, "stop"));
+  };
+  auto options = Options(kit::ChatCompletionsDialect::Compatible);
+  options.image_input = true;
+  const auto model = Take(kit::detail::MakeChatCompletionsModel(options, tasks, server.Open()));
+  Check(model.provider->Capabilities().image_input, "Chat Completions advertises opted-in image support");
+  int opens = 0;
+  auto request = Request();
+  request.items.push_back(kit::ModelContent{kit::ModelContent::Role::User, image});
+  request.attachments.push_back(MediaAttachment(image, "image/png", file, opens));
+  auto stream = Take(co_await model.provider->StartTurnAsync(request));
+  const auto events = co_await Collect(*stream);
+  Check(std::get<kit::ModelTextDelta>(events.front()).utf8 == "Image accepted", "Chat Completions streamed the image answer");
+  ++request.attachments.back().artifact.version;
+  ErrorIs(co_await model.provider->StartTurnAsync(request), kit::ErrorCode::InvalidArgument);
+  options.image_input = false;
+  const auto text_model = Take(kit::detail::MakeChatCompletionsModel(options, tasks, server.Open()));
+  ErrorIs(co_await text_model.provider->StartTurnAsync(request), kit::ErrorCode::Unsupported);
+  Check(opens == 1 && server.requests == 1, "Invalid or disabled images did not open bytes or send a request");
 }
 
 Task<void> GeminiInlineAttachments(TaskScope tasks, bool interactions = false) {
@@ -1715,8 +1745,8 @@ Task<void> GeminiInlineAttachments(TaskScope tasks, bool interactions = false) {
   request.items.push_back(kit::ModelContent{kit::ModelContent::Role::Context, image});
   request.items.push_back(kit::ModelContent{kit::ModelContent::Role::User, document});
   int opens = 0;
-  request.attachments.push_back(GeminiMedia(document, "application/pdf", document_file, opens));
-  request.attachments.push_back(GeminiMedia(image, "image/png", image_file, opens));
+  request.attachments.push_back(MediaAttachment(document, "application/pdf", document_file, opens));
+  request.attachments.push_back(MediaAttachment(image, "image/png", image_file, opens));
   auto opened = Take(co_await model.provider->StartTurnAsync(request));
   const auto events = co_await Collect(*opened);
   Check(opens == 2 && std::get<kit::ModelTextDelta>(events.front()).utf8 == "Media accepted", "Gemini opened each authorized version once");
@@ -1730,6 +1760,7 @@ Task<void> GeminiInlineAttachments(TaskScope tasks, bool interactions = false) {
   request.items.push_back(kit::ModelContent{kit::ModelContent::Role::Context, image});
   ErrorIs(co_await model.provider->StartTurnAsync(std::move(request)), kit::ErrorCode::BudgetExceeded);
   Check(server.requests == 1, "Gemini counted repeated attachment bytes before opening the network");
+  if (!interactions) co_await ChatImageAttachment(tasks, image_file, image);
 }
 
 void NativeHttp(std::string base_url) {

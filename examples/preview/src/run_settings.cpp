@@ -171,6 +171,10 @@ kit::Async<kit::ToolReviewResult> ReviewChartWithModel(const kit::ModelRegistrat
 
 } // namespace
 
+bool SupportsImageInput(std::string_view protocol) {
+  return protocol.empty() || protocol == "chat-completions" || protocol == "generate-content" || protocol == "interactions";
+}
+
 void RunSettings::AddModel(const kit::ModelRegistration& registration, std::string label, ModelLimits limits, bool editable) {
   if (std::ranges::find(models_, registration.ref, &ModelChoice::ref) != models_.end()) return;
   const auto& endpoint = registration.endpoint;
@@ -411,7 +415,8 @@ View AddModelDialog(DialogContext dialog, AddModelProfile add_model, std::functi
     const auto api = model_api_formats.at(format.Get());
     const bool gemini = std::string_view(api.provider) == "gemini";
     return ModelProfileInput{.base_url = url->text, .protocol = api.protocol, .provider = api.provider,
-        .api_key = api_key->text, .image_input = gemini && image_input.Get(), .file_input = gemini && file_input.Get(),
+        .api_key = api_key->text, .image_input = SupportsImageInput(api.protocol) && image_input.Get(),
+        .file_input = gemini && file_input.Get(),
         .reasoning_summary = std::string_view(api.protocol) == "responses" && reasoning_summary.Get()};
   };
   const auto clear_catalog = [catalog, selected, show_catalog, error] {
@@ -597,11 +602,12 @@ View AddModelDialog(DialogContext dialog, AddModelProfile add_model, std::functi
       }).Key("manual-model-limits"));
     }
   }
-  if (std::string_view(api.provider) == "gemini") {
-    content.push_back(Flow {
-      Checkbox(::app::strings::ui_image_input, image_input.Get()).OnChanged([image_input](bool on) { image_input = on; }),
-      Checkbox(::app::strings::ui_pdf_input, file_input.Get()).OnChanged([file_input](bool on) { file_input = on; }),
-    }.With(Spacing(12.0F), Enabled(!busy)));
+  if (SupportsImageInput(api.protocol)) {
+    std::vector<View> media{Checkbox(::app::strings::ui_image_input, image_input.Get())
+        .OnChanged([image_input](bool on) { image_input = on; }).Key("add-model-image-input")};
+    if (std::string_view(api.provider) == "gemini")
+      media.push_back(Checkbox(::app::strings::ui_pdf_input, file_input.Get()).OnChanged([file_input](bool on) { file_input = on; }));
+    content.push_back(Flow(std::move(media)).With(Spacing(12.0F), Enabled(!busy)));
   }
   if (std::string_view(api.protocol) == "responses") {
     content.push_back(Checkbox(::app::strings::ui_request_reasoning_summary, reasoning_summary.Get())
@@ -629,6 +635,7 @@ View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile
   const auto key = UseState(TextEditingValue::FromText({}));
   const auto clear_key = UseState(false);
   const auto limits = UseState(EditLimits(current.limits));
+  const auto image_input = UseState(current.capabilities.image_input);
   const auto saving = UseState(false);
   const auto error = UseState(std::string{});
   const auto tasks = UseApplicationTaskScope();
@@ -637,7 +644,7 @@ View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile
   auto fields = UseEnvironment<TextFieldStyle>();
   fields.show_label = false;
   const auto invalid_limits = UseString(::app::strings::ui_model_token_limit_invalid);
-  const auto save = [dialog, current, edit_model, endpoint, key, clear_key, limits, saving, error, tasks, invalid_limits] {
+  const auto save = [dialog, current, edit_model, endpoint, key, clear_key, limits, image_input, saving, error, tasks, invalid_limits] {
     if (saving.Get() || TrimModelField(endpoint->text).empty()) return;
     ModelLimits updated_limits;
     try { updated_limits = ReadLimits(limits.Get()); }
@@ -649,8 +656,8 @@ View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile
     saving = true;
     error = "";
     tasks.Launch([dialog, edit_model, ref = current.ref, url = endpoint->text, updated_key = std::move(updated_key),
-                  updated_limits, key, saving, error]() mutable -> Task<void> {
-      auto result = co_await edit_model(std::move(ref), std::move(url), std::move(updated_key), updated_limits);
+                  updated_limits, images = image_input.Get(), key, saving, error]() mutable -> Task<void> {
+      auto result = co_await edit_model(std::move(ref), std::move(url), std::move(updated_key), updated_limits, images);
       saving = false;
       if (!result.Succeeded()) { error = result.Error().message; co_return; }
       key = TextEditingValue::FromText({});
@@ -676,6 +683,9 @@ View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile
         limits = std::move(next);
       }),
   };
+  if (SupportsImageInput(current.connection.protocol))
+    content.push_back(Checkbox(::app::strings::ui_image_input, image_input.Get())
+        .OnChanged([image_input](bool on) { image_input = on; }).With(Enabled(ready)).Key("edit-model-image-input"));
   if (!saves_direct_api_keys && !key->text.empty() && !key->text.starts_with("${"))
     content.push_back(Text(::app::strings::ui_direct_keys_are_available_until_preview_closes, TextRole::Label));
   if (!error->empty()) content.push_back(Text(error.Get()).With(Foreground(color.error)).Key("edit-model-error"));

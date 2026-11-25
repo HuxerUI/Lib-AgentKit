@@ -23,7 +23,7 @@ constexpr std::string_view legacy_call_prefix = "agentkit:gemini-legacy:";
 Json ContentPart(const ModelContent& content, const GeminiMediaParts& media) {
   if (const auto* text = std::get_if<std::string>(&content.body)) return {{"text", *text}};
   if (const auto* value = std::get_if<JsonValue>(&content.body)) return {{"text", ToWireJson(*value).dump()}};
-  return media.at(GeminiMediaKey(std::get<ArtifactRef>(content.body)));
+  return media.at(ModelMediaIdentity(std::get<ArtifactRef>(content.body)));
 }
 
 Layouts ReadLayouts(const GeminiGenerateContentOptions& options, const ModelTurnRequest& request) {

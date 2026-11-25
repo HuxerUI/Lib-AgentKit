@@ -10,6 +10,8 @@ inline const huxerui::agentkit::ToolId ReadDesign{"preview.design.read"};
 inline const huxerui::agentkit::ToolId PublishDesign{"preview.design.publish"};
 inline constexpr std::string_view DesignReview = "design.review";
 inline constexpr std::string_view DesignArtifactType = "design/board+json";
+inline constexpr std::string_view DesignBriefPrefix = "Design a polished product screen for this brief:\n";
+inline constexpr std::string_view DesignCorrectionPrefix = "\nCorrect the previous design. Validation failed: ";
 
 struct DesignNode {
   std::string id;

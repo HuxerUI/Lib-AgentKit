@@ -103,34 +103,134 @@ View ReviewDesignImpact(std::shared_ptr<kit::AgentRuntime> runtime, std::shared_
   return ProvideEnvironment(ChatChrome{std::move(chrome)}, PreviewChat(target->owner, std::move(options)));
 }
 
+struct ArtboardSize { using Value = Size; };
+struct ArtboardNodeBounds { using Value = Rect; };
+
+Rect DesignBounds(const DesignNode& node) {
+  return {static_cast<float>(node.x), static_cast<float>(node.y), static_cast<float>(node.width), static_cast<float>(node.height)};
+}
+
+class ArtboardLayout final : public Layout<ArtboardLayout> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext& context, ViewNode& node, Constraints constraints) {
+    const auto natural = *node.LayoutValue<ArtboardSize>();
+    const float scale = std::min({1.0F, constraints.max_width / natural.width, constraints.max_height / natural.height});
+    const Size board{natural.width * scale, natural.height * scale};
+    const auto size = constraints.Constrain(board);
+    const Point origin{(size.width - board.width) / 2, (size.height - board.height) / 2};
+    auto result = LayoutResult{}.SetSize(size);
+    for (std::size_t i = 0; i < node.ChildCount(); ++i) {
+      auto& child = node.ChildAt(i);
+      const auto bounds = child.LayoutValueOr<ArtboardNodeBounds>({0, 0, natural.width, natural.height});
+      const auto width = bounds.width * scale;
+      const auto height = bounds.height * scale;
+      context.Measure(child, {.min_width = width, .max_width = width, .min_height = height, .max_height = height});
+      result.Place(child, {origin.x + bounds.x * scale, origin.y + bounds.y * scale});
+    }
+    return result;
+  }
+};
+
+std::vector<const DesignNode*> DesignPaintOrder(const DesignBoard& board) {
+  std::vector<const DesignNode*> ordered;
+  for (const auto& node : board.nodes) ordered.push_back(&node);
+  std::ranges::stable_sort(ordered, std::greater{}, [](const auto* node) {
+    return node->kind == "card" ? node->width * node->height : 0;
+  });
+  return ordered;
+}
+
+void PaintDesignNode(PaintContext& paint, const DesignNode& node, Rect bounds, float scale, const DesignNode* main_action) {
+  const auto ink = Color::Rgb(23, 34, 53);
+  const auto muted = Color::Rgb(77, 92, 112);
+  const auto accent = Color::Rgb(39, 76, 171);
+  const auto edge = Color::Rgb(207, 216, 230);
+  const auto white = Color::White();
+  const auto corners = CornerRadii{8.0F * scale};
+  if (node.kind == "card") {
+    const auto radius = CornerRadii{14.0F * scale};
+    paint.DrawShadow(bounds, Color::Rgb(38, 54, 86, 0.12F), {0, 6.0F * scale}, 18.0F * scale, 0, radius);
+    paint.DrawRect(bounds, white, radius);
+    paint.DrawBorder(bounds, edge, {.width = scale}, radius);
+    return;
+  }
+  const bool primary = &node == main_action;
+  const bool link = node.kind == "link" || (node.kind == "button" && !primary && main_action &&
+      node.height * 5 < main_action->height * 4);
+  const bool secondary = node.kind == "secondary_button" || (node.kind == "button" && !primary && !link);
+  const bool field = node.kind == "field";
+  const bool heading = node.kind == "heading";
+  const bool caption = node.kind == "caption";
+  const bool toggle = node.kind == "toggle";
+  const bool checkbox = node.kind == "checkbox";
+  const bool boxed = primary || secondary || field;
+  if (boxed) {
+    paint.DrawRect(bounds, primary ? accent : field ? Color::Rgb(250, 252, 255) : white, corners);
+    if (!primary) paint.DrawBorder(bounds, edge, {.width = scale}, corners);
+  }
+  float inset = boxed ? std::min(bounds.width * 0.12F, 14.0F * scale) : 0.0F;
+  if (toggle || checkbox) {
+    const auto size = std::min(bounds.height * 0.65F, 18.0F * scale);
+    const Rect indicator{bounds.x, bounds.y + (bounds.height - size) / 2, size * (toggle ? 1.8F : 1.0F), size};
+    const auto radius = CornerRadii{toggle ? size / 2 : size * 0.22F};
+    paint.DrawRect(indicator, toggle ? Color::Rgb(225, 231, 240) : white, radius);
+    paint.DrawBorder(indicator, edge, {.width = scale}, radius);
+    if (toggle) paint.DrawCircle({indicator.x + size / 2, indicator.y + size / 2}, size * 0.35F, white);
+    inset = indicator.width + 9.0F * scale;
+  }
+  const Rect text{bounds.x + inset, bounds.y, bounds.width - inset * (boxed ? 2.0F : 1.0F), bounds.height};
+  if (text.IsEmpty()) return;
+  const auto nominal = (heading ? 32.0F : caption ? 13.0F : 15.0F) * scale;
+  const auto font = Font::System(std::min(nominal, text.height / 1.36F)).WithWeight(
+      heading ? FontWeight::Bold : caption || primary || secondary || link ? FontWeight::SemiBold : FontWeight::Regular);
+  paint.PushClip(bounds);
+  paint.DrawText(text, node.label, {font, primary ? white : link || secondary ? accent : heading ? ink : muted},
+      {.align = primary || secondary ? TextAlign::Center : TextAlign::Leading, .vertical_align = TextVerticalAlign::Center});
+  paint.PopClip();
+}
+
+View RenderArtboard(std::shared_ptr<const DesignBoard> board, std::string highlighted, float height,
+    std::function<void(std::string)> select) {
+  const Size natural{static_cast<float>(board->width), static_cast<float>(board->height)};
+  const auto order = DesignPaintOrder(*board);
+  std::vector<View> layers{Canvas([board, order, natural, highlighted = std::move(highlighted)](PaintContext& paint, Size size) {
+    const float scale = size.width / natural.width;
+    if (scale <= 0.0F) return;
+    const Rect surface{0, 0, size.width, size.height};
+    paint.DrawRect(surface, Color::Rgb(240, 244, 251), CornerRadii{10.0F});
+    paint.PushClip(surface, CornerRadii{10.0F});
+    const DesignNode* main_action = nullptr;
+    for (const auto& node : board->nodes) {
+      if (node.kind == "button" && (!main_action || node.width * node.height > main_action->width * main_action->height))
+        main_action = &node;
+    }
+    std::optional<Rect> selected;
+    for (const auto* node : order) {
+      const auto area = DesignBounds(*node);
+      const Rect bounds{area.x * scale, area.y * scale, area.width * scale, area.height * scale};
+      PaintDesignNode(paint, *node, bounds, scale, main_action);
+      if (node->id == highlighted) selected = bounds;
+    }
+    if (selected) paint.DrawBorder(*selected, Color::Rgb(91, 122, 207), {.width = 1.5F}, CornerRadii{5.0F});
+    paint.PopClip();
+  }).Key("design-artboard-paint")};
+  if (select) {
+    for (const auto* node : order) {
+      layers.push_back(Column{}.OnClick([select, id = node->id] { select(id); })
+          .With(PointerCursor(PointerCursorKind::Hand), Semantics{.hidden = true})
+          .LayoutValue<ArtboardNodeBounds>(DesignBounds(*node)).Key("design-hit/" + node->id));
+    }
+  }
+  return ArtboardLayout(std::move(layers)).LayoutValue<ArtboardSize>(natural)
+      .With(Frame{.max_height = height}, Semantics{.label = ::app::strings::ui_design_artboard});
+}
+
 } // namespace
 
 View DesignArtboard(std::shared_ptr<const DesignBoard> board, std::string highlighted, float height) {
-  return Canvas([board = std::move(board), highlighted = std::move(highlighted)](PaintContext& paint, Size size) {
-    const float scale = std::min(size.width / board->width, size.height / board->height);
-    if (scale <= 0.0F) return;
-    const auto left = (size.width - board->width * scale) / 2.0F;
-    const auto top = (size.height - board->height * scale) / 2.0F;
-    paint.DrawRect({left, top, board->width * scale, board->height * scale}, Color::Rgb(248, 247, 244), CornerRadii{8.0F});
-    for (const auto& node : board->nodes) {
-      const Rect bounds{left + node.x * scale, top + node.y * scale, node.width * scale, node.height * scale};
-      const bool selected = node.id == highlighted;
-      const bool primary = node.kind == "button";
-      const bool plain = node.kind == "heading" || node.kind == "body";
-      if (!plain || selected) {
-        const auto fill = selected ? Color::Rgb(225, 235, 243) : primary ? Color::Rgb(41, 75, 92) :
-            node.kind == "card" ? Color::White() : Color::Rgb(237, 239, 236);
-        paint.DrawRect(bounds, fill, CornerRadii{7.0F * scale});
-      }
-      const auto margin = (plain ? 0.0F : 12.0F) * scale;
-      const auto offset = std::min(bounds.height * 0.18F, 12.0F * scale);
-      const auto font_size = (node.kind == "heading" ? 29.0F : node.kind == "card" ? 17.0F : 15.0F) * scale;
-      if (bounds.width <= 2.0F * margin || bounds.height <= offset) continue;
-      paint.DrawText({bounds.x + margin, bounds.y + offset, bounds.width - margin * 2.0F, bounds.height - offset},
-          node.label, {.font = Font::System(font_size),
-              .foreground = primary && !selected ? Color::White() : Color::Rgb(29, 37, 41)});
-    }
-  }).With(Frame{.height = height}, Semantics{.label = ::app::strings::ui_design_artboard});
+  return RenderArtboard(std::move(board), std::move(highlighted), height, {});
 }
 
 std::optional<View> RenderDesignArtifact(const kit::ArtifactPreview& preview) {
@@ -164,6 +264,26 @@ View DesignImpactButton(StringVariant label, std::function<void(ViewHandle)> ope
   const auto origin = UseViewHandle();
   return Button(std::move(label)).With(origin).OnClick([open, origin] { open(origin); });
 }
+
+class DesignReviewColumns final : public Layout<DesignReviewColumns> {
+public:
+  using Layout::Layout;
+
+  static LayoutResult Measure(LayoutContext& context, ViewNode& node, Constraints constraints) {
+    auto& artboard = node.ChildAt(0);
+    auto& layers = node.ChildAt(1);
+    const auto width = std::min(constraints.max_width, 1160.0F);
+    const bool split = width >= 680.0F;
+    constexpr float gap = 16.0F;
+    constexpr float layers_width = 222.0F;
+    const float board_width = split ? width - layers_width - gap : width;
+    const auto board_size = context.Measure(artboard, constraints.Loose().TightWidth(board_width));
+    const auto layers_size = context.Measure(layers, constraints.Loose().TightWidth(split ? layers_width : width));
+    const auto height = split ? std::max(board_size.height, layers_size.height) : board_size.height + gap + layers_size.height;
+    return LayoutResult{}.SetSize(constraints.Constrain({width, height})).Place(artboard, {})
+        .Place(layers, split ? Point{board_width + gap, 0} : Point{0, board_size.height + gap});
+  }
+};
 
 [[huxerui::composable]]
 View DesignDetails(const ReviewedDesign& design, const std::vector<kit::ArtifactRef>& versions, std::string selected,
@@ -204,11 +324,13 @@ View DesignDetails(const ReviewedDesign& design, const std::vector<kit::Artifact
       revisions.push_back(Button(::app::strings::ui_newer_design).OnClick([open, after = *std::next(current)] { open(after); }));
     }
     if (restore) revisions.push_back(Button(::app::strings::ui_restore_previous_version).OnClick(std::move(restore)).With(Enabled(!busy)));
-    navigation.push_back(Text(StringVariant::Format(::app::strings::ui_version_0, design.artifact->version), TextRole::Label));
+    navigation.push_back(Text(StringVariant::Format(::app::strings::ui_version_0, design.artifact->version), TextRole::Label)
+        .Style({Font::System(12.0F), colors.on_surface_variant}));
   } else if (pending) {
     decisions.push_back(ProvideEnvironment(quiet, Button(::app::strings::ui_dismiss_draft)
         .OnClick([decide] { decide(false); }).With(Enabled(!busy))));
-    decisions.push_back(Button(::app::strings::ui_approve_design).OnClick([decide] { decide(true); }).With(Enabled(!busy)));
+    decisions.push_back(ProvideEnvironment(PreviewPrimaryButton(UseEnvironment<ButtonStyle>(), colors),
+        Button(::app::strings::ui_approve_design).OnClick([decide] { decide(true); }).With(Enabled(!busy))));
   } else {
     navigation.push_back(Text(::app::strings::ui_review_closed, TextRole::Label));
   }
@@ -216,27 +338,51 @@ View DesignDetails(const ReviewedDesign& design, const std::vector<kit::Artifact
   std::vector<View> details;
   if (detached) details.push_back(Text(board.title, TextRole::Title)
       .Style({Font::System(27.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}));
-  details.push_back(Text(board.brief));
-  details.push_back(DesignArtboard(design.board, selected, 318.0F).With(Padding(10.0F), CornerRadius(8.0F),
-      Border{colors.outline}, Background(colors.surface_container_high)).Key("design-review-artboard"));
+  details.push_back(Text(board.brief).Style({Font::System(13.0F), colors.on_surface_variant}));
   std::vector<View> nodes;
   for (const auto& node : board.nodes) {
-    auto item_style = quiet;
-    if (node.id == selected) {
-      item_style.background = colors.primary_container;
-      item_style.label_style.foreground = colors.on_primary_container;
-    }
-    nodes.push_back(ProvideEnvironment(item_style,
-        Button(node.label).OnClick([select, id = node.id] { select(id); })
-            .With(Semantics{.selected = node.id == selected}).Key(node.id)).Key("design-node/" + node.id));
+    const bool active = node.id == selected;
+    const auto activate = [select, id = node.id] { select(id); };
+    nodes.push_back(Row{
+        Image(node.kind == "card" ? ::app::images::layers : ::app::images::design).Tint(colors.on_surface_variant)
+            .With(Frame{.width = 13.0F, .height = 13.0F}),
+        Text(node.label).Style({Font::System(12.0F).WithWeight(active ? FontWeight::SemiBold : FontWeight::Regular),
+            active ? colors.on_primary_container : colors.on_surface})
+            .LineLimit(1).Overflow(TextOverflow::Ellipsis).With(Grow()),
+    }.OnClick(activate).On<ViewEvents::KeyDown>([activate](const KeyEvent& event) {
+      if (event.key != Key::Enter && event.key != Key::Space) return false;
+      if (!event.repeat) activate();
+      return true;
+    }).With(Frame{.min_height = 30.0F}, Padding(EdgeInsets::Symmetric(8.0F, 3.0F)), Spacing(7.0F),
+        CrossAlign(CrossAxisAlignment::Center), CornerRadius(6.0F), Focusable{}, PointerCursor(PointerCursorKind::Hand),
+        PreviewRowIndication(theme, 6.0F), Background(active ? colors.primary_container : Color::Transparent()),
+        Tooltip(node.label), Semantics{.role = SemanticRole::Button, .label = node.label, .selected = active})
+        .Key("design-node/" + node.id));
   }
-  details.push_back(ScrollView(Row(std::move(nodes)).With(Spacing(6.0F))).ScrollAxis(Axis::Horizontal));
+  std::vector<View> inspector{
+      Text(::app::strings::ui_design_layers, TextRole::Label)
+          .Style({Font::System(12.0F).WithWeight(FontWeight::SemiBold), colors.on_surface_variant})
+          .With(Padding(EdgeInsets::Symmetric(8.0F, 0.0F))),
+      ScrollView(Column(std::move(nodes)).With(CrossAlign(CrossAxisAlignment::Stretch)))
+          .With(Frame{.max_height = 210.0F}, ScrollBar()).Key("design-layers-list"),
+  };
   const auto node = std::ranges::find(board.nodes, selected, &DesignNode::id);
   if (node != board.nodes.end()) {
-    details.push_back(Text(node->note.empty() ? node->kind : node->note).Key("design-selection/" + node->id));
+    inspector.push_back(Divider());
+    inspector.push_back(Column{
+        Text(node->label).Style({Font::System(13.0F).WithWeight(FontWeight::SemiBold), colors.on_surface}),
+        Text(node->note).Style({Font::System(12.0F), colors.on_surface_variant}),
+    }.With(Spacing(5.0F), CrossAlign(CrossAxisAlignment::Stretch), Padding(EdgeInsets::Symmetric(8.0F, 0.0F)))
+        .Key("design-selection/" + node->id));
   }
-  if (source_actions) details.push_back(ProvideEnvironment(quiet, std::move(*source_actions)));
-  if (inspect) revisions.push_back(Button(::app::strings::ui_inspect_impact).OnClick(std::move(inspect)));
+  if (source_actions) inspector.push_back(ProvideEnvironment(quiet, std::move(*source_actions)));
+  if (inspect) inspector.push_back(ProvideEnvironment(quiet, Button(::app::strings::ui_inspect_impact).OnClick(std::move(inspect))));
+  details.push_back(DesignReviewColumns{
+      RenderArtboard(design.board, selected, 420.0F, select).With(Padding(14.0F), CornerRadius(10.0F),
+          Border{colors.outline}, Background(colors.surface_container_low)).Key("design-review-artboard"),
+      Column(std::move(inspector)).With(Spacing(8.0F), Padding(10.0F), CrossAlign(CrossAxisAlignment::Stretch),
+          CornerRadius(10.0F), Border{colors.outline}, Background(colors.surface_container)).Key("design-inspector"),
+  });
   if (!revisions.empty()) details.push_back(ProvideEnvironment(quiet, Flow(std::move(revisions)).With(Spacing(7.0F))));
   details.insert(details.end(), impact.begin(), impact.end());
   std::vector<View> page{
@@ -250,9 +396,9 @@ View DesignDetails(const ReviewedDesign& design, const std::vector<kit::Artifact
     auto actions = Row(std::move(decisions)).With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center));
     page.push_back(Row{Spacer(), std::move(actions)});
   }
-  return Row{Spacer(), Column(std::move(page)).With(Frame{.width = 804.0F}, Spacing(12.0F),
-      CrossAlign(CrossAxisAlignment::Stretch)).Key("design-review-content"), Spacer()}
-      .With(Grow(), Padding(18.0F), CrossAlign(CrossAxisAlignment::Stretch));
+  return Row{Column(std::move(page)).With(Frame{.max_width = 1160.0F}, Grow(), Spacing(12.0F),
+      CrossAlign(CrossAxisAlignment::Stretch)).Key("design-review-content")}
+      .With(Grow(), Padding(18.0F), MainAlign(MainAxisAlignment::Center), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
 } // namespace

@@ -46,7 +46,8 @@ std::string_view UnwrapJsonFence(std::string_view text) {
 }
 
 Json ChatMessages(const ChatCompletionsOptions& options, const ModelTurnRequest& request,
-                  const ToolNames& names, const Json& private_fields, const Json& functions) {
+                  const ToolNames& names, const Json& private_fields, const Json& functions,
+                  const std::map<ModelMediaKey, InlineModelMedia>& media) {
   Json messages = Json::array();
   auto instructions = ModelInstructions(request);
   if (request.output_schema && options.output_format == ChatOutputFormat::JsonObject) {
@@ -84,6 +85,22 @@ Json ChatMessages(const ChatCompletionsOptions& options, const ModelTurnRequest&
     const auto* content = std::get_if<ModelContent>(&item);
     if (content && content->role != ModelContent::Role::Assistant) {
       if (content->role == ModelContent::Role::Tool) throw std::invalid_argument("Tool content needs a call ID");
+      if (const auto* artifact = std::get_if<ArtifactRef>(&content->body)) {
+        const auto& image = media.at(ModelMediaIdentity(*artifact));
+        Json part{{"type", "image_url"}, {"image_url", {{"url", "data:" + image.mime + ";base64," + image.base64}}}};
+        if (i != 0 && std::holds_alternative<ModelContent>(request.items[i - 1]) && messages.back()["role"] == "user") {
+          auto& parts = messages.back()["content"];
+          if (parts.is_string()) {
+            auto text = std::move(parts);
+            parts = Json::array({Json{{"type", "text"}, {"text", std::move(text)}}});
+          }
+          parts.push_back(std::move(part));
+        } else {
+          messages.push_back({{"role", "user"}, {"content", Json::array({std::move(part)})}});
+        }
+        ++i;
+        continue;
+      }
       auto text = std::visit([](const auto& value) -> std::string {
         using T = std::decay_t<decltype(value)>;
         if constexpr (std::is_same_v<T, std::string>) return value;
@@ -144,14 +161,14 @@ Json ChatMessages(const ChatCompletionsOptions& options, const ModelTurnRequest&
 }
 
 Json ChatBody(const ChatCompletionsOptions& options, const ModelTurnRequest& request,
-               const ToolNames& names, const Json& private_fields) {
+               const ToolNames& names, const Json& private_fields, const std::map<ModelMediaKey, InlineModelMedia>& media) {
   auto functions = Json::array();
   for (const auto& tool : request.tools) {
     functions.push_back({{"name", names.Alias(tool.name)}, {"description", tool.description},
         {"parameters", ToWireJson(tool.parameters.document)}});
   }
   Json body{{"model", options.model}, {"stream", true},
-      {"messages", ChatMessages(options, request, names, private_fields, functions)}};
+      {"messages", ChatMessages(options, request, names, private_fields, functions, media)}};
   if (options.dialect == ChatCompletionsDialect::OpenAI) body["store"] = request.allow_server_state;
   if (options.thinking && (options.dialect == ChatCompletionsDialect::DeepSeek ||
                            options.dialect == ChatCompletionsDialect::GlmCompatible)) {
@@ -422,7 +439,8 @@ public:
 
   ModelCapabilities Capabilities() const override {
     return {.text_stream = true, .tool_calls = options_.tool_calls,
-            .structured_output = options_.output_format != ChatOutputFormat::Text, .usage = options_.request_usage,
+            .structured_output = options_.output_format != ChatOutputFormat::Text, .image_input = options_.image_input,
+            .usage = options_.request_usage,
             .multi_tool_calls = options_.tool_calls && options_.multi_tool_calls && !options_.tools_via_json};
   }
 
@@ -432,7 +450,7 @@ public:
     if (request.provider != options_.ref) {
       co_return Fail<std::unique_ptr<ModelTurnStream>>(ErrorCode::Conflict, "Model registration changed");
     }
-    if (!request.attachments.empty() || (!options_.tool_calls && !request.tools.empty()) ||
+    if ((!options_.image_input && !request.attachments.empty()) || (!options_.tool_calls && !request.tools.empty()) ||
         (request.output_schema && (options_.output_format == ChatOutputFormat::Text ||
             (options_.tools_via_json && !request.tools.empty())))) {
       co_return Fail<std::unique_ptr<ModelTurnStream>>(ErrorCode::Unsupported, "Requested model capability is unavailable");
@@ -440,12 +458,20 @@ public:
 
     auto post = MakeModelPost(url_, options_.timeout, request.deadline);
     if (!post.Succeeded()) co_return Opened::Failure(post.Error());
+    std::map<ModelMediaKey, InlineModelMedia> media;
+    if (options_.image_input) {
+      auto loaded = co_await ReadInlineModelMedia(request, 12U << 20, [](std::string_view mime) {
+        return mime == "image/png" || mime == "image/jpeg" || mime == "image/webp";
+      });
+      if (!loaded.Succeeded()) co_return Opened::Failure(loaded.Error());
+      media = std::move(loaded).Value();
+    }
     auto call = std::move(post).Value();
     std::unique_ptr<SseModelProtocol> protocol;
     try {
       ToolNames aliases(request);
       auto fields = ResumeFields(options_, request);
-      call.body = ByteString(ChatBody(options_, request, aliases, fields).dump());
+      call.body = ByteString(ChatBody(options_, request, aliases, fields, media).dump());
       protocol = std::make_unique<ChatProtocol>(options_, request, std::move(aliases), std::move(fields));
     } catch (const std::exception&) {
       co_return Fail<std::unique_ptr<ModelTurnStream>>(ErrorCode::InvalidArgument, "Invalid Chat Completions input or continuation");

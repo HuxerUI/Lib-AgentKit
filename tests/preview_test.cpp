@@ -681,8 +681,12 @@ void StageDesign(const Application& application, const std::filesystem::path& st
   auto review = preview.Find(ButtonText("Review design"));
   Wait(preview, [&] { return review.Exists() && review.One().in_viewport; }, "design draft was not offered for review", 25s);
   review.Tap();
-  auto theme = preview.Find(ButtonText("Theme   \xc2\xb7   Use system setting"));
+  auto theme = preview.Find(UiSelector::Key("design-node/theme"));
   Wait(preview, [&] { return theme.Exists() && theme.One().in_viewport; }, "design nodes were not available for review");
+  const auto title = preview.Find(UiSelector::Key("design-hit/heading")).One().bounds;
+  const auto field = preview.Find(UiSelector::Key("design-hit/theme")).One().bounds;
+  if (title.y + title.height > field.y)
+    throw std::runtime_error("The generated design was offered for review before its overlap was corrected");
   theme.Tap();
   Wait(preview, [&] {
     return preview.Find(UiSelector::Text("Default to the system setting and expose available choices.")).Exists();
@@ -787,13 +791,13 @@ void ApproveAndReviseDesign(const Application& application, const std::filesyste
     ++documents;
   }
   if (documents != 2) throw std::runtime_error("Design approvals did not publish exactly two versioned documents");
-  TapFormButton(preview, "Increase contrast");
+  TapControl(preview, UiSelector::Key("design-node/contrast"), "The contrast layer was unavailable", "design-layers-list");
   const std::string node = "Increase contrast\nThe preference can be changed without leaving this screen.";
   AskAboutSelection(preview, node);
   CheckReturnedConclusion(preview, node);
   TapReviewCard(preview, "Review artifact v2");
   Wait(preview, [&] { return visible("Version 2"); }, "Reopening the design review lost its latest version");
-  TapFormButton(preview, "Save changes");
+  TapControl(preview, UiSelector::Key("design-node/save"), "The save layer was unavailable", "design-layers-list");
   TapFormButton(preview, "Older design");
   Wait(preview, [&] { return visible("Version 1") && visible("The preference can be changed without leaving this screen."); },
       "Reopening the original design lost its selected node");
@@ -3352,8 +3356,31 @@ void VerifyLongConversation(const File& root) {
   }
 }
 
+void VerifyDesignArtboard() {
+  using namespace agentkit_preview;
+  auto document = DecodeJson(nlohmann::json::parse(R"({
+    "title":"Sign in","brief":"Account access","width":640,"height":400,"nodes":[
+      {"id":"title","kind":"heading","label":"Welcome back","note":"","x":184,"y":70,"width":272,"height":28},
+      {"id":"email","kind":"field","label":"Email address","note":"","x":184,"y":124,"width":272,"height":44},
+      {"id":"remember","kind":"checkbox","label":"Keep me signed in","note":"","x":184,"y":188,"width":154,"height":28},
+      {"id":"reset","kind":"link","label":"Reset password","note":"","x":344,"y":188,"width":112,"height":28},
+      {"id":"submit","kind":"button","label":"Sign in","note":"","x":184,"y":232,"width":272,"height":44},
+      {"id":"alternative","kind":"secondary_button","label":"Use another method","note":"","x":184,"y":292,"width":272,"height":40},
+      {"id":"form","kind":"card","label":"Internal form container","note":"","x":160,"y":40,"width":320,"height":320}
+    ]})"));
+  auto board = std::make_shared<DesignBoard>(LiveTake(ParseDesign(document)));
+  const Application application{[]() -> View { return DesignArtboard(UseService<DesignBoard>(), {}); },
+      {.application_hooks = {[board](ApplicationContext& context) { context.Provide(board); }}}};
+  UiTest ui(application, {.viewport = {640.0F, 400.0F}, .resource_provider = std::make_shared<PreviewTestResources>()});
+  const auto snapshot = ui.CaptureSnapshot().ToString();
+  if (snapshot.find("Internal form container") != std::string::npos || snapshot.find("Welcome back") == std::string::npos ||
+      snapshot.find("Reset password") == std::string::npos || snapshot.find("Keep me signed in") == std::string::npos)
+    throw std::runtime_error("The artboard did not distinguish layer names from on-screen content");
+}
+
 void VerifyDomainReviewWindows(const File& root) {
   using namespace agentkit_preview;
+  VerifyDesignArtboard();
   const auto workspace = root.Child("workspace");
   if (!workspace.CreateDirectories()) throw std::runtime_error("Could not create the domain review workspace");
   struct DomainReview {
@@ -3437,9 +3464,18 @@ void VerifyDomainReviewWindows(const File& root) {
     const auto& alternative = fixture->nodes.front();
     Wait(ui, [&] { return first.Find(selection(initial)).Exists() && second.Find(selection(initial)).Exists(); },
         "The two design reviews did not open at the chosen node");
-    first.Find(ButtonText(alternative.label.c_str())).Tap();
+    const auto stage = first.Find(UiSelector::Key("design-review-artboard"));
+    const auto inspector = first.Find(UiSelector::Key("design-inspector"));
+    if (stage.One().bounds.x + stage.One().bounds.width > inspector.One().bounds.x + 1.0F)
+      throw std::runtime_error("The wide review did not place the inspector beside the artboard");
+    first.Find(UiSelector::Key("design-hit/" + alternative.id)).Tap({.device_kind = PointerDeviceKind::Mouse});
     Wait(ui, [&] { return first.Find(selection(alternative)).Exists() && second.Find(selection(initial)).Exists(); },
         "Changing a design node affected another review");
+    ui.SetWindowMetrics({.viewport = {1080.0F, 920.0F}});
+    Wait(ui, [&] { return stage.One().bounds.y + stage.One().bounds.height <= inspector.One().bounds.y + 1.0F; },
+        "The narrow review did not place the inspector below the artboard");
+    first.Find(UiSelector::Key("design-node/" + initial.id)).Tap();
+    Wait(ui, [&] { return first.Find(selection(initial)).Exists(); }, "The inspector could not select a layer");
     first.Find(ButtonText("Approve design")).Tap();
     Wait(ui, [&] {
       const auto view = fixture->design->Snapshot();
@@ -4637,9 +4673,7 @@ void ReviewReleasedDesignImpact(UiTest& preview, const File& edited) {
   auto latest = preview.Find(ReviewCard("Review artifact v1"));
   Wait(preview, [&] { return latest.Exists(); }, "The approved design version could not be reopened");
   latest.Tap();
-  auto save = preview.Find(ButtonText("Save changes"));
-  Wait(preview, [&] { return save.Exists() && save.One().in_viewport; }, "The released Save changes node was not available");
-  save.Tap();
+  TapControl(preview, UiSelector::Key("design-node/save"), "The released save layer was unavailable", "design-layers-list");
   auto inspect = preview.Find(ButtonText("Inspect impact"));
   Wait(preview, [&] { return inspect.Exists() && inspect.One().in_viewport; }, "The published design did not offer an impact query");
   inspect.Tap();
@@ -4679,12 +4713,8 @@ void ReviewReleasedDesignImpact(UiTest& preview, const File& edited) {
   Wait(preview, [&] { return ShowsText(preview, "5 / 5") && ShowsText(preview, "Workspace tests passed"); },
       "The design impact did not open the published verification slide");
   TapFormButton(preview, "Close review");
-  auto scroll = preview.Find(UiSelector::Key("design-review-scroll"));
-  if (!preview.Find(ButtonText("Enabled")).One().in_viewport)
-    static_cast<void>(scroll.ScrollUntil(ButtonText("Enabled"), {.step = {0.0F, -130.0F}}));
-  auto mode = preview.Find(ButtonText("Enabled"));
-  Wait(preview, [&] { return mode.Exists() && mode.One().in_viewport; }, "The released mode node was not available");
-  mode.Tap();
+  TapControl(preview, UiSelector::Key("design-node/mode"), "The released mode layer was not available",
+      "design-review-scroll", -130.0F);
   inspect.Tap();
   Wait(preview, [&] { return config_part.Exists() && settings_part.Exists(); }, "The mode node did not locate both of its changed files");
 }
@@ -9380,6 +9410,13 @@ void VerifyModelEditing(const File& root, const std::string& server) {
     Wait(ui, [&] { return button.Count() == 1 && button.One().in_viewport; }, "The model list did not show one editable profile");
     button.Tap();
   };
+  const auto select_role = [](UiTest& ui, const char* key) {
+    const auto picker = ui.Find(UiSelector::Key(key));
+    Wait(ui, [&] { return picker.Exists() && picker.One().in_viewport; }, key);
+    picker.Tap();
+    ui.PressKey(Key::End);
+    ui.PressKey(Key::Enter);
+  };
   const auto read_profiles = [&] {
     const auto profiles = root.Child("models").ListChildren();
     if (!profiles.Succeeded()) throw std::runtime_error("Could not read the model revision fixture");
@@ -9435,7 +9472,7 @@ void VerifyModelEditing(const File& root, const std::string& server) {
             co_await Delay(10ms);
           }
           if (!root.Child("original-started").Exists()) throw std::runtime_error("The first Run did not open the original connection");
-          const auto revision = LiveTake(co_await save(first, updated, "revision-fixture-key-updated", {65536, 49152, 8192}));
+          const auto revision = LiveTake(co_await save(first, updated, "revision-fixture-key-updated", {65536, 49152, 8192}, false));
           if (revision != kit::ModelProviderRef{first.id, 2} || !session->Snapshot()->summary.active_run)
             throw std::runtime_error("Editing did not retain the active Run and stable model identity");
           WriteFixture(root.Child("release-original"), "ready");
@@ -9476,11 +9513,24 @@ void VerifyModelEditing(const File& root, const std::string& server) {
     if (ui.Find(UiSelector::Key("edit-model-url")).One().value != updated ||
         ui.Find(UiSelector::Key("model-limit-0")).One().value != "65536")
       throw std::runtime_error("The endpoint or context size was not restored after restart");
+    Wait(ui, [&] { return ui.Find(UiSelector::Key("edit-model-image-input")).Exists(); }, "Image capability is missing from model editing");
+    ui.Find(UiSelector::Key("edit-model-image-input")).Tap();
     field(ui, "model-limit-0", "98304");
     ui.Find(UiSelector::Key("update-model")).Tap();
-    Wait(ui, [&] { return !ui.Find(UiSelector::Key("edit-model-dialog")).Exists(); }, "The context-only edit did not save");
-    if (read_profiles().at(3).at("context_window") != 98304)
-      throw std::runtime_error("Editing only the context size did not create the new revision");
+    Wait(ui, [&] { return !ui.Find(UiSelector::Key("edit-model-dialog")).Exists(); }, "The capability and context edit did not save");
+    const auto profile = read_profiles().at(3);
+    if (profile.at("context_window") != 98304 || profile.at("image_input") != true)
+      throw std::runtime_error("Editing the context and image support did not create the new revision");
+    select_role(ui, "settings-image-model");
+    select_role(ui, "settings-image-generation-model");
+    ui.Find(UiSelector::Key("settings-save")).Tap();
+    const auto file = root.Child("settings.json");
+    Wait(ui, [&] { return file.Exists(); }, "Image model roles were not saved");
+    const auto settings = nlohmann::json::parse(file.ReadString().Value());
+    const auto expected = nlohmann::json{{"id", first.id.value}, {"version", 3}};
+    if (settings.at("image_model") != expected || settings.at("image_generation_model") != expected ||
+        settings.contains("image_endpoint"))
+      throw std::runtime_error("Image roles did not persist the selected model revision");
   }
   run_native(false);
 }

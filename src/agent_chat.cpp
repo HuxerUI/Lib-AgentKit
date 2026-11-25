@@ -681,8 +681,8 @@ View ChatRunActivity(RunSnapshot run, std::vector<RunSnapshot> delegates, bool w
   std::optional<View> disclosure;
   if (has_work) disclosure = toggle(ui_work_activity, "chat-run-activity", open, [expanded, open] { expanded = !open; });
   if (finished && show_changes) {
-    auto changes = ActivityAction(Text(ui_view_run_changes, TextRole::Label)
-        .Style({action.font, colors.primary}).With(Frame{.min_height = 24.0F}), theme, ui_view_run_changes, std::move(show_changes))
+    auto changes = ActivityAction(Row{Text(ui_view_run_changes, TextRole::Label).Style({action.font, colors.primary})}
+        .With(CrossAlign(CrossAxisAlignment::Center), Frame{.min_height = 24.0F}), theme, ui_view_run_changes, std::move(show_changes))
         .Key("chat-view-run-changes");
     disclosure = disclosure ? View{Row{std::move(*disclosure), std::move(changes)}.With(Spacing(10.0F),
         CrossAlign(CrossAxisAlignment::Center))} : std::move(changes);
@@ -712,7 +712,7 @@ View ChatRunActivity(RunSnapshot run, std::vector<RunSnapshot> delegates, bool w
         Column(std::move(entries)).With(Grow(), Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch)),
     }.With(Spacing(11.0F), CrossAlign(CrossAxisAlignment::Stretch), Padding(EdgeInsets{.left = 3.0F})));
   }
-  return Column(std::move(content)).With(Spacing(5.0F), Padding(EdgeInsets{.top = 5.0F, .bottom = 8.0F, .left = 3.0F}),
+  return Column(std::move(content)).With(Spacing(5.0F), Padding(EdgeInsets{.top = 5.0F, .bottom = 8.0F}),
       CrossAlign(CrossAxisAlignment::Stretch)).Key("chat-turn/" + run.id.value);
 }
 

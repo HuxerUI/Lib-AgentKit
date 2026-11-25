@@ -76,6 +76,8 @@ struct ChatCompletionsOptions {
   bool tools_via_json = false;
   /// Time limits for receiving successive stream events.
   ModelStreamTimeouts stream_timeouts;
+  /// Enables attached PNG, JPEG, and WebP images on vision-capable endpoints.
+  bool image_input = false;
 };
 
 /// @brief Creates the Chat Completions adapter on the application thread.

@@ -61,10 +61,12 @@ std::string ModelKeyEnvironment(std::string_view key);
 huxerui::agentkit::Async<std::vector<DiscoveredModel>> DiscoverModels(
     ModelProfileInput endpoint, std::shared_ptr<huxerui::HttpClient> client);
 
+bool SupportsImageInput(std::string_view protocol);
+
 using AddModelProfile = std::function<huxerui::agentkit::Async<huxerui::agentkit::ModelProviderRef>(ModelProfileInput)>;
 
 using EditModelProfile = std::function<huxerui::agentkit::Async<huxerui::agentkit::ModelProviderRef>(
-    huxerui::agentkit::ModelProviderRef, std::string endpoint, std::optional<std::string> new_key, ModelLimits)>;
+    huxerui::agentkit::ModelProviderRef, std::string endpoint, std::optional<std::string> new_key, ModelLimits, bool image_input)>;
 
 void ShowAddModel(const huxerui::DialogHandle& dialog, AddModelProfile add_model,
     std::function<void(huxerui::agentkit::ModelProviderRef)> added);

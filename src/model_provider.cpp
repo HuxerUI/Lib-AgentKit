@@ -10,6 +10,80 @@
 
 namespace huxerui::agentkit::detail {
 
+namespace {
+
+std::string Base64(std::span<const std::byte> bytes) {
+  constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string encoded;
+  encoded.reserve(((bytes.size() + 2) / 3) * 4);
+  for (std::size_t i = 0; i < bytes.size(); i += 3) {
+    const auto remaining = bytes.size() - i;
+    const auto a = std::to_integer<unsigned>(bytes[i]);
+    const auto b = remaining > 1 ? std::to_integer<unsigned>(bytes[i + 1]) : 0U;
+    const auto c = remaining > 2 ? std::to_integer<unsigned>(bytes[i + 2]) : 0U;
+    encoded += alphabet[a >> 2];
+    encoded += alphabet[((a & 3U) << 4) | (b >> 4)];
+    encoded += remaining > 1 ? alphabet[((b & 15U) << 2) | (c >> 6)] : '=';
+    encoded += remaining > 2 ? alphabet[c & 63U] : '=';
+  }
+  return encoded;
+}
+
+} // namespace
+
+ModelMediaKey ModelMediaIdentity(const ArtifactRef& ref) { return {ref.id, ref.version}; }
+
+Async<std::map<ModelMediaKey, InlineModelMedia>> ReadInlineModelMedia(const ModelTurnRequest& request,
+    std::size_t byte_limit, std::function<bool(std::string_view)> supports) {
+  using Parts = std::map<ModelMediaKey, InlineModelMedia>;
+  std::map<ModelMediaKey, std::size_t> selected;
+  for (const auto& item : request.items) {
+    const auto* content = std::get_if<ModelContent>(&item);
+    const auto* artifact = content ? std::get_if<ArtifactRef>(&content->body) : nullptr;
+    if (!artifact) continue;
+    if (content->role != ModelContent::Role::User && content->role != ModelContent::Role::Context) {
+      co_return Fail<Parts>(ErrorCode::Unsupported, "Model media must be attached to user or context input");
+    }
+    ++selected[ModelMediaIdentity(*artifact)];
+  }
+  std::set<ModelMediaKey> declared;
+  for (const auto& attachment : request.attachments) {
+    const auto key = ModelMediaIdentity(attachment.artifact);
+    if (!selected.contains(key) || !declared.insert(key).second || !attachment.open) {
+      co_return Fail<Parts>(ErrorCode::InvalidArgument, "Model attachment must match one selected artifact version");
+    }
+    if (!supports(attachment.media_type)) {
+      co_return Fail<Parts>(ErrorCode::Unsupported, "Model input media type is unavailable");
+    }
+  }
+  if (selected.size() != declared.size()) co_return Fail<Parts>(ErrorCode::InvalidArgument, "Model attachment data is missing");
+  Parts parts;
+  auto remaining = byte_limit;
+  for (const auto& attachment : request.attachments) {
+    const auto key = ModelMediaIdentity(attachment.artifact);
+    const auto copies = selected.at(key);
+    if (request.stop.stop_requested()) co_return Fail<Parts>(ErrorCode::AlreadyClosed, "Model turn cancelled");
+    auto opened = co_await attachment.open();
+    if (!opened.Succeeded()) co_return AgentResult<Parts>::Failure(opened.Error());
+    auto stream = std::move(opened).Value();
+    Bytes bytes;
+    for (;;) {
+      if (request.stop.stop_requested()) co_return Fail<Parts>(ErrorCode::AlreadyClosed, "Model turn cancelled");
+      auto read = co_await stream.ReadAsync(std::min<std::size_t>(32 * 1024, remaining / copies + 1));
+      if (!read.Succeeded()) co_return Fail<Parts>(ErrorCode::ProviderFailure, "Model attachment could not be read");
+      if (read.Value().empty()) break;
+      if (read.Value().size() > remaining / copies) {
+        co_return Fail<Parts>(ErrorCode::BudgetExceeded, "Model inline attachments exceed their byte limit");
+      }
+      remaining -= read.Value().size() * copies;
+      bytes.insert(bytes.end(), read.Value().begin(), read.Value().end());
+    }
+    if (bytes.empty()) co_return Fail<Parts>(ErrorCode::InvalidArgument, "Model attachment is empty");
+    parts.emplace(key, InlineModelMedia{attachment.media_type, Base64(bytes)});
+  }
+  co_return AgentResult<Parts>::Success(std::move(parts));
+}
+
 std::string ModelInstructions(const ModelTurnRequest& request) {
   using Json = nlohmann::json;
   auto instructions = request.instructions;

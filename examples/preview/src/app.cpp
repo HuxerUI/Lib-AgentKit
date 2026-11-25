@@ -153,7 +153,7 @@ public:
             .code = kit::ErrorCode::InvalidArgument, .message = "Supply chart categories and values as JSON in local preview"});
         events = {kit::ModelStructuredOutput{agentkit_preview::DecodeJson(data)}};
       } else if (fields && fields->contains("nodes")) {
-        constexpr std::string_view marker = "Create a wireframe for this requirements brief:\n";
+        constexpr auto marker = agentkit_preview::DesignBriefPrefix;
         if (latest.starts_with(marker)) {
           const auto brief = latest.substr(marker.size());
           topic = brief.substr(0, brief.find('\n'));
@@ -161,21 +161,28 @@ public:
         const bool release = topic.starts_with("Workspace release:");
         auto draft = agentkit_preview::SampleDesign(release ? "Settings" : topic);
 #if defined(AGENTKIT_PREVIEW_TEST)
-        if (topic == "Settings wireframe" && latest.find("\nCorrect the previous wireframe.") == std::string::npos)
-          std::get<kit::JsonValue::Object>(draft.value).at("height") = kit::JsonValue{std::int64_t{200}};
+        if (topic == "Settings wireframe" && latest.find(agentkit_preview::DesignCorrectionPrefix) == std::string::npos) {
+          auto& nodes = std::get<kit::JsonValue::Array>(std::get<kit::JsonValue::Object>(draft.value).at("nodes").value);
+          std::get<kit::JsonValue::Object>(nodes.at(2).value).at("y") = kit::JsonValue{std::int64_t{45}};
+        }
 #endif
         if (release) {
           auto& nodes = std::get<kit::JsonValue::Array>(std::get<kit::JsonValue::Object>(draft.value).at("nodes").value);
-          auto update = [&](std::size_t index, std::string_view id, std::string_view label, std::string_view note) {
-            auto& node = std::get<kit::JsonValue::Object>(nodes[index].value);
-            node.at("id") = kit::JsonValue{std::string(id)};
-            node.at("label") = kit::JsonValue{std::string(label)};
-            node.at("note") = kit::JsonValue{std::string(note)};
+          auto update = [&](std::string_view original, std::string_view id, std::string_view label, std::string_view note) {
+            for (auto& value : nodes) {
+              auto& node = std::get<kit::JsonValue::Object>(value.value);
+              if (std::get<std::string>(node.at("id").value) != original) continue;
+              node.at("id") = kit::JsonValue{std::string(id)};
+              node.at("label") = kit::JsonValue{std::string(label)};
+              node.at("note") = kit::JsonValue{std::string(note)};
+              break;
+            }
           };
-          update(0, "heading", "Settings", "Name the workspace settings screen.");
-          update(1, "product", "Product mode", "Group the mode and its description.");
-          update(2, "description", "Manage the settings used by this workspace.", "Explain what the setting changes.");
-          update(3, "mode", "Enabled", "Track whether the current product mode is enabled.");
+          update("heading", "heading", "Settings", "Name the workspace settings screen.");
+          update("appearance", "product", "Product mode", "Group the mode and its description.");
+          update("theme", "description", "Manage the settings used by this workspace.", "Explain what the setting changes.");
+          update("contrast", "mode", "Enabled", "Track whether the current product mode is enabled.");
+          update("appearance-title", "product-title", "Product mode", "");
         }
         events = {kit::ModelStructuredOutput{std::move(draft)}};
       } else if (latest.starts_with("Create a one-slide outline of the supplied report:\n")) {
@@ -585,8 +592,10 @@ std::optional<kit::ModelRegistration> ConfiguredModel(PreviewModelOptions option
   if (model.empty() || url.empty()) throw std::invalid_argument("Set both AgentKit model and base URL");
   if (provider.empty()) provider = protocol == "messages" ? "anthropic" :
       protocol == "generate-content" || protocol == "interactions" ? "gemini" : "openai";
-  if ((options.image_input || options.file_input) && protocol != "generate-content" && protocol != "interactions")
-    throw std::invalid_argument("Attachments require Gemini GenerateContent or Interactions");
+  if (options.image_input && !agentkit_preview::SupportsImageInput(protocol))
+    throw std::invalid_argument("This model protocol does not support image input");
+  if (options.file_input && protocol != "generate-content" && protocol != "interactions")
+    throw std::invalid_argument("Document attachments require Gemini GenerateContent or Interactions");
   if (options.reasoning_summary && (provider != "openai" || protocol != "responses"))
     throw std::invalid_argument("Reasoning summaries require a supporting OpenAI Responses model");
   const auto connect = [](auto registration) {
@@ -675,7 +684,7 @@ std::optional<kit::ModelRegistration> ConfiguredModel(PreviewModelOptions option
       .request_usage = provider == "openai",
       .developer_role = provider == "openai",
       .output_format = kit::ChatOutputFormat::JsonObject,
-      .tools_via_json = tools_via_json};
+      .tools_via_json = tools_via_json, .image_input = options.image_input};
   if (provider == "deepseek" || provider == "glm") chat.thinking = false;
   return connect(kit::MakeChatCompletionsModel(std::move(chat)));
 }
@@ -898,7 +907,8 @@ kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewServic
 }
 
 kit::Async<kit::ModelProviderRef> UpdateModelProfile(std::shared_ptr<PreviewService> service,
-    kit::ModelProviderRef previous, std::string endpoint, std::optional<std::string> new_key, agentkit_preview::ModelLimits limits) {
+    kit::ModelProviderRef previous, std::string endpoint, std::optional<std::string> new_key,
+    agentkit_preview::ModelLimits limits, bool image_input) {
   using Result = kit::AgentResult<kit::ModelProviderRef>;
   const auto resources = UseService<Resources>();
   const auto found = service->model_revisions.find(previous);
@@ -921,10 +931,12 @@ kit::Async<kit::ModelProviderRef> UpdateModelProfile(std::shared_ptr<PreviewServ
   while (endpoint.ends_with('/')) endpoint.pop_back();
   if (new_key) *new_key = TrimModelField(std::move(*new_key));
   if (service->run_settings->CurrentModel(previous) == previous && endpoint == profile.base_url &&
-      (!new_key || *new_key == profile.api_key) && limits == profile.limits) co_return Result::Success(std::move(previous));
+      (!new_key || *new_key == profile.api_key) && limits == profile.limits && image_input == profile.image_input)
+    co_return Result::Success(std::move(previous));
   profile.base_url = std::move(endpoint);
   if (new_key) profile.api_key = std::move(*new_key);
   profile.limits = std::move(limits);
+  profile.image_input = image_input;
   co_return co_await SaveModelProfile(std::move(service), std::move(profile), std::move(previous));
 }
 
@@ -1053,8 +1065,8 @@ agentkit_preview::AddModelProfile AddModelAction(const std::shared_ptr<PreviewSe
 agentkit_preview::EditModelProfile EditModelAction(const std::shared_ptr<PreviewService>& service) {
 #ifndef __EMSCRIPTEN__
   if (service->model_profiles) return [service](kit::ModelProviderRef ref, std::string endpoint,
-      std::optional<std::string> key, agentkit_preview::ModelLimits limits) {
-    return UpdateModelProfile(service, std::move(ref), std::move(endpoint), std::move(key), std::move(limits));
+      std::optional<std::string> key, agentkit_preview::ModelLimits limits, bool image_input) {
+    return UpdateModelProfile(service, std::move(ref), std::move(endpoint), std::move(key), std::move(limits), image_input);
   };
 #endif
   return {};
@@ -1365,30 +1377,20 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
       "create or revise an interface wireframe", agentkit_preview::RunDesign);
   const auto image_available = [host] {
     const auto service = host.lock();
-    return service && !service->settings->image_generation_model.empty() &&
-        (!service->model_revisions.empty() || !Environment("HUXERUI_AGENTKIT_BASE_URL").empty());
+    if (!service) return false;
+    const auto model = service->run_settings->CurrentModel(service->settings->image_generation_model);
+    return model && service->model_revisions.contains(*model);
   };
   Require(agentkit_preview::RegisterPresentationTools(registered, files,
       [host]() -> kit::Async<agentkit_preview::PresentationImageModel> {
     using Result = kit::AgentResult<agentkit_preview::PresentationImageModel>;
     const auto service = host.lock();
     if (!service) co_return Result::Failure({.code = kit::ErrorCode::RuntimeClosed, .message = "GanWork has closed"});
-    const auto settings = service->settings.Get();
     const auto missing = [] {
-      return Result::Failure({.code = kit::ErrorCode::InvalidState, .message = "Configure a saved image generation endpoint and model"});
+      return Result::Failure({.code = kit::ErrorCode::InvalidState, .message = "Select an available image generation model in Settings"});
     };
-    if (settings.image_generation_model.empty()) co_return missing();
-    auto configured = service->run_settings->CurrentModel(settings.image_endpoint ? settings.image_endpoint : settings.daily_model);
-    if (!configured) configured = service->run_settings->DefaultModel(agentkit_preview::GeneralAgent);
-    auto saved = configured ? service->model_revisions.find(*configured) : service->model_revisions.end();
-    if (saved == service->model_revisions.end() && !settings.image_endpoint) {
-      const auto env_url = Environment("HUXERUI_AGENTKIT_BASE_URL");
-      if (!env_url.empty()) co_return Result::Success({env_url, Environment("HUXERUI_AGENTKIT_API_KEY"), settings.image_generation_model});
-      for (const auto& choice : service->run_settings->Models(agentkit_preview::GeneralAgent)) {
-        saved = service->model_revisions.find(choice.ref);
-        if (saved != service->model_revisions.end()) break;
-      }
-    }
+    const auto configured = service->run_settings->CurrentModel(service->settings->image_generation_model);
+    const auto saved = configured ? service->model_revisions.find(*configured) : service->model_revisions.end();
     if (saved == service->model_revisions.end()) co_return missing();
     agentkit_preview::ModelProfileInput profile;
     if (const auto* file = std::get_if<File>(&saved->second)) {
@@ -1402,7 +1404,7 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
     const auto environment = ModelKeyEnvironment(profile.api_key);
     auto key = environment.empty() ? std::move(profile.api_key) : Environment(environment.c_str());
     if (!environment.empty() && key.empty()) co_return missing();
-    co_return Result::Success({std::move(profile.base_url), std::move(key), settings.image_generation_model});
+    co_return Result::Success({std::move(profile.base_url), std::move(key), std::move(profile.model)});
   }));
   register_specialist(
       {.ref = {agentkit_preview::PptAgent, 1}, .display_name = "PPT assistant",
@@ -2099,7 +2101,7 @@ View PreviewConversation(kit::AgentId agent, std::shared_ptr<kit::Conversation> 
 std::optional<View> PreviewAttachmentAction(const std::shared_ptr<PreviewService>& service, const kit::AgentId& agent,
     State<kit::UserRunOptions> next, State<kit::AgentChatDraftSources> sources, kit::ModelCapabilities capabilities,
     std::function<void()> changed) {
-  const auto image_model = service->run_settings->CurrentModel(service->applied_settings->image_model);
+  const auto image_model = service->run_settings->CurrentModel(service->settings->image_model);
   if (image_model && sources->attachments.empty() &&
       service->run_settings->Capabilities(image_model, agent).image_input) {
     auto images = agentkit_preview::AttachmentPicker(service->attachments, sources, {.image_input = true},

@@ -38,6 +38,18 @@ std::string ToolContent(const ModelToolResult& tool);
 
 std::string ModelInstructions(const ModelTurnRequest& request);
 
+using ModelMediaKey = std::pair<ArtifactId, Revision>;
+
+struct InlineModelMedia {
+  std::string mime;
+  std::string base64;
+};
+
+ModelMediaKey ModelMediaIdentity(const ArtifactRef& ref);
+
+Async<std::map<ModelMediaKey, InlineModelMedia>> ReadInlineModelMedia(const ModelTurnRequest& request,
+    std::size_t byte_limit, std::function<bool(std::string_view)> supports);
+
 class ToolNames {
 public:
   explicit ToolNames(const ModelTurnRequest& request, bool require_identifier_start = false);

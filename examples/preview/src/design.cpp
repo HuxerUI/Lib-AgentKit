@@ -3,6 +3,7 @@
 
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <set>
 
@@ -16,6 +17,8 @@ using Json = nlohmann::json;
 constexpr auto type = DesignArtifactType;
 constexpr std::string_view prefix = "preview-design-";
 constexpr std::string_view design_resource = "design-board/";
+constexpr std::array<std::string_view, 10> design_kinds{
+    "heading", "body", "caption", "card", "field", "button", "secondary_button", "link", "toggle", "checkbox"};
 
 template<class T>
 kit::AgentResult<T> Fail(kit::ErrorCode code, std::string message) {
@@ -169,10 +172,31 @@ kit::Async<kit::ToolResult> Invoke(kit::RunContext run, std::string_view stage, 
   co_return result;
 }
 
+kit::AgentResult<DesignBoard> VerifyGeneratedDesign(const std::optional<JsonValue>& document) {
+  if (!document) return Fail<DesignBoard>(kit::ErrorCode::ProviderFailure, "The model returned no design document");
+  auto parsed = ParseDesign(*document);
+  if (!parsed.Succeeded()) return parsed;
+  const auto& nodes = parsed.Value().nodes;
+  const auto contains = [](const DesignNode& card, const DesignNode& node) {
+    return card.kind == "card" && node.x >= card.x && node.y >= card.y &&
+        node.x + node.width <= card.x + card.width && node.y + node.height <= card.y + card.height;
+  };
+  for (auto first = nodes.begin(); first != nodes.end(); ++first) {
+    for (auto second = std::next(first); second != nodes.end(); ++second) {
+      const bool intersect = first->x < second->x + second->width && second->x < first->x + first->width &&
+          first->y < second->y + second->height && second->y < first->y + first->height;
+      if (intersect && !contains(*first, *second) && !contains(*second, *first))
+        return Fail<DesignBoard>(kit::ErrorCode::InvalidArgument, "Overlapping elements: " + first->id + " and " + second->id);
+    }
+  }
+  return parsed;
+}
+
 } // namespace
 
 kit::JsonSchema DesignSchema() {
-  static const auto schema = Value(Json::parse(R"({
+  static const auto schema = [] {
+    auto document = Json::parse(R"({
     "type":"object",
     "additionalProperties":false,
     "required":["title","brief","width","height","nodes"],
@@ -188,7 +212,7 @@ kit::JsonSchema DesignSchema() {
           "required":["id","kind","label","note","x","y","width","height"],
           "properties":{
             "id":{"type":"string"},
-            "kind":{"type":"string","enum":["heading","body","card","field","button","toggle"]},
+            "kind":{"type":"string"},
             "label":{"type":"string"},
             "note":{"type":"string"},
             "x":{"type":"integer"},
@@ -199,7 +223,10 @@ kit::JsonSchema DesignSchema() {
         }
       }
     }
-  })"));
+  })");
+    document["properties"]["nodes"]["items"]["properties"]["kind"]["enum"] = design_kinds;
+    return Value(document);
+  }();
   return {schema};
 }
 
@@ -225,12 +252,11 @@ kit::AgentResult<DesignBoard> ParseDesign(const JsonValue& value) {
     const auto& nodes = doc.at("nodes");
     if (!nodes.is_array() || nodes.empty() || nodes.size() > 24) throw std::invalid_argument("Expected one to 24 nodes");
     std::set<std::string> ids;
-    const std::set<std::string_view> kinds{"heading", "body", "card", "field", "button", "toggle"};
     for (const auto& entry : nodes) {
       DesignNode node{text(entry, "id", 64), text(entry, "kind", 16), text(entry, "label", 640), text(entry, "note", 1920, true),
           number(entry, "x", 0, design.width - 1), number(entry, "y", 0, design.height - 1),
           number(entry, "width", 1, design.width), number(entry, "height", 1, design.height)};
-      if (!SafeId(node.id) || !ids.insert(node.id).second || !kinds.contains(node.kind) ||
+      if (!SafeId(node.id) || !ids.insert(node.id).second || std::ranges::find(design_kinds, node.kind) == design_kinds.end() ||
           node.x + node.width > design.width || node.y + node.height > design.height) {
         throw std::invalid_argument("Each node needs a unique stable ID, supported component and valid bounds");
       }
@@ -257,7 +283,9 @@ JsonValue SampleDesign(std::string title) {
            {"note", "The preference can be changed without leaving this screen."},
            {"x", 58}, {"y", 218}, {"width", 604}, {"height", 42}},
           {{"id", "save"}, {"kind", "button"}, {"label", "Save changes"}, {"note", "Keep the primary action near the bottom."},
-           {"x", 502}, {"y", 340}, {"width", 182}, {"height", 45}}
+           {"x", 502}, {"y", 340}, {"width", 182}, {"height", 45}},
+          {{"id", "appearance-title"}, {"kind", "caption"}, {"label", "Appearance"}, {"note", ""},
+           {"x", 58}, {"y", 119}, {"width", 604}, {"height", 25}}
       })}});
 }
 
@@ -575,13 +603,17 @@ kit::Async<kit::RunCompletion> RunDesign(kit::RunContext run, kit::RunInput inpu
   } else {
     auto baseline = co_await Invoke(run, "base", {ReadDesign, JsonValue{JsonValue::Object{}}});
     if (!baseline.Succeeded()) co_return Completion::Failure(baseline.Error());
-    std::string prompt = "Create a wireframe for this requirements brief:\n" + input.input.text +
-        "\nUse only heading, body, card, field, button and toggle. Return 1 to 24 nodes. "
-        "Use a 640 by 360 pixel artboard unless the brief calls for a different size. "
-        "Canvas width must be between 320 and 1600 pixels and height between 220 and 1200 pixels. "
-        "Every node must fit within the canvas. "
-        "Do not use overlapping bounds except when grouping controls inside a card. "
-        "Give each node a stable ASCII id and describe notable behavior in its note.";
+    std::string prompt = std::string(DesignBriefPrefix) + input.input.text +
+        "\nChoose the composition for the task. Use an 800 by 520 pixel artboard for desktop when unspecified; "
+        "choose a portrait artboard when the brief calls for mobile. The legal canvas is 320 to 1600 by 220 to 1200 pixels. "
+        "Use 1 to 24 nodes. Use consistent alignment, at least 24 px of card padding, and 12 to 20 px between controls. "
+        "Allow at least 44 px for a screen heading and for inputs and filled buttons. "
+        "A card is a background grouping, and its label is only shown in the layer list. Use heading or caption for visible titles. "
+        "Use button only for the main action, secondary_button for alternative actions, link for navigation, "
+        "checkbox for a form option, toggle for a persistent setting, and body or caption for explanatory copy. "
+        "For sign-in, distinguish the main submit action from password recovery and account creation links. "
+        "Write concise, natural screen copy in the user's language. Put implementation notes in note. "
+        "Give each node a stable ASCII id. Keep all nodes within the artboard and avoid overlaps other than full containment by a card.";
     const auto& latest = baseline.Value().model_value;
     const auto* previous = latest ? Property(*latest, "document") : nullptr;
     const auto* base = latest ? Property(*latest, "base") : nullptr;
@@ -589,13 +621,13 @@ kit::Async<kit::RunCompletion> RunDesign(kit::RunContext run, kit::RunInput inpu
     const auto schema = DesignSchema();
     auto model = co_await run.CompleteAsync({.instruction = prompt, .output_schema = schema});
     if (!model.Succeeded()) co_return Completion::Failure(model.Error());
-    auto verified = ParseDesign(*model.Value().structured);
+    auto verified = VerifyGeneratedDesign(model.Value().structured);
     if (!verified.Succeeded()) {
-      prompt += "\nCorrect the previous wireframe. Validation failed: " + verified.Error().message +
+      prompt += std::string(DesignCorrectionPrefix) + verified.Error().message +
           ". Preserve the requirements and valid node IDs. Return the complete corrected document.";
       model = co_await run.CompleteAsync({.instruction = std::move(prompt), .output_schema = schema});
       if (!model.Succeeded()) co_return Completion::Failure(model.Error());
-      verified = ParseDesign(*model.Value().structured);
+      verified = VerifyGeneratedDesign(model.Value().structured);
       if (!verified.Succeeded()) co_return Completion::Failure(verified.Error());
     }
     prepared = JsonValue{JsonValue::Object{

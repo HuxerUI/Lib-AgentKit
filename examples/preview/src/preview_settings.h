@@ -19,8 +19,7 @@ struct PreviewSettings {
   std::optional<huxerui::agentkit::ModelProviderRef> daily_model;
   std::optional<huxerui::agentkit::ModelProviderRef> image_model;
   std::optional<huxerui::agentkit::ModelProviderRef> review_model;
-  std::optional<huxerui::agentkit::ModelProviderRef> image_endpoint;
-  std::string image_generation_model = "gpt-image-1.5";
+  std::optional<huxerui::agentkit::ModelProviderRef> image_generation_model;
   LocalFilePermissions file_access;
 
   bool operator==(const PreviewSettings&) const = default;

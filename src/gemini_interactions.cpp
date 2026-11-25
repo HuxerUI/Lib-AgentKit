@@ -142,7 +142,7 @@ Input MakeInput(const ModelTurnRequest& request, const ToolNames& names, const R
     if (content && content->role != ModelContent::Role::Assistant) {
       if (content->role == ModelContent::Role::Tool) throw std::invalid_argument("Tool content needs a call identity");
       if (const auto* artifact = std::get_if<ArtifactRef>(&content->body)) {
-        input.all.push_back({{"type", "user_input"}, {"content", Json::array({media.at(GeminiMediaKey(*artifact))})}});
+        input.all.push_back({{"type", "user_input"}, {"content", Json::array({media.at(ModelMediaIdentity(*artifact))})}});
       } else {
         const auto* text = std::get_if<std::string>(&content->body);
         auto value = text ? *text : ToWireJson(std::get<JsonValue>(content->body)).dump();
