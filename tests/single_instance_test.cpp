@@ -746,6 +746,85 @@ void TestLockAndIpcInitializationFailures(const std::string& runtime_dir) {
 #endif
 }
 
+void TestReentrantCallbackLifecycleCalls(const std::string& runtime_dir) {
+  // Subtest A: callback calls Stop() directly from the listener thread.
+  {
+    const std::string id = "reentrant-self-stop";
+    const auto res = si::StartOrActivate(MakeTestOptions(runtime_dir, id));
+    Check(res.status == si::StartStatus::Acquired, "Subtest A acquire failed: " + res.error);
+
+    std::atomic<bool> callback_done{false};
+    si::SetActivationHandler([&callback_done]() {
+      si::Stop();
+      callback_done.store(true);
+    });
+
+    Check(TriggerExternalActivation(runtime_dir, id), "Subtest A TriggerExternalActivation failed");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+    while (std::chrono::steady_clock::now() < deadline && !callback_done.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    Check(callback_done.load(), "Subtest A callback did not finish in time");
+
+    si::Stop();
+    const auto reacquire = si::StartOrActivate(MakeTestOptions(runtime_dir, id));
+    Check(reacquire.status == si::StartStatus::Acquired,
+          "Subtest A re-acquire after self-stop failed: " + reacquire.error);
+    si::Stop();
+  }
+
+  // Subtest B: external Stop() runs concurrently while callback reentrantly calls Stop() and StartOrActivate().
+  {
+    const std::string id = "reentrant-concurrent-stop";
+    for (int round = 0; round < 10; ++round) {
+      const auto opts = MakeTestOptions(runtime_dir, id);
+      const auto res = si::StartOrActivate(opts);
+      Check(res.status == si::StartStatus::Acquired,
+            "Subtest B round " + std::to_string(round) + " acquire failed: " + res.error);
+
+      std::mutex ready_mutex;
+      std::condition_variable ready_cv;
+      bool entered_callback = false;
+      std::atomic<int> reentrant_start_status{-1};
+
+      si::SetActivationHandler([&]() {
+        {
+          std::lock_guard<std::mutex> lock(ready_mutex);
+          entered_callback = true;
+        }
+        ready_cv.notify_one();
+        // Yield briefly so the main thread enters Stop() and waits in join().
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        si::Stop();
+        const auto inner = si::StartOrActivate(opts);
+        reentrant_start_status.store(static_cast<int>(inner.status));
+      });
+
+      Check(TriggerExternalActivation(runtime_dir, id), "Subtest B TriggerExternalActivation failed");
+      {
+        std::unique_lock<std::mutex> lock(ready_mutex);
+        Check(ready_cv.wait_for(lock, std::chrono::milliseconds(1500), [&]() { return entered_callback; }),
+              "Subtest B timed out waiting for callback entry");
+      }
+
+      const auto t0 = std::chrono::steady_clock::now();
+      si::Stop();
+      const auto elapsed_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+
+      Check(elapsed_ms < 1000, "Subtest B Stop() took too long: " + std::to_string(elapsed_ms) + "ms");
+      Check(reentrant_start_status.load() == static_cast<int>(si::StartStatus::Failed),
+            "Subtest B expected reentrant StartOrActivate during shutdown to return Failed, got " +
+                std::to_string(reentrant_start_status.load()));
+
+      const auto next = si::StartOrActivate(opts);
+      Check(next.status == si::StartStatus::Acquired,
+            "Subtest B post-shutdown acquire failed: " + next.error);
+      si::Stop();
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -775,6 +854,7 @@ int main(int argc, char** argv) {
     TestConcurrentActivationAndShutdown(temp_dir.Path());
     TestRestartAfterAbnormalExit(self_exe, temp_dir.Path());
     TestLockAndIpcInitializationFailures(temp_dir.Path());
+    TestReentrantCallbackLifecycleCalls(temp_dir.Path());
 
     std::cout << "All single-instance tests passed.\n";
     return 0;

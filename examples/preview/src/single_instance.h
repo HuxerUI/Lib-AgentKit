@@ -39,14 +39,19 @@ bool IsEnabled();
 /// Ensures at most one active desktop instance runs for the given instance_id.
 StartResult StartOrActivate(const Options& options = {});
 
-/// Registers a callback invoked when a secondary instance requests window activation.
-/// If an activation arrived before registration, it is delivered immediately.
+/// Registers a callback invoked on a background listener thread when a secondary
+/// instance requests window activation. If an activation arrived before registration,
+/// it is delivered synchronously on the calling thread.
+/// Reentrant calls to Stop(), ClearActivationHandler(), or SetActivationHandler()
+/// from within the callback are safe and deadlock-free; calling StartOrActivate()
+/// reentrantly while shutdown is in progress returns StartStatus::Failed.
 void SetActivationHandler(std::function<void()> handler);
 
 /// Clears the activation callback registered via SetActivationHandler.
 void ClearActivationHandler();
 
 /// Stops the background listener and releases instance lock resources.
+/// Safe to call concurrently or reentrantly from an activation callback.
 void Stop();
 
 /// RAII guard that calls Stop() when leaving scope.
