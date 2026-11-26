@@ -63,7 +63,8 @@ using ConfiguredPreviewDriver = std::function<huxerui::Task<void>(
     huxerui::agentkit::AgentResult<std::shared_ptr<huxerui::agentkit::AgentRuntime>>,
     std::optional<huxerui::agentkit::WorkspaceId>, huxerui::agentkit::ProjectId)>;
 huxerui::ApplicationHook MakeConfiguredPreviewTestInstaller(
-    huxerui::File database, huxerui::File workspace, huxerui::File ctest, ConfiguredPreviewDriver drive);
+    huxerui::File database, huxerui::File workspace, huxerui::File ctest, ConfiguredPreviewDriver drive,
+    std::optional<huxerui::agentkit::ModelRegistration> code_model = {});
 using PreviewStoreAdapter = std::function<std::shared_ptr<huxerui::agentkit::SessionStore>(std::shared_ptr<huxerui::agentkit::SessionStore>)>;
 huxerui::ApplicationHook MakeRunSettingsTestInstaller(huxerui::File database, huxerui::File workspace,
     std::vector<huxerui::agentkit::ModelRegistration> models,
@@ -1294,7 +1295,7 @@ Task<void> RunConfiguredChartReview(const std::shared_ptr<kit::AgentRuntime>& ru
     if (snapshot && !snapshot->summary.active_run && !snapshot->runs.empty()) {
       const auto call = export_call(*snapshot);
       if (call == snapshot->tools.end() || (ask ? call->review.has_value() : (!call->review || call->review->plan != call->plan ||
-          call->review->reviewer != "preview.report-chart.model/v1"))) {
+          call->review->reviewer != "ganwork.tool-review.model/v1"))) {
         throw std::runtime_error("Chart export did not record the configured approval path");
       }
       const auto has_approval = std::ranges::any_of(snapshot->interactions, [](const auto& item) {
@@ -7868,7 +7869,11 @@ public:
       if (!scenario || !offered("run_powershell") || !offered("web_fetch") || offered("web_search") != search_enabled_)
         co_return error("Unexpected host tool offer");
       if (!reply) {
-        events.emplace_back(kit::ModelToolStarted{"host-tool", scenario->tool});
+        const auto tool = std::ranges::find_if(request.tools, [&](const auto& spec) {
+          return spec.name == scenario->tool || spec.tool.id.value == scenario->tool;
+        });
+        if (tool == request.tools.end()) co_return error("The requested fixture tool is unavailable");
+        events.emplace_back(kit::ModelToolStarted{"host-tool", tool->name});
         events.emplace_back(kit::ModelToolArguments{"host-tool", scenario->arguments.dump()});
         events.emplace_back(kit::ModelToolFinished{"host-tool"});
         finish = kit::ModelFinishReason::ToolCalls;
@@ -7985,6 +7990,127 @@ void VerifyHostTools(const File& root, std::string url) {
   const auto folders = root.Child("ganwork-task-files").ListChildren();
   if (!folders.Succeeded() || folders.Value().size() != 1 || !folders.Value().front().Child("isolated.txt").Exists())
     throw std::runtime_error("Standalone PowerShell did not write to its own task directory");
+}
+
+void VerifyToolAutoReview(const File& root, bool include_timeout) {
+  using namespace agentkit_preview;
+  using Outcome = kit::ToolReviewOutcome;
+  struct ReviewCase {
+    std::string operation;
+    std::string marker;
+    Outcome outcome;
+    bool timeout;
+  };
+  const auto workspace = root.Child("code");
+  if (!workspace.CreateDirectories()) throw std::runtime_error("Could not create the review workspace");
+  std::vector<ReviewCase> reviews;
+  std::vector<HostToolCase> calls;
+  const auto add = [&](std::string operation, bool timeout) {
+    for (const auto& [suffix, outcome] : {std::pair{"allowed", Outcome::Approved},
+             {"denied", Outcome::Denied}, {"manual", Outcome::Escalated}}) {
+      if (timeout && outcome != Outcome::Escalated) continue;
+      const auto marker = operation + (timeout ? "-timeout" : "-" + std::string(suffix));
+      const auto path = marker + ".txt";
+      std::string action;
+      const char* tool;
+      nlohmann::json arguments;
+      if (operation == "file") {
+        WriteFixture(workspace.Child(path), "before");
+        action = "edit " + path + " in this workspace, replacing exactly before with after";
+        tool = "edit_file";
+        arguments = {{"path", path}, {"old_text", "before"}, {"new_text", "after"}};
+      } else if (operation == "powershell") {
+        const auto command = "Set-Content -LiteralPath " + path + " -Value after";
+        action = "run this PowerShell command in the current workspace: " + command;
+        tool = "run_powershell";
+        arguments = {{"command", command}};
+      } else {
+        action = "call record_review on the Review fixture MCP server once with marker " + marker;
+        tool = "ganwork.mcp/1/record_review";
+        arguments = {{"marker", marker}};
+      }
+      auto intent = outcome == Outcome::Approved ? "Please " + action + ". Do not take any other action." :
+          outcome == Outcome::Denied ? "Do not " + action + ". I explicitly forbid that action." :
+          "Help me consider a possible next step for " + operation + ". I haven't chosen the operation or target.";
+      if (outcome == Outcome::Escalated) intent += " Case " + marker + ".";
+      reviews.push_back({operation, marker, outcome, timeout});
+      calls.push_back({std::move(intent), tool,
+          operation == "file" ? "Edit file" : operation == "powershell" ? "Run PowerShell" : "Review fixture / record_review",
+          std::move(arguments), outcome == Outcome::Denied});
+    }
+  };
+  add("file", false);
+  add("powershell", false);
+  add("mcp", false);
+  if (include_timeout) add("file", true);
+
+  std::exception_ptr failure;
+  bool completed = false;
+  kit::ModelRegistration producer{{{"auto-review-fixture"}, 1}, {"fixture", "auto-review-fixture", "script", {}},
+      std::make_shared<HostToolModel>(calls, false)};
+  const Application application{[]() -> View { return Spacer(); },
+      {.window = {.activatable = false}, .quit_on_last_window_closed = false,
+       .application_hooks = {MakeConfiguredPreviewTestInstaller(root.Child("sessions.sqlite3"), workspace,
+           File(AGENTKIT_PREVIEW_CTEST), [&](auto started, auto workspace_id, auto project) -> Task<void> {
+    const auto app = UseApplication();
+    try {
+      const auto runtime = LiveTake(std::move(started));
+      for (std::size_t index = 0; index < calls.size(); ++index) {
+        const auto& call = calls[index];
+        const auto& check = reviews[index];
+        const auto file = check.operation == "mcp" ? root.Child(check.marker + ".called") : workspace.Child(check.marker + ".txt");
+        const auto effect_observed = [&] {
+          if (check.operation != "file") return file.Exists();
+          const auto content = file.ReadString();
+          if (!content.Succeeded()) throw std::runtime_error("The review file disappeared");
+          return content.Value() == "after";
+        };
+        auto created = LiveTake(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
+            .options = {.agent = CodeAgent, .project = project, .workspace = workspace_id, .title = check.marker},
+            .initial = kit::SendInput{.text = call.name},
+            .user_start = {.execution_profile = ReviewProfile}}));
+        auto session = LiveTake(co_await runtime->Sessions().OpenAsync(std::get<kit::SessionCreated>(created.outcome).session));
+        const auto observed = co_await LiveObserve(session);
+        std::optional<kit::InteractionSnapshot> approval;
+        if (check.outcome == Outcome::Escalated) {
+          const auto resources = UseService<Resources>();
+          const auto title = check.operation == "file" ? resources->GetString(::app::strings::ui_local_edit_file) :
+              check.operation == "powershell" ? resources->GetString(::app::strings::ui_tool_powershell) : std::string(call.approval);
+          approval = co_await LiveInteraction(session, title, {}, 25s);
+          if (effect_observed()) throw std::runtime_error(check.marker + ": executed before manual approval");
+          co_await LiveApprove(session, *approval);
+        }
+        co_await LiveRunCompleted(session, 25s);
+        const auto snapshot = session->Snapshot();
+        const auto used = std::ranges::find_if(snapshot->tools, [&](const auto& tool) { return tool.tool.id.value == call.tool; });
+        if (used == snapshot->tools.end() || !used->review || used->review->plan != used->plan ||
+            used->review->reviewer != "ganwork.tool-review.model/v1" || used->review->outcome != check.outcome ||
+            (check.timeout && used->review->reason != "Tool review timed out"))
+          throw std::runtime_error(check.marker + ": unexpected review outcome: " +
+              (used != snapshot->tools.end() && used->review ? used->review->reason : "no recorded review"));
+        if (approval) {
+          const auto& plan = std::get<kit::ToolApproval>(approval->body);
+          if (plan.call != used->id || plan.plan != used->plan)
+            throw std::runtime_error(check.marker + ": human review did not retain the original plan");
+        } else if (std::ranges::any_of(snapshot->interactions, [](const auto& interaction) {
+                     return std::holds_alternative<kit::ToolApproval>(interaction.body);
+                   })) {
+          throw std::runtime_error(check.marker + ": unexpected manual approval");
+        }
+        const bool denied = check.outcome == Outcome::Denied;
+        if (effect_observed() == denied || used->state != (denied ? kit::ToolCallState::Denied : kit::ToolCallState::Succeeded))
+          throw std::runtime_error(check.marker + ": review did not control actual execution");
+        if (check.operation == "file") CheckText(file, denied ? "before" : "after");
+        std::cout << check.marker << " passed with plan " << used->plan->value << std::endl;
+      }
+      LiveTake(co_await runtime->CloseAsync());
+      completed = true;
+    } catch (...) { failure = std::current_exception(); }
+    app.Quit();
+  }, std::move(producer))}}};
+  static_cast<void>(RunApplication());
+  if (failure) std::rethrow_exception(failure);
+  if (!completed) throw std::runtime_error("The automatic review acceptance did not finish");
 }
 #endif
 
@@ -10134,6 +10260,14 @@ void VerifyLocalization(const File& root) {
 } // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+  if ((argc == 3 || argc == 4) && std::string_view(argv[1]) == "--tool-auto-review") {
+    try {
+      VerifyToolAutoReview(File(std::filesystem::absolute(std::filesystem::u8path(argv[2])).u8string()), argc == 4);
+      return 0;
+    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+  }
+#endif
   if (argc == 4 && std::string_view(argv[1]) == "--extensions") {
     try {
       VerifyExtensions(File(std::filesystem::absolute(std::filesystem::u8path(argv[2])).u8string()), argv[3]);

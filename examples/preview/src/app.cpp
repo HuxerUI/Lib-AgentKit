@@ -1210,6 +1210,10 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
                  , web_search_available
 #endif
                  ](kit::PolicyRequest request) -> kit::Async<kit::PolicyDecision> {
+        using Result = kit::AgentResult<kit::PolicyDecision>;
+        const auto decide = [&request](kit::PolicyDecision decision) {
+          return Result::Success(agentkit_preview::RouteToolReview(request, std::move(decision)));
+        };
         if (review_user_comparisons && request.capability == kit::Capability::CreateComparison &&
             request.operation != kit::JsonValue{}) {
           co_return kit::AgentResult<kit::PolicyDecision>::Success({kit::AccessDecision::RequireConfirmation, {}});
@@ -1223,7 +1227,7 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
         if (request.tool && request.tool->catalog && request.tool->catalog->value.starts_with("ganwork.mcp/")) {
           auto decision = request.actor.principal != preview_user ? kit::AccessDecision::Deny :
               request.capability == kit::Capability::ExecuteTool ? kit::AccessDecision::RequireConfirmation : kit::AccessDecision::Allow;
-          co_return kit::AgentResult<kit::PolicyDecision>::Success({decision, {}});
+          co_return decide({decision, {}});
         }
 #ifdef _WIN32
         if (agentkit_preview::HostToolLabel(tool)) {
@@ -1232,11 +1236,11 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
             decision = kit::AccessDecision::Deny;
           else if (request.capability == kit::Capability::ExecuteTool)
             decision = kit::AccessDecision::RequireConfirmation;
-          co_return kit::AgentResult<kit::PolicyDecision>::Success({decision, {}});
+          co_return decide({decision, {}});
         }
 #endif
         if (agentkit_preview::IsLocalFileTool(tool))
-          co_return kit::AgentResult<kit::PolicyDecision>::Success(local_files->Decide(request));
+          co_return decide(local_files->Decide(request));
         const auto workspace = request.workspace ? workspaces->Find(*request.workspace) : std::nullopt;
         const bool workspace_available = workspace && workspace->NativeFolder();
         if (agentkit_preview::IsWorkspaceTool(tool) && !workspace_available &&
@@ -1251,9 +1255,11 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
             tool != agentkit_preview::ReadDesign && tool != agentkit_preview::PublishDesign &&
             tool != agentkit_preview::ReadReport && tool != agentkit_preview::PrepareReleaseOutline &&
             tool != agentkit_preview::PublishReportChart;
-        co_return settings->Decide(request, needs_confirmation, workspace_available, local_files->Current()->full_access);
+        auto decision = settings->Decide(request, needs_confirmation, workspace_available, local_files->Current()->full_access);
+        if (!decision.Succeeded()) co_return decision;
+        co_return decide(std::move(decision).Value());
       },
-      .tool_reviewer = agentkit_preview::ChartExportReviewer(files.exports, std::move(review_model)),
+      .tool_reviewer = agentkit_preview::MakeToolReviewer(files.exports, std::move(review_model), runtime_ref),
       .tool_resources = [presentations = agentkit_preview::PresentationResources(files, runtime_ref),
                         code = agentkit_preview::CodeResources(workspaces),
                         local = agentkit_preview::LocalFileResources(workspaces),
@@ -3561,10 +3567,11 @@ ApplicationHook MakeRunSettingsTestInstaller(File database, File workspace, std:
   };
 }
 
-ApplicationHook MakeConfiguredPreviewTestInstaller(File database, File workspace, File ctest, ConfiguredPreviewDriver drive) {
-  return [database = std::move(database), workspace = std::move(workspace), ctest = std::move(ctest), drive = std::move(drive)](
-             ApplicationContext& context) {
-    auto service = InstallPreview(context, database, true, workspace, {}, ctest);
+ApplicationHook MakeConfiguredPreviewTestInstaller(File database, File workspace, File ctest, ConfiguredPreviewDriver drive,
+    std::optional<kit::ModelRegistration> code_model) {
+  return [database = std::move(database), workspace = std::move(workspace), ctest = std::move(ctest), drive = std::move(drive),
+      code_model = std::move(code_model)](ApplicationContext& context) {
+    auto service = InstallPreview(context, database, true, workspace, code_model, ctest);
     if (drive) UseApplicationTaskScope().Launch([service, drive]() -> Task<void> {
       auto started = co_await WaitForRuntime(service);
       co_await drive(std::move(started), service->startup_workspace, ProjectFor(service->startup_workspace));

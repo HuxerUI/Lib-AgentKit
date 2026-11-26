@@ -127,8 +127,12 @@ private:
   std::map<huxerui::agentkit::ExecutionProfileId, huxerui::agentkit::WorkspaceId, std::less<>> full_access_;
 };
 
-huxerui::agentkit::ToolReviewer ChartExportReviewer(huxerui::File export_folder,
-    std::optional<huxerui::agentkit::AgentResult<huxerui::agentkit::ModelRegistration>> model = {});
+huxerui::agentkit::PolicyDecision RouteToolReview(const huxerui::agentkit::PolicyRequest& request,
+    huxerui::agentkit::PolicyDecision decision);
+
+huxerui::agentkit::ToolReviewer MakeToolReviewer(huxerui::File export_folder,
+    std::optional<huxerui::agentkit::AgentResult<huxerui::agentkit::ModelRegistration>> model,
+    std::shared_ptr<std::weak_ptr<huxerui::agentkit::AgentRuntime>> runtime);
 huxerui::View RunSettingsControls(std::shared_ptr<RunSettings> settings,
     huxerui::State<huxerui::agentkit::UserRunOptions> next, huxerui::agentkit::AgentId agent,
     std::optional<huxerui::agentkit::WorkspaceId> workspace, std::optional<huxerui::File> workspace_root,

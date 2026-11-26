@@ -326,6 +326,8 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HU
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/preview_extensions_server.py" $<TARGET_FILE:huxerui_agentkit_preview_tests>)
             add_test(NAME huxerui_agentkit_host_tools_tests COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/host_tools_server.py" $<TARGET_FILE:huxerui_agentkit_preview_tests>)
+            add_test(NAME huxerui_agentkit_tool_auto_review_tests COMMAND "${Python3_EXECUTABLE}" -B
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/tool_auto_review_server.py" $<TARGET_FILE:huxerui_agentkit_preview_tests>)
         endif ()
     endif ()
     add_test(NAME huxerui_agentkit_domain_review_tests COMMAND huxerui_agentkit_preview_tests --domain-review-windows)
