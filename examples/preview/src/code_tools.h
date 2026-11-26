@@ -30,7 +30,7 @@ huxerui::agentkit::Async<bool> AllowsWorkspaceTools(huxerui::agentkit::RunContex
     const RunSettings& settings);
 
 huxerui::agentkit::Async<huxerui::agentkit::RunCompletion> AnswerWithWorkspaceTools(
-    huxerui::agentkit::RunContext run, bool tests_configured, bool restore);
+    huxerui::agentkit::RunContext run, bool tests_configured, bool restore, std::string findings = {});
 
 struct CodeEditorFile {
   huxerui::agentkit::ResourceId id;

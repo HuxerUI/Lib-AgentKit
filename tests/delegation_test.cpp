@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <iostream>
 #include <thread>
+#include <utility>
 
 namespace {
 using namespace huxerui;
@@ -66,14 +67,23 @@ struct Probe {
   bool ask = false;
   bool checked_model_result = false;
   bool lose_tool_result = false;
+  bool deny_specialist = false;
+  std::vector<ModelProviderRef> models_used;
+  std::vector<ArtifactRef> attachments_used;
   std::vector<RunId> completed;
 };
 
+const ModelProviderRef specialist{{"specialist"}, 1};
+const ModelProviderRef limited_model{{"limited"}, 1};
+const ArtifactRef image_attachment{{"expert-image"}, 1};
+
 class Model final : public ModelProvider {
 public:
-  explicit Model(std::shared_ptr<Probe> probe) : probe_(std::move(probe)) {}
+  explicit Model(std::shared_ptr<Probe> probe, bool text_stream = true) : probe_(std::move(probe)), text_stream_(text_stream) {}
 
-  ModelCapabilities Capabilities() const override { return {.text_stream = true, .tool_calls = true, .structured_output = true}; }
+  ModelCapabilities Capabilities() const override {
+    return {.text_stream = text_stream_, .tool_calls = true, .structured_output = true, .image_input = true};
+  }
 
   Async<std::unique_ptr<ModelTurnStream>> StartTurnAsync(ModelTurnRequest request) override {
     std::vector<ModelEvent> events;
@@ -105,6 +115,13 @@ public:
       }
     } else {
       ++probe_->child_model_turns;
+      probe_->models_used.push_back(request.provider);
+      for (const auto& attachment : request.attachments) {
+        auto stream = Take(co_await attachment.open());
+        const auto data = co_await stream.ReadAsync(16);
+        Check(data.Succeeded() && data.Value() == Bytes{std::byte{0x42}}, "the authorized image bytes did not reach the delegate");
+        probe_->attachments_used.push_back(attachment.artifact);
+      }
       for (const auto& item : request.items) {
         const auto* content = std::get_if<ModelContent>(&item);
         const auto* text = content ? std::get_if<std::string>(&content->body) : nullptr;
@@ -117,6 +134,7 @@ public:
 
 private:
   std::shared_ptr<Probe> probe_;
+  bool text_stream_;
 };
 
 const ToolId shared_tool{"test.shared"};
@@ -149,8 +167,17 @@ Async<RunCompletion> CompletePanel(RunContext context, std::string scenario) {
     requests = {std::move(matching), std::move(invalid)};
   } else if (scenario == "revoke") {
     requests = {Expert("write")};
+  } else if (scenario == "unavailable override" || scenario == "incompatible override" || scenario == "denied override" ||
+             scenario == "unrelated attachment" || scenario == "image attachment") {
+    auto request = Expert("model");
+    request.model = scenario == "unavailable override" ? ModelProviderRef{specialist.id, 9}
+        : scenario == "incompatible override" ? limited_model : specialist;
+    if (scenario == "unrelated attachment") request.input.attachments.push_back({{"other-input"}, 1});
+    if (scenario == "image attachment") request.input.attachments.push_back(image_attachment);
+    requests.push_back(std::move(request));
   } else {
     requests = {Expert("write"), Expert("model")};
+    if (scenario == "private parent prompt") requests.back().model = specialist;
   }
   auto outcomes = co_await context.DelegateAsync(batch, requests);
   if (!outcomes.Succeeded()) co_return AgentResult<RunCompletion>::Failure(outcomes.Error());
@@ -159,6 +186,11 @@ Async<RunCompletion> CompletePanel(RunContext context, std::string scenario) {
     Check(replayed.size() == outcomes.Value().size(), "delegation replay changed batch size");
     for (std::size_t index = 0; index < replayed.size(); ++index)
       Check(replayed[index].run == outcomes.Value()[index].run, "delegation replay created a child");
+    if (scenario == "private parent prompt") {
+      requests.back().model.reset();
+      Check(FailedWith(co_await context.DelegateAsync(batch, requests), ErrorCode::Conflict), "a replay changed the requested model");
+      requests.back().model = specialist;
+    }
     requests.front().input.text += " changed";
     Check(FailedWith(co_await context.DelegateAsync(batch, requests), ErrorCode::Conflict), "changed command was accepted");
   }
@@ -187,7 +219,9 @@ std::shared_ptr<AgentRuntime> Register(std::shared_ptr<Probe> probe, std::size_t
       .principal = [] { return AgentResult<PrincipalId>::Success({"operator"}); },
       .access = [probe](PolicyRequest request) -> Async<PolicyDecision> {
         auto decision = AccessDecision::Allow;
-        if (request.capability == Capability::DelegateRun && probe->block_delegation) decision = AccessDecision::Deny;
+        if (request.capability == Capability::DelegateRun &&
+            (probe->block_delegation || (probe->deny_specialist && request.recipient_model == specialist.id)))
+          decision = AccessDecision::Deny;
         if (request.capability == Capability::ExecuteTool && request.tool && request.tool->id == shared_tool) {
           const bool parent = request.actor.agent &&
               (request.actor.agent->id.value == "parent" || request.actor.agent->id.value == "model-parent");
@@ -195,9 +229,24 @@ std::shared_ptr<AgentRuntime> Register(std::shared_ptr<Probe> probe, std::size_t
           else if (parent && probe->ask) decision = AccessDecision::RequireConfirmation;
         }
         co_return AgentResult<PolicyDecision>::Success({decision, "Test policy"});
+      }, .artifact_store = {
+          .open = [](ArtifactResolveRequest) -> Async<AsyncInputStream> {
+            co_return AgentResult<AsyncInputStream>::Success(AsyncInputStream::FromReader(
+                [done = false](std::stop_token, std::size_t) mutable -> Task<IoResult<Bytes>> {
+                  co_return IoResult<Bytes>::Success(std::exchange(done, true) ? Bytes{} : Bytes{std::byte{0x42}});
+                }));
+          },
+          .resolve_staged_attachment = [](ActionParty, SessionId, ArtifactId id) -> Async<ArtifactDraft> {
+            co_return AgentResult<ArtifactDraft>::Success(
+                {.id = std::move(id), .type = "image/png", .name = "Expert fixture", .storage_handle = "image", .size_bytes = 1});
+          },
       }, .store = std::move(store), .max_delegation_depth = depth, .max_parallel_delegates = parallel}));
   Take(runtime->RegisterModel({.ref = {{"model"}, 1}, .endpoint = {"test", "delegation", "script", {}},
       .provider = std::make_shared<Model>(probe)}));
+  Take(runtime->RegisterModel({.ref = specialist, .endpoint = {"test", "specialist", "script", {}},
+      .provider = std::make_shared<Model>(probe)}));
+  Take(runtime->RegisterModel({.ref = limited_model, .endpoint = {"test", "limited", "script", {}},
+      .provider = std::make_shared<Model>(probe, false)}));
   for (const auto& id : {shared_tool, private_tool}) {
     Take(runtime->RegisterTool({.id = id, .version = 1, .description = "Test tool", .input_schema = {JsonValue{true}},
         .effect = probe->lose_tool_result ? ToolEffect::ExternalSubmit : ToolEffect::Read,
@@ -235,7 +284,7 @@ std::shared_ptr<AgentRuntime> Register(std::shared_ptr<Probe> probe, std::size_t
         co_return AgentResult<RunCompletion>::Success({"Nested expert completed"});
       }}));
   Take(runtime->RegisterAgent({.definition = {.ref = {{"expert"}, 1}, .display_name = "Expert", .model = {"model"},
-      .tools = {shared_tool, private_tool}},
+      .tools = {shared_tool, private_tool}, .requires_model = {.text_stream = true}},
       .run = [probe](RunContext context, RunInput input) -> Async<RunCompletion> {
         ++probe->admitted;
         if (input.input.text == "structured") co_return AgentResult<RunCompletion>::Success({"Structured result", JsonValue{true}});
@@ -369,6 +418,37 @@ Task<void> VerifyCancellation() {
   Take(co_await runtime->CloseAsync());
 }
 
+Task<void> VerifyModelOverrideRejection() {
+  const std::vector<std::pair<std::string, ErrorCode>> cases{
+      {"unavailable override", ErrorCode::NotFound}, {"incompatible override", ErrorCode::Unsupported},
+      {"denied override", ErrorCode::PermissionDenied}, {"unrelated attachment", ErrorCode::PermissionDenied}};
+  for (const auto& [scenario, code] : cases) {
+    auto probe = std::make_shared<Probe>();
+    probe->deny_specialist = scenario == "denied override";
+    auto runtime = Register(probe, 2);
+    auto session = Take(co_await Start(runtime, scenario));
+    auto result = co_await Wait(session, Idle);
+    Check(result->runs.size() == 1 && result->runs.front().failure && result->runs.front().failure->code == code &&
+        probe->models_used.empty(), "an invalid delegated model or input created a child");
+    Take(co_await runtime->CloseAsync());
+  }
+}
+
+Task<void> VerifyDelegatedAttachment() {
+  auto probe = std::make_shared<Probe>();
+  auto runtime = Register(probe, 2);
+  Take(co_await runtime->StartAsync());
+  const auto created = Take(co_await runtime->Sessions().CreateAsync(NewCommandId(), {
+      .options = {.agent = {"parent"}, .retention = SessionRetention::Ephemeral},
+      .initial = SendInput{.text = "image attachment", .staged_attachments = {image_attachment.id}}}));
+  const auto session = Take(co_await runtime->Sessions().OpenAsync(std::get<SessionCreated>(created.outcome).session));
+  auto result = co_await Wait(session, Idle);
+  Check(result->runs.size() == 2 && result->runs.back().state == RunState::Succeeded &&
+      probe->models_used == std::vector{specialist} && probe->attachments_used == std::vector{image_attachment},
+      "the delegate did not receive the exact image on the selected model");
+  Take(co_await runtime->CloseAsync());
+}
+
 Task<void> VerifyRevocation() {
   auto probe = std::make_shared<Probe>();
   probe->ask = true;
@@ -403,17 +483,22 @@ Task<void> VerifyRetryWithUnknownChildEffect() {
 Task<void> VerifyRecovery(File file, bool model_driven) {
   auto probe = std::make_shared<Probe>();
   probe->ask = true;
-  auto runtime = Register(probe, 1, Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)));
+  auto store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
+  auto runtime = Register(probe, 1, std::move(store));
   auto session = Take(co_await Start(runtime, model_driven ? "recover model panel" : "private parent prompt",
       model_driven ? "model-parent" : "parent", SessionRetention::Stored));
   auto waiting = co_await Wait(session, [](const auto& snapshot) { return PendingInteractions(snapshot).size() == 1; });
   const auto approval = PendingInteractions(*waiting).front();
   const auto id = waiting->summary.id;
   Check(waiting->runs.size() == 3 && probe->admitted == 1 && probe->writes == 0, "queued expert started before recovery");
+  if (!model_driven) Check(waiting->runs[2].model == specialist, "the queued expert did not pin the requested model");
   Take(co_await runtime->CloseAsync());
   session.reset();
   runtime.reset();
-  runtime = Register(probe, 1, Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file)));
+  store = Take(co_await agentkit_host::OpenSqliteSessionStoreAsync(file));
+  runtime = Register(probe, 1, std::move(store));
+  Take(runtime->RegisterModel({.ref = {specialist.id, 2}, .endpoint = {"test", "specialist", "script", {}},
+      .provider = std::make_shared<Model>(probe)}));
   Take(co_await runtime->StartAsync());
   session = Take(co_await runtime->Sessions().OpenAsync(id));
   auto recovered = co_await Wait(session, [&](const auto& snapshot) {
@@ -429,6 +514,8 @@ Task<void> VerifyRecovery(File file, bool model_driven) {
       result->runs[2].state == RunState::Succeeded && result->runs[2].id == waiting->runs[2].id &&
       probe->writes == 1 && probe->admitted == 2, "recovered batch duplicated work or failed to consume the queued expert");
   if (model_driven) Check(probe->checked_model_result, "model did not receive the restored delegation result");
+  else Check(result->runs[2].model == specialist && probe->models_used == std::vector{specialist},
+      "the restored expert called a different model revision");
   Take(co_await runtime->CloseAsync());
 }
 
@@ -444,6 +531,8 @@ int main() {
           try {
             co_await VerifyModelPanel();
             co_await VerifyBudgetsAndScope();
+            co_await VerifyModelOverrideRejection();
+            co_await VerifyDelegatedAttachment();
             co_await VerifyCancellation();
             co_await VerifyRevocation();
             co_await VerifyRetryWithUnknownChildEffect();

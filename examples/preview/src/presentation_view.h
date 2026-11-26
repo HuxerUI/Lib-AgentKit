@@ -23,8 +23,12 @@ using PresentationReviewPages = std::map<std::pair<huxerui::agentkit::ArtifactId
 using OpenPresentationLocation = std::function<void(PresentationLocation)>;
 
 huxerui::View ImportReportControl(std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime,
-    huxerui::agentkit::ProjectId project, std::function<void(ImportedPresentationReport)> imported,
-    std::optional<huxerui::State<std::string>> draft_error = {});
+    huxerui::agentkit::ProjectId project, std::function<void(ImportedPresentationReport)> imported);
+
+huxerui::Task<void> PickPresentationReport(std::shared_ptr<huxerui::FilePicker> picker,
+    std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime, huxerui::agentkit::ProjectId project,
+    std::function<void(ImportedPresentationReport)> imported, huxerui::State<bool> busy, huxerui::State<std::string> error);
+
 huxerui::View SharedReportsDialog(huxerui::DialogContext dialog,
     std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime, huxerui::agentkit::ProjectId project);
 

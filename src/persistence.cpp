@@ -190,7 +190,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(SkillActivation, skill, trigger)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(RunSteerSnapshot, message, state, reason)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(RunTiming, started_at, ended_at, waiting_for_input, input_wait_started_at)
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(ModelContextUsage, estimated_input_tokens, input_budget_tokens, before_compaction_tokens)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ModelContextUsage, estimated_input_tokens, input_budget_tokens,
+    before_compaction_tokens, context_window_tokens)
 
 void to_json(nlohmann::json& wire, const RunSnapshot& run) {
   wire["id"] = run.id;
@@ -362,7 +363,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(FormRecord, request, stamp, result)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(HostToolRecord, request, ref, stamp, call, result, failure)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(StoredArtifact, record, handle)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(StoredCollaboration, record, auto_start, scope, steer_message, goal)
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DelegatedRun, budget, expected_result, started)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(DelegatedRun, budget, expected_result, started, requested_model)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(HostedModelStep, input_index, allowed_tools, published, include_catalog_tools)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ModelHistory, messages, summarized, summary, edited)
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(StoredRun, view, principal, input, deadline, prepared_tool,
@@ -1331,8 +1332,11 @@ Async<void> RuntimeState::LoadStored() {
     }
     auto session = DecodeStoredSession(row, tools);
     if (!session.Succeeded()) co_return AgentResult<void>::Failure(session.Error());
-    for (const auto& run : session.Value().runs) {
+    for (auto& run : session.Value().runs) {
       if (!run_ids.insert(run.view.id).second) co_return Fail<void>(ErrorCode::PersistenceFailure, "Duplicate stored run");
+      if (auto& usage = run.view.context_usage; usage && !usage->context_window_tokens) {
+        if (const auto* model = ResolveModel(run.view.model)) usage->context_window_tokens = model->context_limits.context_window;
+      }
     }
     for (const auto& item : session.Value().commands) {
       if (!command_keys.emplace(item.principal, item.record.progress.accepted.command).second) {

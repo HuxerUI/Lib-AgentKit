@@ -22,6 +22,8 @@ struct PreviewSettings {
   std::optional<huxerui::agentkit::ModelProviderRef> image_model;
   std::optional<huxerui::agentkit::ModelProviderRef> review_model;
   std::optional<huxerui::agentkit::ModelProviderRef> image_generation_model;
+  std::optional<huxerui::agentkit::ModelProviderRef> research_model;
+  std::optional<huxerui::agentkit::ModelProviderRef> verification_model;
   LocalFilePermissions file_access;
   std::vector<McpServer> mcp_servers;
 
@@ -30,11 +32,13 @@ struct PreviewSettings {
 
 huxerui::agentkit::Async<PreviewSettings> ReadPreviewSettings(huxerui::File file);
 huxerui::agentkit::Async<void> SavePreviewSettings(huxerui::File file, PreviewSettings settings);
+void ClearRetiredModelRoles(PreviewSettings& settings, const RunSettings& models);
 std::string WithReplyPreferences(std::string instructions, const PreviewSettings& settings);
 huxerui::ThemeSpec PreviewThemeFor(const PreviewSettings& settings, huxerui::ThemeBrightness system);
 
 huxerui::View PreviewSettingsPage(huxerui::State<PreviewSettings> current, huxerui::State<PreviewSettings> applied,
     std::shared_ptr<RunSettings> models, huxerui::File file, AddModelProfile add_model, EditModelProfile edit_model,
+    RemoveModelProfile remove_model,
     std::function<void()> close, std::function<huxerui::agentkit::Async<void>(LocalFilePermissions)> apply_file_access,
     std::shared_ptr<ImportedSkillSource> imported_skills, std::shared_ptr<McpConnections> mcp,
     std::shared_ptr<huxerui::agentkit::AgentRuntime> runtime, huxerui::State<bool> busy);

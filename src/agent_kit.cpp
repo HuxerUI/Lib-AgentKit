@@ -115,7 +115,9 @@ Async<PolicyDecision> RuntimeState::Decide(PolicyRequest request) {
       const auto& session = sessions.at(child->view.session);
       auto delegation = Request(parent.principal, Capability::DelegateRun, &session, &parent);
       delegation.new_agent = child->view.agent.id;
+      delegation.recipient_model = child->view.model.id;
       delegation.sources = child->input.context;
+      for (const auto& ref : child->input.attachments) delegation.sources.push_back({ref});
       auto permission = co_await options.access(std::move(delegation));
       if (!permission.Succeeded()) co_return permission;
       if (stage != Stage::Started || parent.stop.stop_requested())

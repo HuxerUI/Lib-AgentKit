@@ -94,12 +94,14 @@ struct RunResume {
 struct DelegateRequest {
   /// Direct delegate declared on the parent agent.
   AgentId agent;
-  /// Task text and explicit sources to provide to the child.
+  /// Task text, explicit sources and selected versions of the parent's input attachments.
   SendInput input;
   /// Optional per-child limits bounded by the child and all ancestor constraints.
   Budget budget;
   /// Schema for the child's structured result, when required.
   std::optional<JsonSchema> expected_result;
+  /// Optional exact model registration authorized for the child. Defaults to the delegate's registered model.
+  std::optional<ModelProviderRef> model;
   /// Compares the stored fields for equality.
   bool operator==(const DelegateRequest&) const = default;
 };
@@ -128,6 +130,10 @@ public:
   /// @brief Returns the current Run ID.
   /// @return The stable ID of the Run bound to this context.
   RunId Id() const;
+
+  /// @brief Returns the exact model registration bound to this Run.
+  /// @return The model and revision pinned when this Run was accepted.
+  ModelProviderRef Model() const;
 
   /// @brief Returns artifact operations bound to the Run's actor.
   ArtifactChanges Artifacts() const;

@@ -16,20 +16,60 @@ def stream(content):
 
 def verify(executable, fixture):
     calls = []
+    probes = []
+    expert_calls = []
     lock = threading.Lock()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass
 
+        def do_GET(self):
+            if (self.path != "/original/v1/models"
+                    or self.headers.get("Authorization") != "Bearer revision-fixture-key-original"):
+                self.send_error(403)
+                return
+            body = json.dumps({"data": [{"id": "editable-chat"}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def send_stream(self, content):
+            body = stream(content)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_POST(self):
             endpoint = self.path.split("/")[1]
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if self.path == "/expert/v1/chat/completions":
+                self.handle_expert_request(request)
+                return
+            probe = request.get("messages") == [{"role": "user", "content": "Reply with OK."}]
+            if (probe and self.path == "/original/v1/chat/completions" and request.get("model") == "editable-chat"
+                    and self.headers.get("Authorization") == "Bearer invalid-fixture-key"):
+                with lock:
+                    probes.append("rejected")
+                self.send_error(401)
+                return
             if (endpoint not in ("original", "updated") or self.path != f"/{endpoint}/v1/chat/completions"
                     or request.get("model") != "editable-chat"
                     or self.headers.get("Authorization") != f"Bearer revision-fixture-key-{endpoint}"):
                 print(f"Unexpected endpoint, model or credential for {self.path}", file=sys.stderr)
                 self.send_error(403)
+                return
+            if probe:
+                if "tools" in request or "response_format" in request or endpoint != "original":
+                    self.send_error(400)
+                    return
+                with lock:
+                    probes.append("verified")
+                self.send_stream("OK")
                 return
             classify = "response_format" in request
             with lock:
@@ -49,12 +89,32 @@ def verify(executable, fixture):
                 content = "Original endpoint reply."
             else:
                 content = f"Updated endpoint reply {number}."
-            body = stream(content)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self.send_stream(content)
+
+        def handle_expert_request(self, request):
+            if self.headers.get("Authorization") != "Bearer revision-fixture-key-original":
+                self.send_error(401)
+                return
+            model = request.get("model")
+            messages = request.get("messages", [])
+            text = json.dumps(messages)
+            if "Classify this request" in text:
+                phase, content = "route", '{"route":"expert-team"}'
+            elif "Plan two independent" in text:
+                phase, content = "plan", json.dumps(
+                    {"research": "Find research evidence.", "verification": "Check verification evidence.", "parent_action": False})
+            elif "Find research evidence." in text and "Inspect the relevant sources" in text:
+                phase, content = "research", "Research evidence."
+            elif "Check verification evidence." in text and "Independently check behavior" in text:
+                phase, content = "verification", "Verification evidence."
+            elif "Research evidence." in text and "Verification evidence." in text:
+                phase, content = "conclusion", "Both experts reported evidence."
+            else:
+                self.send_error(400)
+                return
+            with lock:
+                expert_calls.append((phase, model))
+            self.send_stream(content)
 
     with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
         worker = threading.Thread(target=server.serve_forever)
@@ -71,6 +131,12 @@ def verify(executable, fixture):
     expected = [("original", True), ("original", False)] + [("updated", True), ("updated", False)] * 2
     if calls != expected:
         raise RuntimeError(f"Unexpected endpoint sequence: {calls}")
+    if probes != ["rejected", "verified", "verified"]:
+        raise RuntimeError(f"Unexpected connection checks: {probes}")
+    if sorted(expert_calls) != sorted([
+            ("route", "expert-verification"), ("plan", "expert-verification"), ("research", "expert-research"),
+            ("verification", "expert-verification"), ("conclusion", "expert-verification")]):
+        raise RuntimeError(f"Unexpected expert model calls: {expert_calls}")
     return 0
 
 

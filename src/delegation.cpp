@@ -177,7 +177,8 @@ void RuntimeState::ScheduleDelegates(SessionData& session) {
   });
 }
 
-Async<void> RuntimeState::CheckDelegation(const RunExecution& parent, const DelegateRequest& request) {
+Async<void> RuntimeState::CheckDelegation(const RunExecution& parent, const DelegateRequest& request,
+    const ModelProviderRef& model) {
   if (stage != Stage::Started || parent.stop.stop_requested() || Terminal(parent.view.state)) {
     co_return Fail<void>(ErrorCode::AlreadyClosed, "The delegating run has ended");
   }
@@ -185,6 +186,11 @@ Async<void> RuntimeState::CheckDelegation(const RunExecution& parent, const Dele
   const auto& definition = agents.at(parent.view.agent.id);
   if (std::ranges::find(definition.delegates, request.agent) == definition.delegates.end()) {
     co_return Fail<void>(ErrorCode::PermissionDenied, "The target agent is outside the delegation allowlist");
+  }
+  if (std::ranges::any_of(request.input.attachments, [&](const auto& ref) {
+        return std::ranges::find(parent.input.attachments, ref) == parent.input.attachments.end();
+      })) {
+    co_return Fail<void>(ErrorCode::PermissionDenied, "The delegated attachments are outside the parent input");
   }
   std::size_t depth = 1;
   for (auto* current = &parent; current; current = Parent(*this, *current), ++depth) {
@@ -201,10 +207,16 @@ Async<void> RuntimeState::CheckDelegation(const RunExecution& parent, const Dele
   if (parent.deadline && *parent.deadline <= Now()) co_return Fail<void>(ErrorCode::DeadlineExceeded, "The delegating run expired");
   auto access = Request(parent.principal, Capability::DelegateRun, &session, &parent);
   access.new_agent = request.agent;
+  access.recipient_model = model.id;
   access.sources = request.input.context;
+  for (const auto& ref : request.input.attachments) access.sources.push_back({ref});
   auto allowed = co_await Require(access);
   if (!allowed.Succeeded()) co_return allowed;
-  co_return co_await ValidateInputSources(session, std::move(access.actor), request.input.context);
+  allowed = co_await ValidateInputSources(session, access.actor, request.input.context);
+  if (!allowed.Succeeded()) co_return allowed;
+  auto attachments = co_await ResolveModelAttachments(session, std::move(access.actor), request.input.attachments, model);
+  if (!attachments.Succeeded()) co_return AgentResult<void>::Failure(attachments.Error());
+  co_return AgentResult<void>::Success();
 }
 
 Async<std::vector<DelegateOutcome>> RuntimeState::Delegate(RunId id, CommandId command, std::vector<DelegateRequest> requests) {
@@ -215,9 +227,15 @@ Async<std::vector<DelegateOutcome>> RuntimeState::Delegate(RunId id, CommandId c
     co_return Fail<std::vector<DelegateOutcome>>(ErrorCode::InvalidArgument, "A delegation command requires 1 to 32 requests");
   }
   if (parent.waiting_for_delegates) co_return Fail<std::vector<DelegateOutcome>>(ErrorCode::Busy, "A delegation is already being awaited");
+  auto prior = parent.delegations.find(command);
+  if (prior != parent.delegations.end() && prior->second.size() != requests.size())
+    co_return Fail<std::vector<DelegateOutcome>>(ErrorCode::Conflict, "The delegation command changed");
   const auto access_at = access_revision;
-  for (const auto& request : requests) {
-    auto valid = CheckInput(request.input);
+  std::vector<ModelProviderRef> selected;
+  selected.reserve(requests.size());
+  for (std::size_t index = 0; index < requests.size(); ++index) {
+    const auto& request = requests[index];
+    auto valid = CheckInput(request.input, false, false, true);
     if (!valid.Succeeded()) co_return Result::Failure(valid.Error());
     if (request.budget.deadline && *request.budget.deadline <= Duration::zero()) {
       co_return Fail<std::vector<DelegateOutcome>>(ErrorCode::InvalidArgument, "A child deadline must be positive");
@@ -226,26 +244,44 @@ Async<std::vector<DelegateOutcome>> RuntimeState::Delegate(RunId id, CommandId c
       valid = ValidateJson(request.expected_result->document, JsonSchema{JsonValue{true}});
       if (!valid.Succeeded()) co_return Result::Failure(valid.Error());
     }
-    auto allowed = co_await CheckDelegation(parent, request);
+    if (prior != parent.delegations.end()) {
+      const auto& child = runs.at(prior->second[index]);
+      if (request != DelegateRequest{child.view.agent.id, child.input, child.delegate->budget,
+            child.delegate->expected_result, child.delegate->requested_model}) {
+        co_return Fail<std::vector<DelegateOutcome>>(ErrorCode::Conflict, "The delegation command changed");
+      }
+      selected.push_back(child.view.model);
+    } else {
+      const auto agent = agents.find(request.agent);
+      if (agent == agents.end())
+        co_return Fail<std::vector<DelegateOutcome>>(ErrorCode::PermissionDenied, "The target agent is outside the delegation allowlist");
+      if (request.model && (request.model->id.value.empty() || !request.model->version))
+        co_return Fail<std::vector<DelegateOutcome>>(ErrorCode::InvalidArgument, "A delegated model requires an ID and version");
+      const auto* model = request.model ? ResolveModel(*request.model) : LatestModel(agent->second.model);
+      if (!model) co_return Fail<std::vector<DelegateOutcome>>(ErrorCode::NotFound, "The delegated model registration is unavailable");
+      auto required = agent->second.requires_model;
+      if (!workflows.contains(request.agent)) {
+        required.tool_calls |= !agent->second.tools.empty() || !agent->second.tool_catalogs.empty() || !agent->second.delegates.empty();
+        required.structured_output |= request.expected_result.has_value();
+      }
+      if (!Supports(model->provider->Capabilities(), required))
+        co_return Fail<std::vector<DelegateOutcome>>(ErrorCode::Unsupported, "The selected model lacks capabilities required by the delegate");
+      selected.push_back(model->ref);
+    }
+    auto allowed = co_await CheckDelegation(parent, request, selected.back());
     if (!allowed.Succeeded()) co_return Result::Failure(allowed.Error());
   }
   if (access_at != access_revision) co_return Fail<std::vector<DelegateOutcome>>(ErrorCode::Conflict, "Delegation access changed");
   if (parent.stop.stop_requested()) co_return Fail<std::vector<DelegateOutcome>>(ErrorCode::AlreadyClosed, "The delegating run has ended");
   if (parent.waiting_for_delegates) co_return Fail<std::vector<DelegateOutcome>>(ErrorCode::Busy, "A delegation is already being awaited");
 
-  auto prior = parent.delegations.find(command);
   SessionData* goal_owner = nullptr;
-  if (prior != parent.delegations.end()) {
-    if (prior->second.size() != requests.size()) co_return Fail<std::vector<DelegateOutcome>>(ErrorCode::Conflict, "The delegation command changed");
-    for (std::size_t i = 0; i < requests.size(); ++i) {
-      const auto& child = runs.at(prior->second[i]);
-      if (requests[i] != DelegateRequest{child.view.agent.id, child.input, child.delegate->budget, child.delegate->expected_result}) {
-        co_return Fail<std::vector<DelegateOutcome>>(ErrorCode::Conflict, "The delegation command changed");
-      }
-    }
-  } else {
+  if (prior == parent.delegations.end()) {
+    if (parent.delegations.contains(command))
+      co_return Fail<std::vector<DelegateOutcome>>(ErrorCode::Conflict, "The delegation command was accepted concurrently");
     auto& batch = parent.delegations[command];
-    for (auto& request : requests) {
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+      auto& request = requests[index];
       const auto child_id = RunId{MakeId()};
       const auto& agent = agents.at(request.agent);
       auto deadline = parent.deadline;
@@ -258,11 +294,13 @@ Async<std::vector<DelegateOutcome>> RuntimeState::Delegate(RunId id, CommandId c
       tighten(agent.budget.deadline);
       tighten(request.budget.deadline);
       std::vector<ModelItem> items{ModelContent{ModelContent::Role::User, request.input.text}};
-      RunSnapshot view{.id = child_id, .session = session.summary.id, .agent = agent.ref, .model = LatestModel(agent.model)->ref,
+      for (const auto& ref : request.input.attachments) items.emplace_back(ModelContent{ModelContent::Role::User, ref});
+      RunSnapshot view{.id = child_id, .session = session.summary.id, .agent = agent.ref, .model = std::move(selected[index]),
           .trigger = RunTrigger::Delegation, .parent = id, .goal = parent.view.goal, .state = RunState::WaitingForDependency, .usage = {}};
       auto& child = runs.emplace(child_id, RunExecution{.view = std::move(view), .principal = parent.principal, .input = std::move(request.input),
           .items = std::move(items), .model_boundary = true, .deadline = deadline,
-          .delegate = DelegatedRun{std::move(request.budget), std::move(request.expected_result)}}).first->second;
+          .delegate = DelegatedRun{.budget = std::move(request.budget), .expected_result = std::move(request.expected_result),
+              .requested_model = std::move(request.model)}}).first->second;
       if (parent.view.goal) goal_owner = AttachGoalRun(child, parent.view.goal);
       batch.push_back(child_id);
       session.runs.push_back(child_id);

@@ -7,6 +7,7 @@
 #include "preview_json.h"
 #include "preview_theme.h"
 #include "report_chart.h"
+#include "../../../support/token_count.h"
 
 #include <huxerui/huxerui.h>
 
@@ -15,7 +16,9 @@
 #include <charconv>
 #include <cctype>
 #include <initializer_list>
+#include <limits>
 #include <span>
+#include <tuple>
 
 namespace agentkit_preview {
 namespace {
@@ -175,7 +178,8 @@ bool SupportsImageInput(std::string_view protocol) {
   return protocol.empty() || protocol == "chat-completions" || protocol == "generate-content" || protocol == "interactions";
 }
 
-void RunSettings::AddModel(const kit::ModelRegistration& registration, std::string label, ModelLimits limits, bool editable) {
+void RunSettings::AddModel(const kit::ModelRegistration& registration, std::string label, ModelLimits limits, bool editable,
+    ModelExpertPreferences experts) {
   if (std::ranges::find(models_, registration.ref, &ModelChoice::ref) != models_.end()) return;
   const auto& endpoint = registration.endpoint;
   auto name = label.empty() ? endpoint.model : std::move(label);
@@ -189,8 +193,9 @@ void RunSettings::AddModel(const kit::ModelRegistration& registration, std::stri
     if (uri && uri->Authority()) location = std::string(*uri->Authority()) + std::string(uri->Path());
   }
   const auto caps = registration.provider->Capabilities();
+  if (limits == ModelLimits{}) limits = registration.context_limits;
   models_.push_back({registration.ref, name, std::move(name), registration.ref != DemoModel,
-      caps.text_stream && caps.structured_output, caps, std::move(location), endpoint, limits, editable});
+      caps.text_stream && caps.structured_output, caps, std::move(location), endpoint, limits, editable, experts});
   auto& version = model_versions_[registration.ref.id];
   version = std::max(version, registration.ref.version);
   model_revision_ = model_revision_.Get() + 1;
@@ -201,13 +206,31 @@ void RunSettings::SetDefaults(kit::ModelProviderRef general, std::optional<kit::
   code_ = std::move(code);
 }
 
+void RunSettings::RetireModel(const kit::ModelId& id) {
+  if (retired_models_.insert(id).second) model_revision_ = model_revision_.Get() + 1;
+}
+
+bool RunSettings::IsRetired(const kit::ModelId& id) const {
+  static_cast<void>(model_revision_.Get());
+  return retired_models_.contains(id);
+}
+
+bool RunSettings::HasRetiredDefault(const kit::AgentId& agent) const {
+  return agent == CodeAgent ? code_ && IsRetired(code_->id) : IsRetired(general_.id);
+}
+
 std::optional<kit::ModelProviderRef> RunSettings::DefaultModel(const kit::AgentId& agent) const {
-  return CurrentModel(agent == CodeAgent ? code_ : std::optional{general_});
+  if (!HasRetiredDefault(agent)) return CurrentModel(agent == CodeAgent ? code_ : std::optional{general_});
+  const auto choices = Models(agent);
+  const auto first = std::ranges::find_if(choices, [](const ModelChoice& model) { return model.ref != DemoModel; });
+  if (first != choices.end()) return first->ref;
+  return agent == CodeAgent ? std::nullopt : std::optional{DemoModel};
 }
 
 std::optional<kit::ModelProviderRef> RunSettings::CurrentModel(std::optional<kit::ModelProviderRef> model) const {
   static_cast<void>(model_revision_.Get());
   if (model) {
+    if (retired_models_.contains(model->id)) return {};
     const auto version = model_versions_.find(model->id);
     if (version != model_versions_.end()) model->version = version->second;
   }
@@ -217,13 +240,48 @@ std::optional<kit::ModelProviderRef> RunSettings::CurrentModel(std::optional<kit
 std::vector<ModelChoice> RunSettings::Models(const kit::AgentId& agent) const {
   static_cast<void>(model_revision_.Get());
   std::vector<ModelChoice> result;
+  const bool expert = agent == ResearchExpert || agent == VerificationExpert;
   std::ranges::copy_if(models_, std::back_inserter(result), [&](const ModelChoice& choice) {
-    return choice.ref.version == model_versions_.at(choice.ref.id) && choice.suitable && (agent != CodeAgent || choice.code);
+    return !retired_models_.contains(choice.ref.id) && choice.ref.version == model_versions_.at(choice.ref.id) &&
+        (expert ? choice.ref != DemoModel && choice.capabilities.text_stream && choice.capabilities.tool_calls :
+            choice.suitable && (agent != CodeAgent || choice.code));
   });
   for (auto& choice : result) {
     if (std::ranges::count(result, choice.name, &ModelChoice::name) > 1) choice.label += separator + choice.endpoint;
   }
   return result;
+}
+
+std::optional<kit::ModelProviderRef> RunSettings::SelectExpertModel(const kit::AgentId& expert,
+    const std::optional<kit::ModelProviderRef>& preferred, const kit::ModelProviderRef& parent,
+    kit::ModelCapabilities required, std::size_t task_bytes) const {
+  const auto enough_context = [input = task_bytes / 3 + 2048](const ModelLimits& limits) {
+    return (!limits.max_input_tokens || *limits.max_input_tokens >= input) &&
+        (!limits.context_window || *limits.context_window >= input + 512);
+  };
+  const auto eligible = [&](const ModelChoice& choice) {
+    const auto& caps = choice.capabilities;
+    return choice.ref != DemoModel && caps.text_stream && caps.tool_calls &&
+        (!required.image_input || caps.image_input) && (!required.file_input || caps.file_input) && enough_context(choice.limits);
+  };
+  const auto rank = [&](const ModelChoice& choice) {
+    const auto& strengths = choice.experts;
+    const bool research = expert == ResearchExpert;
+    return std::tuple{required.image_input ? strengths.vision : ModelStrength::Unknown,
+        research ? strengths.code : strengths.reasoning, research ? strengths.reasoning : strengths.code,
+        choice.limits.context_window.value_or(0), choice.ref == parent};
+  };
+  const auto choices = Models(expert);
+  const ModelChoice* best = nullptr;
+  for (const auto& choice : choices) {
+    if (!eligible(choice)) continue;
+    if (preferred && choice.ref.id == preferred->id) return choice.ref;
+    if (choice.experts.automatic && (!best || rank(choice) > rank(*best))) best = &choice;
+  }
+  if (best) return best->ref;
+  const auto current = std::ranges::find(models_, parent, &ModelChoice::ref);
+  if (current != models_.end() && !IsRetired(parent.id) && eligible(*current)) return parent;
+  return {};
 }
 
 StringVariant RunSettings::ModelLabel(const std::optional<kit::ModelProviderRef>& ref) const {
@@ -354,21 +412,48 @@ using LimitFields = std::array<TextEditingValue, 3>;
 using CatalogSelection = std::map<std::string, LimitFields, std::less<>>;
 
 LimitFields EditLimits(const ModelLimits& limits = {}) {
-  const auto field = [](auto value) { return TextEditingValue::FromText(value ? std::to_string(*value) : ""); };
+  const auto field = [](auto value) {
+    return TextEditingValue::FromText(value ? kit::detail::FormatTokenCount(*value, true) : "");
+  };
   return {field(limits.context_window), field(limits.max_input_tokens), field(limits.max_output_tokens)};
 }
 
-ModelLimits ReadLimits(const LimitFields& fields) {
-  const auto read = [](const TextEditingValue& field) -> std::optional<std::uint64_t> {
-    if (field.text.empty()) return {};
-    const auto* end = field.text.data() + field.text.size();
-    std::uint64_t amount = 0;
-    const auto parsed = std::from_chars(field.text.data(), end, amount);
-    if (parsed.ec != std::errc{} || parsed.ptr != end || !amount)
-      throw std::invalid_argument("Token limits must be positive whole numbers.");
-    return amount;
+std::optional<std::uint64_t> ReadTokenLimit(std::string text) {
+  text = TrimModelField(std::move(text));
+  if (text.empty()) return {};
+  std::string_view number(text);
+  unsigned digits = 0;
+  if (number.back() == 'k' || number.back() == 'K') digits = 3;
+  if (number.back() == 'm' || number.back() == 'M') digits = 6;
+  if (digits) number.remove_suffix(1);
+  const auto read_integer = [](std::string_view input) {
+    std::uint64_t value = 0;
+    const auto result = std::from_chars(input.data(), input.data() + input.size(), value);
+    if (result.ec != std::errc{} || result.ptr != input.data() + input.size())
+      throw std::invalid_argument("Invalid token count");
+    return value;
   };
-  return {read(fields[0]), read(fields[1]), read(fields[2])};
+  const auto decimal = number.find('.');
+  const auto whole = read_integer(number.substr(0, decimal));
+  std::uint64_t fraction = 0;
+  if (decimal != number.npos) {
+    auto tail = number.substr(decimal + 1);
+    if (!digits || tail.empty()) throw std::invalid_argument("Invalid token count precision");
+    while (!tail.empty() && tail.back() == '0') tail.remove_suffix(1);
+    if (tail.size() > digits) throw std::invalid_argument("Token count must be a whole number");
+    if (!tail.empty()) {
+      fraction = read_integer(tail);
+      for (auto places = tail.size(); places < digits; ++places) fraction *= 10;
+    }
+  }
+  const std::uint64_t scale = digits == 6 ? 1'000'000 : digits == 3 ? 1'000 : 1;
+  if ((!whole && !fraction) || whole > (std::numeric_limits<std::uint64_t>::max() - fraction) / scale)
+    throw std::invalid_argument("Token count is outside the supported range");
+  return whole * scale + fraction;
+}
+
+ModelLimits ReadLimits(const LimitFields& fields) {
+  return {ReadTokenLimit(fields[0].text), ReadTokenLimit(fields[1].text), ReadTokenLimit(fields[2].text)};
 }
 
 View ModelLimitFields(const LimitFields& fields, bool enabled, const ColorScheme& colors,
@@ -378,12 +463,37 @@ View ModelLimitFields(const LimitFields& fields, bool enabled, const ColorScheme
   std::vector<View> row;
   for (std::size_t i = 0; i < fields.size(); ++i) {
     auto input = TextField(fields[i]).Label(strings[i]).Placeholder(::app::strings::ui_model_limit_unknown)
-        .Variant(TextFieldVariant::Outlined).InputConfiguration({.type = TextInputType::Number})
+        .Variant(TextFieldVariant::Outlined)
         .OnChanged([change, i](const TextEditingValue& value) { change(i, value); })
         .With(Enabled(enabled)).Key("model-limit-" + std::to_string(i));
     row.push_back(PreviewLabeledField(strings[i], std::move(input), colors).With(Grow()));
   }
-  return Row(std::move(row)).With(Spacing(6.0F));
+  return Column{Row(std::move(row)).With(Spacing(6.0F)),
+      Text(::app::strings::ui_model_token_limit_hint, TextRole::Label).With(Foreground(colors.on_surface_variant)),
+  }.With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch));
+}
+
+struct ModelConnectionCheck {
+  std::string model;
+  bool running = false;
+  std::optional<kit::AgentError> error;
+
+  bool operator==(const ModelConnectionCheck&) const = default;
+};
+
+StringVariant ConnectionCheckMessage(const ModelConnectionCheck& check) {
+  using namespace ::app::strings;
+  if (check.running) return ui_testing_model_connection;
+  if (!check.error) return ui_model_connection_available;
+  const auto& error = *check.error;
+  if (error.provider_code == "missing_key_environment") return ui_model_connection_missing_key;
+  if (error.code == kit::ErrorCode::InvalidArgument) return ui_model_connection_invalid_configuration;
+  if (error.code == kit::ErrorCode::PermissionDenied) return ui_model_connection_auth_failed;
+  if (error.code == kit::ErrorCode::RateLimited) return ui_model_connection_rate_limited;
+  if (error.code == kit::ErrorCode::DeadlineExceeded) return ui_model_connection_timed_out;
+  if (error.provider_code == "404") return ui_model_connection_not_found;
+  if (error.code == kit::ErrorCode::ProtocolError) return ui_model_connection_no_reply;
+  return ui_model_connection_failed;
 }
 
 [[huxerui::composable]]
@@ -404,12 +514,13 @@ View AddModelDialog(DialogContext dialog, AddModelProfile add_model, std::functi
   const auto reasoning_summary = UseState(false);
   const auto fetching = UseState(false);
   const auto saving = UseState(false);
+  const auto check = UseState(ModelConnectionCheck{});
   const auto error = UseState(std::string{});
   const auto tasks = UseTaskScope();
   const auto application_tasks = UseApplicationTaskScope();
   const auto client = UseService<HttpClient>();
   const auto color = UseTheme().colors;
-  const auto busy = fetching.Get() || saving.Get();
+  const auto busy = fetching.Get() || saving.Get() || check->running;
   const auto invalid_limits = UseString(::app::strings::ui_model_token_limit_invalid);
   const auto profile = [format, url, api_key, image_input, file_input, reasoning_summary] {
     const auto api = model_api_formats.at(format.Get());
@@ -419,14 +530,29 @@ View AddModelDialog(DialogContext dialog, AddModelProfile add_model, std::functi
         .file_input = gemini && file_input.Get(),
         .reasoning_summary = std::string_view(api.protocol) == "responses" && reasoning_summary.Get()};
   };
-  const auto clear_catalog = [catalog, selected, show_catalog, error] {
+  const auto clear_catalog = [catalog, selected, show_catalog, error, check] {
     catalog = std::shared_ptr<const std::vector<DiscoveredModel>>{};
     selected = CatalogSelection{};
     show_catalog = false;
     error = "";
+    check = ModelConnectionCheck{};
   };
-  const auto fetch = [profile, client, tasks, fetching, saving, catalog, show_catalog, show_connection, search, error] {
-    if (!client || fetching.Get() || saving.Get()) return;
+  const auto test_connection = [profile, tasks, fetching, saving, check](std::string id) {
+    if (fetching.Get() || saving.Get() || check->running || id.empty()) return;
+    auto request = profile();
+    if (TrimModelField(request.base_url).empty()) return;
+    request.model = id;
+    check = ModelConnectionCheck{.model = std::move(id), .running = true};
+    tasks.Launch([request = std::move(request), check]() mutable -> Task<void> {
+      auto result = co_await TestModelConnection(std::move(request));
+      auto finished = check.Get();
+      finished.running = false;
+      if (!result.Succeeded()) finished.error = result.Error();
+      check = std::move(finished);
+    });
+  };
+  const auto fetch = [profile, client, tasks, fetching, saving, check, catalog, show_catalog, show_connection, search, error] {
+    if (!client || fetching.Get() || saving.Get() || check->running) return;
     fetching = true;
     error = "";
     tasks.Launch([request = profile(), client, fetching, catalog, show_catalog, show_connection, search, error]() mutable -> Task<void> {
@@ -439,9 +565,9 @@ View AddModelDialog(DialogContext dialog, AddModelProfile add_model, std::functi
       search = TextEditingValue::FromText({});
     });
   };
-  const auto save = [dialog, profile, add_model, select, model, limits, selected, show_catalog, api_key, saving, fetching,
+  const auto save = [dialog, profile, add_model, select, model, limits, selected, show_catalog, api_key, saving, fetching, check,
                      error, invalid_limits, show_limits, application_tasks] {
-    if (saving.Get() || fetching.Get()) return;
+    if (saving.Get() || fetching.Get() || check->running) return;
     std::vector<ModelProfileInput> entries;
     const auto make = [&entries, &profile](std::string name, const LimitFields& fields) {
       auto value = profile();
@@ -490,6 +616,16 @@ View AddModelDialog(DialogContext dialog, AddModelProfile add_model, std::functi
   const auto button_style = UseEnvironment<ButtonStyle>();
   const auto secondary = PreviewSecondaryButton(button_style, color);
   const auto primary = PreviewPrimaryButton(button_style, color);
+  const auto test_button = [test_connection, secondary, enabled = !busy && !TrimModelField(url->text).empty()](std::string id, std::string key) {
+    const bool valid = !id.empty();
+    return ProvideEnvironment(secondary, Button(::app::strings::ui_test_model_connection)
+        .OnClick([test_connection, id = std::move(id)] { test_connection(id); }).With(Enabled(enabled && valid)).Key(std::move(key)));
+  };
+  const auto test_status = [latest = check.Get(), color](std::string_view id) -> std::optional<View> {
+    if (id.empty() || latest.model != id) return {};
+    return Text(ConnectionCheckMessage(latest), TextRole::Label)
+        .With(Foreground(latest.error ? color.error : color.on_surface_variant)).Key("model-connection-status");
+  };
   auto fields = UseEnvironment<TextFieldStyle>();
   fields.show_label = false;
   const auto api = model_api_formats.at(format.Get());
@@ -558,17 +694,20 @@ View AddModelDialog(DialogContext dialog, AddModelProfile add_model, std::functi
     if (results.empty()) {
       content.push_back(Text(::app::strings::ui_no_catalog_models, TextRole::Label));
     } else {
-      content.push_back(VirtualList(std::move(results), [selected, busy, color](const DiscoveredModel& item) {
+      content.push_back(VirtualList(std::move(results), [selected, busy, color, test_button, test_status](const DiscoveredModel& item) {
         const auto pending = selected.Get();
         const auto entry = pending.find(item.id);
         const bool checked = entry != pending.end();
         const auto label = item.name == item.id ? item.id : item.name + separator + item.id;
-        std::vector<View> row{Checkbox(label, checked).OnChanged([selected, item](bool on) {
+        auto choice = Checkbox(label, checked).OnChanged([selected, item](bool on) {
           auto next = selected.Get();
           if (on) next.emplace(item.id, EditLimits(item.limits));
           else next.erase(item.id);
           selected = std::move(next);
-        }).With(Enabled(!busy), Tooltip(label)).Key("catalog-model/" + item.id)};
+        }).With(Grow(), Enabled(!busy), Tooltip(label)).Key("catalog-model/" + item.id);
+        std::vector<View> row{Row{std::move(choice), test_button(item.id, "test-model-connection/" + item.id)}
+            .With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Center))};
+        if (auto status = test_status(item.id)) row.push_back(std::move(*status));
         if (checked) row.push_back(ModelLimitFields(entry->second, !busy, color, [selected, id = item.id](std::size_t i, TextEditingValue value) {
           auto next = selected.Get();
           if (auto entry = next.find(id); entry != next.end()) {
@@ -583,8 +722,12 @@ View AddModelDialog(DialogContext dialog, AddModelProfile add_model, std::functi
     }
   } else {
     const auto label = ::app::strings::ui_model_id;
-    content.push_back(PreviewLabeledField(label, TextField(model).Label(label).Variant(TextFieldVariant::Outlined)
-        .OnChanged([model](const TextEditingValue& value) { model = value; }).With(Enabled(!busy)).Key("add-model-id"), color));
+    const auto id = TrimModelField(model->text);
+    content.push_back(Row{PreviewLabeledField(label, TextField(model).Label(label).Variant(TextFieldVariant::Outlined)
+        .OnChanged([model, check](const TextEditingValue& value) { model = value; check = ModelConnectionCheck{}; })
+        .With(Enabled(!busy)).Key("add-model-id"), color).With(Grow()), test_button(id, "test-model-connection")}
+        .With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::End)));
+    if (auto status = test_status(id)) content.push_back(std::move(*status));
     auto disclosure = UseEnvironment<ChipStyle>();
     disclosure.background = color.surface_container_low;
     disclosure.border = Border{Color::Transparent()};
@@ -619,7 +762,7 @@ View AddModelDialog(DialogContext dialog, AddModelProfile add_model, std::functi
   const auto action = saving.Get() ? ::app::strings::ui_saving :
       show_catalog.Get() ? ::app::strings::ui_save_models : ::app::strings::ui_save_model;
   auto body = ScrollView(Column(std::move(content)).With(Spacing(12.0F), Padding(EdgeInsets::Symmetric(20.0F, 15.0F)),
-      CrossAlign(CrossAxisAlignment::Stretch))).With(Frame{.max_height = 520.0F}, ScrollBar());
+      CrossAlign(CrossAxisAlignment::Stretch))).With(Frame{.max_height = 520.0F}, ScrollBar()).Key("add-model-fields");
   auto actions = Row {
     Spacer(),
     ProvideEnvironment(secondary, Button(::app::strings::ui_cancel).OnClick([dialog] { dialog.Dismiss(); }).With(Enabled(!saving.Get()))),
@@ -636,6 +779,7 @@ View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile
   const auto clear_key = UseState(false);
   const auto limits = UseState(EditLimits(current.limits));
   const auto image_input = UseState(current.capabilities.image_input);
+  const auto experts = UseState(current.experts);
   const auto saving = UseState(false);
   const auto error = UseState(std::string{});
   const auto tasks = UseApplicationTaskScope();
@@ -644,7 +788,7 @@ View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile
   auto fields = UseEnvironment<TextFieldStyle>();
   fields.show_label = false;
   const auto invalid_limits = UseString(::app::strings::ui_model_token_limit_invalid);
-  const auto save = [dialog, current, edit_model, endpoint, key, clear_key, limits, image_input, saving, error, tasks, invalid_limits] {
+  const auto save = [dialog, current, edit_model, endpoint, key, clear_key, limits, image_input, experts, saving, error, tasks, invalid_limits] {
     if (saving.Get() || TrimModelField(endpoint->text).empty()) return;
     ModelLimits updated_limits;
     try { updated_limits = ReadLimits(limits.Get()); }
@@ -656,8 +800,8 @@ View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile
     saving = true;
     error = "";
     tasks.Launch([dialog, edit_model, ref = current.ref, url = endpoint->text, updated_key = std::move(updated_key),
-                  updated_limits, images = image_input.Get(), key, saving, error]() mutable -> Task<void> {
-      auto result = co_await edit_model(std::move(ref), std::move(url), std::move(updated_key), updated_limits, images);
+                  updated_limits, images = image_input.Get(), preferences = experts.Get(), key, saving, error]() mutable -> Task<void> {
+      auto result = co_await edit_model(std::move(ref), std::move(url), std::move(updated_key), updated_limits, images, preferences);
       saving = false;
       if (!result.Succeeded()) { error = result.Error().message; co_return; }
       key = TextEditingValue::FromText({});
@@ -686,11 +830,36 @@ View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile
   if (SupportsImageInput(current.connection.protocol))
     content.push_back(Checkbox(::app::strings::ui_image_input, image_input.Get())
         .OnChanged([image_input](bool on) { image_input = on; }).With(Enabled(ready)).Key("edit-model-image-input"));
+  const auto strength = [experts, ready, color](StringResource label, ModelStrength ModelExpertPreferences::* field, const char* id) {
+    const std::array options{::app::strings::ui_model_limit_unknown, ::app::strings::ui_model_strength_typical,
+        ::app::strings::ui_model_strength_strong};
+    auto picker = Select(options, static_cast<std::size_t>(experts.Get().*field), [](StringResource value) { return Text(value); })
+        .Label(label).OnChanged([experts, field](std::size_t index) {
+          auto value = experts.Get();
+          value.*field = static_cast<ModelStrength>(index);
+          experts = value;
+        }).With(Enabled(ready)).Key(id);
+    return PreviewLabeledField(label, std::move(picker), color).With(Grow());
+  };
+  content.push_back(ProvideEnvironment(DividerStyle{color.outline}, Divider()));
+  content.push_back(Text(::app::strings::ui_model_strengths, TextRole::Label)
+      .Style({Font::System(14.0F).WithWeight(FontWeight::SemiBold), color.on_surface}));
+  content.push_back(Row{
+      strength(::app::strings::ui_model_strength_code, &ModelExpertPreferences::code, "edit-model-strength-code"),
+      strength(::app::strings::ui_model_strength_reasoning, &ModelExpertPreferences::reasoning, "edit-model-strength-reasoning"),
+      strength(::app::strings::ui_image_understanding, &ModelExpertPreferences::vision, "edit-model-strength-vision"),
+  }.With(Spacing(8.0F)));
+  content.push_back(Checkbox(::app::strings::ui_model_expert_automatic, experts->automatic)
+      .OnChanged([experts](bool on) {
+        auto value = experts.Get();
+        value.automatic = on;
+        experts = value;
+      }).With(Enabled(ready)).Key("edit-model-expert-automatic"));
   if (!saves_direct_api_keys && !key->text.empty() && !key->text.starts_with("${"))
     content.push_back(Text(::app::strings::ui_direct_keys_are_available_until_preview_closes, TextRole::Label));
   if (!error->empty()) content.push_back(Text(error.Get()).With(Foreground(color.error)).Key("edit-model-error"));
   auto body = ScrollView(Column(std::move(content)).With(Spacing(12.0F), Padding(EdgeInsets::Symmetric(20.0F, 15.0F)),
-      CrossAlign(CrossAxisAlignment::Stretch))).With(Frame{.max_height = 520.0F}, ScrollBar());
+      CrossAlign(CrossAxisAlignment::Stretch))).With(Frame{.max_height = 520.0F}, ScrollBar()).Key("edit-model-fields");
   auto actions = Row{
       Spacer(),
       ProvideEnvironment(PreviewSecondaryButton(buttons, color), Button(::app::strings::ui_cancel)
@@ -770,16 +939,18 @@ View RunSettingsControls(std::shared_ptr<RunSettings> settings, State<kit::UserR
   const auto permission_anchor = UseViewHandle();
   const auto colors = UseTheme().colors;
   const auto choices = settings->Models(agent);
-  const auto chosen_model = settings->CurrentModel(next->model);
-  Lifecycle([next, chosen_model, changed] {
-    if (next->model == chosen_model) return;
+  const auto chosen_model = agent == CodeAgent && next->model == DemoModel ? std::nullopt : settings->CurrentModel(next->model);
+  const auto effective_model = chosen_model ? chosen_model : settings->DefaultModel(agent);
+  const bool replace_model = (next->model && !chosen_model) || (!next->model && settings->HasRetiredDefault(agent));
+  // The code assistant rejects the demo model. Keep that explicit binding when its last model is removed.
+  const auto apply_model = !replace_model ? chosen_model : effective_model.value_or(DemoModel);
+  Lifecycle([next, apply_model, changed] {
+    if (next->model == apply_model) return;
     auto value = next.Get();
-    if (!value.model || !chosen_model || value.model->id != chosen_model->id) return;
-    value.model = chosen_model;
+    value.model = apply_model;
     next = std::move(value);
     if (changed) changed();
-  }, chosen_model, next->model);
-  const auto effective_model = chosen_model ? chosen_model : settings->DefaultModel(agent);
+  }, apply_model, next->model);
   const auto selected = effective_model ? std::ranges::find(choices, *effective_model, &ModelChoice::ref) : choices.end();
   const auto* selected_brand = selected == choices.end() ? nullptr : FindModelBrand(selected->connection.model);
   auto model = effective_model == DemoModel ? UseString(::app::strings::ui_local_demo_model) :

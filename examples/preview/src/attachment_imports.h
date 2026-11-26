@@ -23,8 +23,9 @@ private:
 
 huxerui::agentkit::ArtifactStore WithAttachmentImports(huxerui::agentkit::ArtifactStore artifacts,
     std::shared_ptr<AttachmentImports> imports);
-huxerui::View AttachmentPicker(std::shared_ptr<AttachmentImports> imports,
+huxerui::View ComposerAddMenu(std::shared_ptr<AttachmentImports> imports,
     huxerui::State<huxerui::agentkit::AgentChatDraftSources> sources, huxerui::agentkit::ModelCapabilities capabilities,
-    std::function<void()> on_staged = {});
+    huxerui::agentkit::ModelCapabilities image_capabilities, std::function<void(bool)> on_staged,
+    std::vector<huxerui::MenuEntry> actions);
 
 } // namespace agentkit_preview

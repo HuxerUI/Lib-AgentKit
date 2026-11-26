@@ -892,6 +892,8 @@ struct ModelContextUsage {
   std::uint64_t input_budget_tokens = 0;
   /// Initial estimate for this request if compaction reduced it.
   std::optional<std::uint64_t> before_compaction_tokens;
+  /// Total input and output window of the bound model revision, when known.
+  std::optional<std::uint64_t> context_window_tokens;
 };
 
 /// @brief Authorized, durable state of one Run.

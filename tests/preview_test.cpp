@@ -17,6 +17,7 @@
 #include "../examples/preview/src/design.h"
 #include "../examples/preview/src/git_process.h"
 #include "../examples/preview/src/general_workflow.h"
+#include "../examples/preview/src/host_tools.h"
 #include "../examples/preview/src/link_navigation.h"
 #include "../examples/preview/src/local_files.h"
 #include "../examples/preview/src/markdown_images.h"
@@ -41,6 +42,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <set>
+#include <span>
 #include <thread>
 
 huxerui::View App();
@@ -170,7 +172,7 @@ UiSelector ButtonText(const char* label) {
   if (label == std::string_view("Send") || label == std::string_view("Queue message") || label == std::string_view("Send as new task"))
     return UiSelector::Key(std::string("chat-send/") + label);
   if (label == std::string_view("New group")) return UiSelector::Key("new-group");
-  if (label == std::string_view("Goal")) return UiSelector::Key("conversation-goal");
+  if (label == std::string_view("Goal")) return UiSelector::Key("composer-add");
   if (label == std::string_view("Close goal")) return UiSelector::Key("goal-close");
   if (label == std::string_view("Compare alternatives")) return UiSelector::Key("comparison-entry");
   if (label == std::string_view("Back to comparison")) return UiSelector::Key("comparison-return");
@@ -283,8 +285,29 @@ void OpenPptForm(UiTest& preview, UiSelector form) {
   Wait(preview, [&] { return editor.Exists(); }, "The presentation form did not open on its own page");
 }
 
+void TapComposerItem(UiTest& preview, const char* label) {
+  const auto add = preview.FindSemantics(UiSemanticSelector::AllOf(
+      UiSemanticSelector::Role(SemanticRole::Button), UiSemanticSelector::Label("Add to conversation")));
+  Wait(preview, [&] { return add.Count() == 1 && !add.One().offscreen && add.One().enabled; }, "The add menu was unavailable");
+  add.PerformSemanticAction({SemanticActionKind::Activate, {}});
+  const auto item = preview.FindSemantics(UiSemanticSelector::AllOf(
+      UiSemanticSelector::Role(SemanticRole::MenuItem), UiSemanticSelector::Label(label)));
+  try {
+    Wait(preview, [&] { return item.Exists() && item.One().enabled && !item.One().offscreen; }, label);
+  } catch (...) {
+    const auto file = std::filesystem::temp_directory_path() / ("ganwork-composer-menu-" + kit::NewCommandId().value + ".snapshot");
+    static_cast<void>(File(file.u8string()).WriteString(preview.CaptureSnapshot().ToString()));
+    std::cerr << "Composer menu fixture: " << file << '\n';
+    throw;
+  }
+  ClickPreviewMouse(preview, item.One().bounds);
+  Wait(preview, [&] { return !item.Exists(); }, "The add menu did not close");
+  preview.Pump(250ms);
+}
+
 void TapFormButton(UiTest& preview, const char* label) {
   const auto action = std::string_view(label);
+  if (action == "Goal") return TapComposerItem(preview, label);
   if (action == "Confirm outline" || action == "Draft outline") OpenPptForm(preview, ButtonText(label));
   TapControl(preview, ButtonText(label), label);
 }
@@ -820,6 +843,7 @@ void ApproveAndReviseDesign(const Application& application, const std::filesyste
       "Reopening the original design lost its selected node");
   TapFormButton(preview, "Back to conversation");
   const auto click = [&](const char* label) {
+    if (std::string_view(label) == "Goal") return TapComposerItem(preview, label);
     auto control = preview.Find(ButtonText(label));
     Wait(preview, [&] {
       return std::ranges::any_of(control.All(), [](const auto& item) { return item.in_viewport && item.enabled; });
@@ -839,7 +863,13 @@ void ApproveAndReviseDesign(const Application& application, const std::filesyste
   preview.Pump();
   click("Set goal");
   auto objective = preview.Find(UiSelector::Key("goal-objective"));
-  Wait(preview, [&] { return objective.Exists() && objective.One().focused; }, "The goal editor did not focus its objective");
+  try {
+    Wait(preview, [&] { return objective.Exists() && objective.One().focused; }, "The goal editor did not focus its objective");
+  } catch (...) {
+    static_cast<void>(File((storage.parent_path() / "goal-editor.snapshot").u8string())
+        .WriteString(preview.CaptureSnapshot().ToString()));
+    throw;
+  }
   const auto advanced = goal_panel_view.Find(UiSelector::Key("goal-advanced"));
   const auto budget = goal_panel_view.Find(UiSelector::Key("goal-budget-tokens"));
   advanced.Tap();
@@ -1539,6 +1569,130 @@ Task<void> RunConfiguredPresentation(const std::shared_ptr<kit::AgentRuntime>& r
   std::cout << "Approved staged PowerPoint and exported bytes match" << '\n';
   LiveTake(co_await runtime->CloseAsync());
 }
+
+#ifdef _WIN32
+Task<void> RunConfiguredExpertTeam(const std::shared_ptr<kit::AgentRuntime>& runtime, const kit::ProjectId& project,
+    const kit::WorkspaceId& workspace, const File& data, std::string_view phase) {
+  using namespace agentkit_preview;
+  constexpr auto title = "Parallel expert acceptance";
+  const bool resume = phase == "expert-resume";
+  std::optional<std::string> prompt;
+  if (!resume) {
+    const auto origin = data.Child("expert-origin.txt").ReadString();
+    if (!origin.Succeeded()) throw std::runtime_error("Create expert-origin.txt with the local fixture URL");
+    prompt = "Use the same-conversation parallel expert team for a read-only evidence review. Ask the research expert to read "
+        "README.md and fetch " + origin.Value() + "/research using web_fetch. Independently ask the verification expert to "
+        "read VERIFY.txt and fetch " + origin.Value() + "/verify using web_fetch. Each expert must report the exact file "
+        "and page tokens from those sources. The web calls need approval. After both experts finish, compare their evidence "
+        "and summarize all four exact tokens. Do not edit files or fetch any other address.";
+  }
+  const auto session = co_await LiveConversation(runtime, project, workspace, GeneralAgent, title, std::move(prompt));
+  auto watching = co_await LiveObserve(session);
+  std::shared_ptr<const kit::SessionSnapshot> snapshot;
+  std::vector<kit::InteractionSnapshot> pending;
+  nlohmann::json identity;
+  const auto deadline = std::chrono::steady_clock::now() + 150s;
+  do {
+    snapshot = session->Snapshot();
+    if (snapshot && !snapshot->runs.empty() && !snapshot->summary.active_run) {
+      const auto& root = snapshot->runs.front();
+      throw std::runtime_error(root.failure ? root.failure->message : "The parent settled before both expert approvals");
+    }
+    if (snapshot && snapshot->runs.size() == 3) {
+      const auto& parent = snapshot->runs.front();
+      pending.clear();
+      for (const auto& child : std::span(snapshot->runs).subspan(1)) {
+        const auto approval = std::ranges::find_if(snapshot->interactions, [&](const auto& item) {
+          const auto* tool = std::get_if<kit::ToolApproval>(&item.body);
+          if (child.parent != parent.id || !child.timing || item.run != child.id ||
+              item.state != kit::InteractionState::Pending || !tool) return false;
+          const auto call = std::ranges::find(snapshot->tools, tool->call, &kit::ToolCallSnapshot::id);
+          return call != snapshot->tools.end() && call->tool.id == WebFetch;
+        });
+        if (approval != snapshot->interactions.end()) pending.push_back(*approval);
+      }
+      if (pending.size() == 2 && std::ranges::any_of(parent.waits, [](const auto& wait) { return wait.kind == kit::WaitKind::Delegation; })) {
+        identity = {{"session", snapshot->summary.id.value}, {"parent", parent.id.value}, {"children", nlohmann::json::array()}};
+        for (const auto& item : pending) identity["children"].push_back({{"run", item.run->value}, {"approval", item.id.value},
+            {"version", item.version}, {"call", std::get<kit::ToolApproval>(item.body).call.value}});
+        break;
+      }
+    }
+    co_await Delay(25ms);
+  } while (std::chrono::steady_clock::now() < deadline);
+  if (identity.is_null()) throw std::runtime_error("The two expert calls did not reach overlapping approvals");
+  const auto record = data.Child("expert-checkpoint.json");
+  if (!resume) {
+    WriteFixture(record, identity.dump());
+    std::cout << "Two expert Runs reached approval concurrently under parent " << identity.at("parent") << '\n';
+    if (phase == "expert-prepare") {
+      LiveTake(co_await runtime->CloseAsync());
+      co_return;
+    }
+
+    LiveTake(co_await session->CancelAsync(kit::NewCommandId(), snapshot->runs.front().id));
+    for (const auto end = std::chrono::steady_clock::now() + 30s; std::chrono::steady_clock::now() < end; ) {
+      snapshot = session->Snapshot();
+      if (snapshot && !snapshot->summary.active_run && snapshot->runs.size() == 3 &&
+          std::ranges::all_of(snapshot->runs, [](const auto& run) { return run.state == kit::RunState::Cancelled; })) {
+        if (std::ranges::any_of(snapshot->tools, [](const auto& tool) {
+              return tool.tool.id == WebFetch && tool.state == kit::ToolCallState::Succeeded;
+            })) throw std::runtime_error("A cancelled expert executed its pending web call");
+        std::cout << "Parent and both expert Runs cancelled; neither pending web call ran\n";
+        LiveTake(co_await runtime->CloseAsync());
+        co_return;
+      }
+      co_await Delay(25ms);
+    }
+    throw std::runtime_error("Parent cancellation did not settle both experts");
+  }
+
+  const auto saved = record.ReadString();
+  if (!saved.Succeeded() || nlohmann::json::parse(saved.Value()) != identity)
+    throw std::runtime_error("Restart changed the session, parent, child Run or approval identities");
+  for (const auto& item : pending) co_await LiveApprove(session, item);
+  co_await LiveRunCompleted(session, 180s);
+  snapshot = session->Snapshot();
+  if (snapshot->runs.size() != 3 || !std::ranges::all_of(snapshot->runs, [](const auto& run) { return run.state == kit::RunState::Succeeded; }))
+    throw std::runtime_error("Restart did not finish the original parent and both experts");
+  for (const auto& id : identity.at("children")) {
+    const auto& result = id.at("call").get_ref<const std::string&>();
+    if (std::ranges::count_if(snapshot->tools, [&](const auto& call) { return call.id.value == result &&
+          call.state == kit::ToolCallState::Succeeded; }) != 1)
+      throw std::runtime_error("The original approved call did not succeed exactly once");
+  }
+  std::string conclusion;
+  for (const auto& message : snapshot->messages) {
+    if (message.run != snapshot->runs.front().id || message.author != kit::MessageAuthor::Agent) continue;
+    for (const auto& block : message.blocks) if (const auto* text = std::get_if<kit::TextBlock>(&block.body)) conclusion += text->text;
+  }
+  for (const auto* token : {"RESEARCH-FILE-271", "VERIFY-FILE-392", "RESEARCH-PAGE-561", "VERIFY-PAGE-874"}) {
+    if (conclusion.find(token) == std::string::npos) throw std::runtime_error("Final conclusion omitted " + std::string(token));
+  }
+  WriteFixture(data.Child("expert-conclusion.md"), conclusion);
+  std::cout << "Restart preserved both expert Run and approval IDs; each web call ran once and the parent reported all four tokens\n";
+  LiveTake(co_await runtime->CloseAsync());
+}
+
+void VerifyExpertTimeline(const File& data, const File& workspace) {
+  const Application application{App, {.application_hooks = {MakeConfiguredPreviewTestInstaller(data.Child("sessions.sqlite3"),
+      workspace, File(AGENTKIT_PREVIEW_CTEST), {})}}};
+  UiTest ui(application, {.viewport = {1080.0F, 880.0F}});
+  const auto row = ConversationRow(ui, "Parallel expert acceptance");
+  Wait(ui, [&] { return row.Exists() && row.One().in_viewport; }, "The completed expert conversation did not reopen");
+  row.Tap();
+  const auto history = ui.Find(UiSelector::Key("agent-chat-history"));
+  Wait(ui, [&] { return history.Exists(); }, "The expert timeline did not mount");
+  const auto toggle = UiSelector::Key("chat-expert-toggle");
+  history.ScrollUntil(toggle, {.step = {0.0F, -125.0F}}).Tap();
+  const auto group = ui.Find(UiSelector::Key("chat-experts"));
+  Wait(ui, [&] { return group.Find(UiSelector::Text("Research expert · Completed")).Exists() &&
+      group.Find(UiSelector::Text("Verification expert · Completed")).Exists() &&
+      group.Find(UiSelector::Key("chat-expert-conclusion")).Count() == 2; },
+      "The timeline did not show both expert statuses and conclusions");
+  std::cout << "The restored conversation displayed both completed experts and their conclusions in the timeline\n";
+}
+#endif
 
 Task<void> RunConfiguredPreview(std::shared_ptr<kit::AgentRuntime> runtime, kit::WorkspaceId workspace,
     kit::ProjectId project, File data, std::string phase) {
@@ -3271,7 +3425,7 @@ void VerifyLongConversation(const File& root) {
     const auto origin = opener.One().bounds.y;
     opener.Tap();
     Wait(ui, [&] { return ui.Find(UiSelector::Key("presentation-slide")).Exists() &&
-        std::ranges::none_of(ui.Find(UiSelector::Key("conversation-goal")).All(), &UiNodeInfo::participates_in_layout) &&
+        std::ranges::none_of(ui.Find(UiSelector::Key("composer-add")).All(), &UiNodeInfo::participates_in_layout) &&
         std::ranges::none_of(ui.Find(UiSelector::Key("comparison-entry")).All(), &UiNodeInfo::participates_in_layout); },
         "The historical deck did not open a dedicated review");
     TapFormButton(ui, "Next slide");
@@ -3858,7 +4012,7 @@ std::vector<kit::ModelRegistration> SettingsModels(std::shared_ptr<std::vector<S
   for (const auto* label : {"A", "B", "C"}) {
     models.push_back({{{std::string("test.settings.") + label}, 1}, {"test", std::string("Model ") + label, "script", {}},
         std::make_shared<SettingsPatchModel>(label, calls), false, false,
-        {.context_window = 16384, .max_output_tokens = 1024}});
+        {.context_window = 258000, .max_output_tokens = 1024}});
   }
   return models;
 }
@@ -3986,8 +4140,11 @@ void VerifyPreviewRunSettings(const File& root) {
       preview.Find(UiSelector::Key("chat-composer-actions")).Find(UiSelector::Key("composer-context")).Exists())
     throw std::runtime_error("The context indicator should be grouped with the composer settings");
   const auto context_details = context_info.One().value;
-  if (context_details.find("estimated input tokens") == std::string::npos || ShowsText(preview, context_details))
-    throw std::runtime_error("The context indicator did not distinguish an estimate or exposed its tooltip early");
+  const auto has_detail = [&](std::string_view text) { return context_details.find(text) != std::string::npos; };
+  if (!has_detail("Configured context window 258k tokens") ||
+      !has_detail("Estimated input ") || !has_detail("Input budget after reserves ") ||
+      has_detail("Input budget after reserves 258k tokens") || ShowsText(preview, context_details))
+    throw std::runtime_error("The context indicator did not distinguish the configured window from the current input budget");
   const auto hover_context = [&](Rect bounds) {
     preview.SendPointer({.type = PointerEventType::Move, .pointer_id = 1,
         .position = {bounds.x + bounds.width / 2, bounds.y + bounds.height / 2}, .device_kind = PointerDeviceKind::Mouse});
@@ -4519,7 +4676,7 @@ void StartWorkspaceRelease(const Application& application, const File& config, c
   SendNewConversation(preview, std::move(objective));
   auto goal = preview.Find(ButtonText("Goal"));
   Wait(preview, [&] { return goal.Exists(); }, "Release conversation did not open");
-  goal.Tap();
+  TapComposerItem(preview, "Goal");
   auto enable = preview.Find(ButtonText("Enable"));
   Wait(preview, [&] { return enable.Exists() && enable.One().enabled; }, "The General assistant did not propose the release goal");
   if (slide_count) SetReleaseSlideCount(preview, slide_count);
@@ -4603,7 +4760,7 @@ void RejectIncompleteVerification(const Application& application, const File& te
   general.Tap();
   auto goal = preview.Find(ButtonText("Goal"));
   Wait(preview, [&] { return goal.Exists() && !preview.Find(UiSelector::Key("agent-chat-stop")).Exists(); }, "Failed verification did not reach the goal");
-  goal.Tap();
+  TapComposerItem(preview, "Goal");
   Wait(preview, [&] { return preview.Find(ButtonText("Resume")).Exists(); }, "Failed verification did not block the release goal");
   if (tested.Exists() != tests_passed || PendingConversation(preview, "Workspace release slides").Exists() ||
       preview.Find(ButtonText("Open completion approval")).Exists()) {
@@ -4645,7 +4802,7 @@ void ReviseWorkspaceRelease(const Application& application, const File& tested, 
   preview.Find(UiSelector::Text("Workspace release: Ship settings")).Tap();
   auto goal = preview.Find(ButtonText("Goal"));
   Wait(preview, [&] { return goal.Exists(); }, "The release goal could not be reopened");
-  goal.Tap();
+  TapComposerItem(preview, "Goal");
   SetReleaseSlideCount(preview, "5", {"1 linked runs will stop for this revision."});
   if (old_output.Exists()) throw std::runtime_error("The original export ran when the goal changed");
 }
@@ -4697,19 +4854,27 @@ void FinishWorkspaceRelease(const Application& application, const File& tested, 
   general.Tap();
   Wait(preview, [&] { return preview.Find(UiSelector::Text("Complete goal")).Exists(); }, "Missing final goal approval");
   approve.Tap();
-  preview.Find(ButtonText("Goal")).Tap();
+  TapComposerItem(preview, "Goal");
   Wait(preview, [&] { return preview.Find(UiSelector::Text("Completed")).Exists(); }, "The verified release goal did not complete");
 
   ReviewReleasedDesignImpact(preview, tested.Parent()->Child("settings.html"));
 }
 
 void ReviewReleasedDesignImpact(UiTest& preview, const File& edited) {
-  auto design = preview.Find(UiSelector::Text("Release design"));
-  Wait(preview, [&] { return design.Exists(); }, "The published release design was not in the conversation list");
-  design.Tap();
-  auto latest = preview.Find(ReviewCard("Review artifact v1"));
-  Wait(preview, [&] { return latest.Exists(); }, "The approved design version could not be reopened");
-  latest.Tap();
+  const auto design = ConversationRow(preview, "Release design");
+  Wait(preview, [&] { return design.Count() == 1 && design.One().in_viewport; },
+      "The published release design was not visible in the conversation list");
+  ClickPreviewMouse(preview, design.One().visible_bounds);
+  const auto heading = preview.Find(UiSelector::Key("agent-chat-heading")).Find(UiSelector::Text("Release design"));
+  try {
+    Wait(preview, [&] { return heading.Exists() && !preview.Find(UiSelector::Key("goal-panel")).Exists(); },
+        "Selecting the release design did not switch away from the completed goal");
+    TapControl(preview, ReviewCard("Review artifact v1"), "The approved design version could not be reopened",
+        "agent-chat-history", -95.0F);
+  } catch (...) {
+    static_cast<void>(edited.Parent()->Child("released-design-navigation.snapshot").WriteString(preview.CaptureSnapshot().ToString()));
+    throw;
+  }
   TapControl(preview, UiSelector::Key("design-node/save"), "The released save layer was unavailable", "design-layers-list");
   auto inspect = preview.Find(ButtonText("Inspect impact"));
   Wait(preview, [&] { return inspect.Exists() && inspect.One().in_viewport; }, "The published design did not offer an impact query");
@@ -7049,11 +7214,16 @@ void VerifyReleaseCompletionRevision(const File& root, bool complete_automatical
           preview.Find(ButtonText("Open completion approval")).Exists(); },
           "Goal did not show the completion review, run status and evidence version");
       TapFormButton(preview, "Open completion approval");
-      Wait(preview, [&] {
-        return std::ranges::any_of(preview.Find(UiSelector::Key(old_approval.id.value)).All(),
-            [](const auto& item) { return item.in_viewport; }) &&
-            preview.Find(ButtonText("Back to conversation")).Exists() && preview.Find(ButtonText("Approve")).Exists();
-      }, "Goal did not open the exact completion request");
+      try {
+        Wait(preview, [&] {
+          return std::ranges::any_of(preview.Find(UiSelector::Key(old_approval.id.value)).All(),
+              [](const auto& item) { return item.in_viewport; }) &&
+              preview.Find(ButtonText("Back to conversation")).Exists() && preview.Find(ButtonText("Approve")).Exists();
+        }, "Goal did not open the exact completion request");
+      } catch (...) {
+        static_cast<void>(root.Child("goal-completion-entry.snapshot").WriteString(preview.CaptureSnapshot().ToString()));
+        throw;
+      }
       TapFormButton(preview, "Back to conversation");
       TapFormButton(preview, "Goal");
       SetReleaseSlideCount(preview, "5", {"1 pending interactions will close.", "Evidence must be verified against the new version."},
@@ -9548,9 +9718,11 @@ void VerifyModelEditing(const File& root, const std::string& server) {
   const auto original = server + "/original/v1";
   const auto updated = server + "/updated/v1";
   constexpr auto model = "editable-chat";
-  const auto field = [](UiTest& ui, const char* key, const std::string& value) {
+  const auto field = [](UiTest& ui, const char* key, const std::string& value, const char* scroll_key = nullptr) {
     auto input = ui.Find(UiSelector::Key(key));
-    Wait(ui, [&] { return input.Exists() && input.One().in_viewport; }, key);
+    Wait(ui, [&] { return input.Exists(); }, key);
+    if (scroll_key && !input.One().in_viewport)
+      input = ui.Find(UiSelector::Key(scroll_key)).ScrollUntil(UiSelector::Key(key), {.step = {0.0F, 80.0F}});
     input.Tap();
     input.ReplaceText(value);
   };
@@ -9564,10 +9736,8 @@ void VerifyModelEditing(const File& root, const std::string& server) {
     Wait(ui, [&] { return button.Count() == 1 && button.One().in_viewport; }, "The model list did not show one editable profile");
     button.Tap();
   };
-  const auto select_role = [](UiTest& ui, const char* key) {
-    const auto picker = ui.Find(UiSelector::Key(key));
-    Wait(ui, [&] { return picker.Exists() && picker.One().in_viewport; }, key);
-    picker.Tap();
+  const auto select_last = [](UiTest& ui, const char* key, const char* scroll_key = "settings-scroll") {
+    TapControl(ui, UiSelector::Key(key), key, scroll_key);
     ui.PressKey(Key::End);
     ui.PressKey(Key::Enter);
   };
@@ -9592,7 +9762,24 @@ void VerifyModelEditing(const File& root, const std::string& server) {
     ui.Find(UiSelector::Key("settings-add-model")).Tap();
     field(ui, "add-model-url", original);
     field(ui, "add-model-id", model);
+    const auto connection = ui.Find(UiSelector::Key("model-connection-status"));
+    const auto probe = ui.Find(UiSelector::Key("test-model-connection"));
+    field(ui, "add-model-key", "${GANWORK_TEST_UNSET_MODEL_KEY}");
+    Wait(ui, [&] { return probe.Exists() && probe.One().enabled && probe.One().in_viewport; }, "The manual connection button was unavailable");
+    probe.Tap();
+    Wait(ui, [&] { return ShowsText(ui, "The API key environment variable is unset."); },
+        "The connection test did not report a missing key");
+    if (root.Child("models").Exists() && !read_profiles().empty())
+      throw std::runtime_error("Testing the connection saved a model profile");
     field(ui, "add-model-key", "revision-fixture-key-original");
+    if (connection.Exists()) throw std::runtime_error("Editing the credentials did not clear the previous connection result");
+    ui.Find(UiSelector::Key("advanced-model-limits")).Tap();
+    field(ui, "model-limit-0", "0.0001k", "add-model-fields");
+    ui.Find(UiSelector::Key("save-model")).Tap();
+    Wait(ui, [&] { return ui.Find(UiSelector::Key("add-model-error")).Exists(); }, "A fractional token count was accepted");
+    field(ui, "model-limit-0", "1m", "add-model-fields");
+    field(ui, "model-limit-1", "400k", "add-model-fields");
+    field(ui, "model-limit-2", "258k", "add-model-fields");
     ui.Find(UiSelector::Key("save-model")).Tap();
     Wait(ui, [&] { return !ui.Find(UiSelector::Key("add-model-dialog")).Exists(); }, "The original model was not saved");
     edit(ui);
@@ -9600,7 +9787,11 @@ void VerifyModelEditing(const File& root, const std::string& server) {
     if (ui.Find(UiSelector::Key("edit-model-url")).One().value != original || !key.One().secure || !key.One().value.empty())
       throw std::runtime_error("The edit dialog did not prefill the endpoint and protect the saved key");
   }
-  const kit::ModelProviderRef first{{read_profiles().at(1).at("profile_id").get<std::string>()}, 1};
+  const auto original_profile = read_profiles().at(1);
+  if (original_profile.at("context_window") != 1000000 || original_profile.at("max_input_tokens") != 400000 ||
+      original_profile.at("max_output_tokens") != 258000)
+    throw std::runtime_error("Adding a model did not convert k and m counts to exact tokens");
+  const kit::ModelProviderRef first{{original_profile.at("profile_id").get<std::string>()}, 1};
   kit::SessionId session_id;
   const auto run_native = [&](bool editing) {
     std::exception_ptr failure;
@@ -9610,6 +9801,18 @@ void VerifyModelEditing(const File& root, const std::string& server) {
       try {
         const auto runtime = LiveTake(std::move(started));
         if (editing) {
+          agentkit_preview::ModelProfileInput profile{.model = model, .base_url = original, .protocol = "chat-completions",
+              .provider = "compatible", .api_key = "invalid-fixture-key"};
+          const auto rejected = co_await agentkit_preview::TestModelConnection(profile);
+          if (rejected.Succeeded() || rejected.Error().code != kit::ErrorCode::PermissionDenied)
+            throw std::runtime_error(rejected.Succeeded() ? "The test accepted an invalid key" : rejected.Error().message);
+          profile.api_key = "revision-fixture-key-original";
+          LiveTake(co_await agentkit_preview::TestModelConnection(profile));
+          const auto catalog = LiveTake(co_await agentkit_preview::DiscoverModels(profile, std::make_shared<HttpClient>()));
+          if (catalog.size() != 1 || catalog.front().id != model)
+            throw std::runtime_error("The connection fixture model was not in the endpoint catalog");
+          profile.model = catalog.front().id;
+          LiveTake(co_await agentkit_preview::TestModelConnection(profile));
           auto created = LiveTake(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
               .options = {.agent = agentkit_preview::GeneralAgent, .title = "Initial revision request"},
               .initial = kit::SendInput{.text = "Initial revision request"}}));
@@ -9626,7 +9829,7 @@ void VerifyModelEditing(const File& root, const std::string& server) {
             co_await Delay(10ms);
           }
           if (!root.Child("original-started").Exists()) throw std::runtime_error("The first Run did not open the original connection");
-          const auto revision = LiveTake(co_await save(first, updated, "revision-fixture-key-updated", {65536, 49152, 8192}, false));
+          const auto revision = LiveTake(co_await save(first, updated, "revision-fixture-key-updated", {65536, 49152, 8192}, false, {}));
           if (revision != kit::ModelProviderRef{first.id, 2} || !session->Snapshot()->summary.active_run)
             throw std::runtime_error("Editing did not retain the active Run and stable model identity");
           WriteFixture(root.Child("release-original"), "ready");
@@ -9665,28 +9868,108 @@ void VerifyModelEditing(const File& root, const std::string& server) {
     open_settings(ui);
     edit(ui);
     if (ui.Find(UiSelector::Key("edit-model-url")).One().value != updated ||
-        ui.Find(UiSelector::Key("model-limit-0")).One().value != "65536")
+        ui.Find(UiSelector::Key("model-limit-0")).One().value != "65.536k")
       throw std::runtime_error("The endpoint or context size was not restored after restart");
     Wait(ui, [&] { return ui.Find(UiSelector::Key("edit-model-image-input")).Exists(); }, "Image capability is missing from model editing");
     ui.Find(UiSelector::Key("edit-model-image-input")).Tap();
-    field(ui, "model-limit-0", "98304");
+    field(ui, "model-limit-0", "1.5m");
+    field(ui, "model-limit-1", "258K");
+    field(ui, "model-limit-2", "8192");
+    select_last(ui, "edit-model-strength-reasoning", "edit-model-fields");
+    TapControl(ui, UiSelector::Key("edit-model-expert-automatic"), "Expert selection switch", "edit-model-fields");
     ui.Find(UiSelector::Key("update-model")).Tap();
     Wait(ui, [&] { return !ui.Find(UiSelector::Key("edit-model-dialog")).Exists(); }, "The capability and context edit did not save");
     const auto profile = read_profiles().at(3);
-    if (profile.at("context_window") != 98304 || profile.at("image_input") != true)
-      throw std::runtime_error("Editing the context and image support did not create the new revision");
-    select_role(ui, "settings-image-model");
-    select_role(ui, "settings-image-generation-model");
+    if (profile.at("context_window") != 1500000 || profile.at("max_input_tokens") != 258000 ||
+        profile.at("max_output_tokens") != 8192 || profile.at("image_input") != true ||
+        profile.at("experts").at("reasoning") != "strong" || profile.at("experts").at("automatic") != true)
+      throw std::runtime_error("The model revision did not save token counts, image support and expert preferences");
+    select_last(ui, "settings-image-model");
+    select_last(ui, "settings-image-generation-model");
+    select_last(ui, "settings-research-model");
+    select_last(ui, "settings-verification-model");
     ui.Find(UiSelector::Key("settings-save")).Tap();
     const auto file = root.Child("settings.json");
     Wait(ui, [&] { return file.Exists(); }, "Image model roles were not saved");
     const auto settings = nlohmann::json::parse(file.ReadString().Value());
     const auto expected = nlohmann::json{{"id", first.id.value}, {"version", 3}};
     if (settings.at("image_model") != expected || settings.at("image_generation_model") != expected ||
+        settings.at("research_model") != expected || settings.at("verification_model") != expected ||
         settings.contains("image_endpoint"))
       throw std::runtime_error("Image roles did not persist the selected model revision");
   }
   run_native(false);
+  const auto remove = UiSelector::Key("settings-remove-model/" + first.id.value);
+  const auto confirmation = UiSelector::Key("remove-model-dialog");
+  const auto verify_removed = [&](UiTest& ui) {
+    if (ui.Find(remove).Exists() || ui.Find(ButtonText("Edit model")).Exists() || ShowsText(ui, model))
+      throw std::runtime_error("The removed model was still listed");
+    if (!ui.Find(UiSelector::Key("settings-image-model")).Find(UiSelector::Text("Use the selected chat model")).Exists())
+      throw std::runtime_error("The removed model was still selected for image understanding");
+  };
+  {
+    const Application application{App, {.application_hooks = {MakePreviewInstaller(database, true)}}};
+    UiTest ui(application, {.viewport = {1440.0F, 960.0F}});
+    open_settings(ui);
+    TapControl(ui, remove, "The saved model had no remove action");
+    TapControl(ui, UiSelector::Key("cancel-remove-model"), "The removal could not be canceled");
+    Wait(ui, [&] { return !ui.Find(confirmation).Exists(); }, "The removal dialog stayed open after cancellation");
+    TapControl(ui, remove, "Canceling removal hid the model");
+    TapControl(ui, UiSelector::Key("confirm-remove-model"), "The removal could not be confirmed");
+    Wait(ui, [&] { return !ui.Find(confirmation).Exists() && !ui.Find(remove).Exists(); }, "The confirmed removal did not finish");
+    verify_removed(ui);
+  }
+  if (read_profiles().size() != 3) throw std::runtime_error("The removal discarded revisions used by existing runs");
+  {
+    const Application application{App, {.application_hooks = {MakePreviewInstaller(database, true)}}};
+    UiTest ui(application, {.viewport = {1440.0F, 960.0F}});
+    open_settings(ui);
+    Wait(ui, [&] { return ShowsText(ui, "No models configured"); }, "The removed model reappeared after restart");
+    verify_removed(ui);
+  }
+
+  const auto expert_data = root.Child("expert-routing");
+  const auto profiles = expert_data.Child("models");
+  if (!profiles.CreateDirectories()) throw std::runtime_error("Could not create the expert routing fixture");
+  const kit::ModelProviderRef research{{"test.experts.research"}, 1};
+  const kit::ModelProviderRef verification{{"test.experts.verification"}, 1};
+  auto profile = original_profile;
+  profile["base_url"] = server + "/expert/v1";
+  profile["profile_id"] = research.id.value;
+  profile["model"] = "expert-research";
+  profile["experts"] = {{"automatic", true}, {"code", "strong"}};
+  WriteFixture(profiles.Child("research.json"), profile.dump());
+  profile["profile_id"] = verification.id.value;
+  profile["model"] = "expert-verification";
+  profile["experts"] = {{"automatic", true}, {"reasoning", "strong"}};
+  WriteFixture(profiles.Child("verification.json"), profile.dump());
+  WriteFixture(expert_data.Child("settings.json"),
+      nlohmann::json{{"daily_model", {{"id", verification.id.value}, {"version", verification.version}}}}.dump());
+
+  std::exception_ptr failure;
+  const Application acceptance{[]() -> View { return Spacer(); },
+      {.window = {.activatable = false}, .quit_on_last_window_closed = false,
+       .application_hooks = {MakeModelEditingTestInstaller(expert_data.Child("sessions.sqlite3"), [&](auto started, auto) -> Task<void> {
+    const auto app = UseApplication();
+    try {
+      const auto runtime = LiveTake(std::move(started));
+      const auto created = LiveTake(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
+          .options = {.agent = agentkit_preview::GeneralAgent, .title = "Expert routing acceptance"},
+          .initial = kit::SendInput{.text = "Use the parallel expert team for an independent research and verification pass."}}));
+      auto session = LiveTake(co_await runtime->Sessions().OpenAsync(std::get<kit::SessionCreated>(created.outcome).session));
+      auto observing = co_await LiveObserve(session);
+      co_await LiveRunCompleted(session);
+      const auto snapshot = session->Snapshot();
+      if (snapshot->runs.size() != 3 || snapshot->runs[0].model != verification || snapshot->runs[1].model != research ||
+          snapshot->runs[2].model != verification || snapshot->runs[1].state != kit::RunState::Succeeded ||
+          snapshot->runs[2].state != kit::RunState::Succeeded)
+        throw std::runtime_error("Automatic expert routing did not bind both models by role");
+      LiveTake(co_await runtime->CloseAsync());
+    } catch (...) { failure = std::current_exception(); }
+    app.Quit();
+  })}}};
+  static_cast<void>(RunApplication());
+  if (failure) std::rethrow_exception(failure);
 }
 
 void VerifyThemeSettings(const File& root) {
@@ -10414,6 +10697,12 @@ int main(int argc, char** argv) {
       std::cerr << "Create the acceptance workspace in the supplied directory first\n";
       return 1;
     }
+#ifdef _WIN32
+    if (phase == "expert-timeline") {
+      try { VerifyExpertTimeline(data, workspace); return 0; }
+      catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+    }
+#endif
     int result = 1;
     ConfiguredPreviewDriver drive;
     if (argc == 4) {
@@ -10428,6 +10717,10 @@ int main(int argc, char** argv) {
             co_await RunConfiguredChartReview(runtime, project, data, phase);
           else if (phase.starts_with("skill-"))
             co_await RunConfiguredReleaseSkill(runtime, project, *workspace, data, phase);
+#ifdef _WIN32
+          else if (phase == "expert-prepare" || phase == "expert-resume" || phase == "expert-cancel")
+            co_await RunConfiguredExpertTeam(runtime, project, *workspace, data, phase);
+#endif
           else if (phase.starts_with("release-"))
             co_await RunConfiguredRelease(std::move(runtime), *workspace, std::move(project), data, phase);
           else

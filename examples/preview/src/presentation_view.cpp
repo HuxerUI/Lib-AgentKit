@@ -1352,38 +1352,31 @@ View SharedReportsDialog(DialogContext dialog, std::shared_ptr<kit::AgentRuntime
       Padding(20.0F), Spacing(10.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
+Task<void> PickPresentationReport(std::shared_ptr<FilePicker> picker, std::shared_ptr<kit::AgentRuntime> runtime,
+    kit::ProjectId project, std::function<void(ImportedPresentationReport)> imported, State<bool> busy, State<std::string> error) {
+  if (busy.Get()) co_return;
+  busy = true;
+  error = "";
+  auto selected = co_await picker->OpenFileAsync({.name = "JSON report", .extensions = {"json"}, .content_types = {"application/json"}});
+  if (selected) {
+    auto report = co_await ImportPresentationReport(runtime->Projects(), project, std::move(*selected));
+    if (report.Succeeded()) imported(std::move(report).Value());
+    else error = report.Error().message;
+  }
+  busy = false;
+}
+
 [[huxerui::composable]]
 View ImportReportControl(std::shared_ptr<kit::AgentRuntime> runtime, kit::ProjectId project,
-    std::function<void(ImportedPresentationReport)> imported, std::optional<State<std::string>> draft_error) {
+    std::function<void(ImportedPresentationReport)> imported) {
   const auto picker = UseService<FilePicker>();
   const auto tasks = UseTaskScope();
   const auto busy = UseState(false);
-  const auto local_error = UseState(std::string{});
-  const auto error = draft_error.value_or(local_error);
+  const auto error = UseState(std::string{});
   if (!picker || !picker->CanOpenFiles()) return View{};
   auto pick = [picker, tasks, busy, error, runtime, project, imported] {
-    if (busy.Get()) return;
-    busy = true;
-    error = "";
-    tasks.Launch([picker, busy, error, runtime, project, imported]() -> Task<void> {
-      auto selected = co_await picker->OpenFileAsync({.name = "JSON report", .extensions = {"json"}, .content_types = {"application/json"}});
-      if (selected) {
-        auto report = co_await ImportPresentationReport(runtime->Projects(), project, std::move(*selected));
-        if (report.Succeeded()) imported(std::move(report).Value());
-        else error = report.Error().message;
-      }
-      busy = false;
-    });
+    tasks.Launch(PickPresentationReport(picker, runtime, project, imported, busy, error));
   };
-  if (draft_error) {
-    auto style = UseEnvironment<IconButtonStyle>();
-    style.foreground = UseTheme().colors.on_surface_variant;
-    style.icon_size = 16.0F;
-    style.minimum_interactive_size = style.state_layer_size = 32.0F;
-    const auto label = ::app::strings::ui_add_report;
-    return ProvideEnvironment(style, IconButton(::app::images::add, label).OnClick(std::move(pick))
-        .With(Enabled(!busy.Get()), Tooltip(label)).Key("attach-report"));
-  }
   auto action = Button(::app::strings::ui_import_report_into_project).OnClick(std::move(pick)).With(Enabled(!busy.Get()));
   if (error->empty()) return action;
   return Column{std::move(action), Text(error.Get(), TextRole::Label)}.With(Spacing(6.0F));

@@ -29,6 +29,8 @@ CommandService RunContext::Commands() { return CommandService(runtime_, run_); }
 
 std::stop_token RunContext::StopToken() const { return runtime_->runs.at(run_).stop.get_token(); }
 
+ModelProviderRef RunContext::Model() const { return runtime_->runs.at(run_).view.model; }
+
 Async<ModelReply> RunContext::CompleteAsync(ModelInput input) {
   return [](RunContext context, ModelInput request) -> Async<ModelReply> {
     auto active = Active(*context.runtime_, context.run_);

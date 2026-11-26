@@ -334,7 +334,9 @@ Async<void> CompactModelRequest(RuntimeState& state, SessionData& session, RunEx
   const auto initial = EstimateTokens(request);
   auto used = initial;
   const auto record_usage = [&] {
-    run.view.context_usage = ModelContextUsage{used, limit, used < initial ? std::optional{initial} : std::nullopt};
+    run.view.context_usage = ModelContextUsage{.estimated_input_tokens = used, .input_budget_tokens = limit,
+        .before_compaction_tokens = used < initial ? std::optional{initial} : std::nullopt,
+        .context_window_tokens = limits.context_window};
   };
   record_usage();
   if (used <= limit) co_return Result::Success();
@@ -974,7 +976,9 @@ Task<void> RuntimeState::Drive(RunId id) {
     if ((run.deadline && Now() >= *run.deadline)) { Stop(run, RunEndReason::Deadline); co_return; }
     if (run.delegate) {
       const auto& parent = runs.at(*run.view.parent);
-      auto allowed = co_await CheckDelegation(parent, {run.view.agent.id, run.input, run.delegate->budget, run.delegate->expected_result});
+      auto allowed = co_await CheckDelegation(parent,
+          {run.view.agent.id, run.input, run.delegate->budget, run.delegate->expected_result, run.delegate->requested_model},
+          run.view.model);
       if (allowed.Succeeded()) allowed = co_await Require(Request(run.principal, Capability::StartSessionRun, &session, &run));
       if (run.stop.stop_requested()) co_return;
       if (!allowed.Succeeded()) { FailRun(*this, run, allowed.Error()); co_return; }

@@ -5,6 +5,8 @@
 #include <huxerui/http.h>
 #include <huxerui/presentation.h>
 
+#include <set>
+
 namespace agentkit_preview {
 
 inline const huxerui::agentkit::PrincipalId PreviewUser{"preview.user"};
@@ -25,6 +27,17 @@ struct ComposerDraft {
 
 using ModelLimits = huxerui::agentkit::ModelContextLimits;
 
+enum class ModelStrength { Unknown, Typical, Strong };
+
+struct ModelExpertPreferences {
+  ModelStrength code = ModelStrength::Unknown;
+  ModelStrength reasoning = ModelStrength::Unknown;
+  ModelStrength vision = ModelStrength::Unknown;
+  bool automatic = false;
+
+  bool operator==(const ModelExpertPreferences&) const = default;
+};
+
 struct ModelChoice {
   huxerui::agentkit::ModelProviderRef ref;
   std::string label;
@@ -36,6 +49,7 @@ struct ModelChoice {
   huxerui::agentkit::ModelEndpoint connection;
   ModelLimits limits;
   bool editable = false;
+  ModelExpertPreferences experts;
 };
 
 struct ModelProfileInput {
@@ -48,6 +62,7 @@ struct ModelProfileInput {
   bool file_input = false;
   bool reasoning_summary = false;
   ModelLimits limits;
+  ModelExpertPreferences experts;
 };
 
 struct DiscoveredModel {
@@ -61,12 +76,16 @@ std::string ModelKeyEnvironment(std::string_view key);
 huxerui::agentkit::Async<std::vector<DiscoveredModel>> DiscoverModels(
     ModelProfileInput endpoint, std::shared_ptr<huxerui::HttpClient> client);
 
+huxerui::agentkit::Async<void> TestModelConnection(ModelProfileInput profile);
+
 bool SupportsImageInput(std::string_view protocol);
 
 using AddModelProfile = std::function<huxerui::agentkit::Async<huxerui::agentkit::ModelProviderRef>(ModelProfileInput)>;
 
 using EditModelProfile = std::function<huxerui::agentkit::Async<huxerui::agentkit::ModelProviderRef>(
-    huxerui::agentkit::ModelProviderRef, std::string endpoint, std::optional<std::string> new_key, ModelLimits, bool image_input)>;
+    huxerui::agentkit::ModelProviderRef, std::string endpoint, std::optional<std::string> new_key, ModelLimits,
+    bool image_input, ModelExpertPreferences)>;
+using RemoveModelProfile = std::function<huxerui::agentkit::Async<void>(huxerui::agentkit::ModelProviderRef)>;
 
 void ShowAddModel(const huxerui::DialogHandle& dialog, AddModelProfile add_model,
     std::function<void(huxerui::agentkit::ModelProviderRef)> added);
@@ -76,12 +95,18 @@ void ShowEditModel(const huxerui::DialogHandle& dialog, ModelChoice current, Edi
 class RunSettings {
 public:
   void AddModel(const huxerui::agentkit::ModelRegistration& registration, std::string label = {},
-      ModelLimits limits = {}, bool editable = false);
+      ModelLimits limits = {}, bool editable = false, ModelExpertPreferences experts = {});
+  void RetireModel(const huxerui::agentkit::ModelId& id);
+  bool IsRetired(const huxerui::agentkit::ModelId& id) const;
+  bool HasRetiredDefault(const huxerui::agentkit::AgentId& agent) const;
   void SetDefaults(huxerui::agentkit::ModelProviderRef general, std::optional<huxerui::agentkit::ModelProviderRef> code);
   std::optional<huxerui::agentkit::ModelProviderRef> DefaultModel(const huxerui::agentkit::AgentId& agent) const;
   std::optional<huxerui::agentkit::ModelProviderRef> CurrentModel(
       std::optional<huxerui::agentkit::ModelProviderRef> model) const;
   std::vector<ModelChoice> Models(const huxerui::agentkit::AgentId& agent) const;
+  std::optional<huxerui::agentkit::ModelProviderRef> SelectExpertModel(const huxerui::agentkit::AgentId& expert,
+      const std::optional<huxerui::agentkit::ModelProviderRef>& preferred, const huxerui::agentkit::ModelProviderRef& parent,
+      huxerui::agentkit::ModelCapabilities required = {}, std::size_t task_bytes = 0) const;
   huxerui::StringVariant ModelLabel(const std::optional<huxerui::agentkit::ModelProviderRef>& ref) const;
   std::optional<huxerui::Image> ModelAvatar(const huxerui::agentkit::ModelProviderRef& ref, huxerui::Color foreground) const;
   huxerui::agentkit::ModelCapabilities Capabilities(const std::optional<huxerui::agentkit::ModelProviderRef>& ref,
@@ -97,6 +122,7 @@ public:
 private:
   std::vector<ModelChoice> models_;
   std::map<huxerui::agentkit::ModelId, huxerui::agentkit::Revision> model_versions_;
+  std::set<huxerui::agentkit::ModelId> retired_models_;
   huxerui::State<std::size_t> model_revision_{std::size_t{0}};
   huxerui::agentkit::ModelProviderRef general_ = DemoModel;
   std::optional<huxerui::agentkit::ModelProviderRef> code_;

@@ -739,6 +739,13 @@ std::string UnprotectModelKey(const nlohmann::json& value) {
 }
 #endif
 
+void NormalizeModelProfile(agentkit_preview::ModelProfileInput& profile) {
+  profile.model = TrimModelField(std::move(profile.model));
+  profile.base_url = TrimModelField(std::move(profile.base_url));
+  while (profile.base_url.ends_with('/')) profile.base_url.pop_back();
+  profile.api_key = TrimModelField(std::move(profile.api_key));
+}
+
 kit::ModelRegistration MakeProfileModel(const agentkit_preview::ModelProfileInput& profile, std::string environment,
     std::optional<kit::ModelProviderRef> revision = {}) {
   const std::string_view url = profile.base_url;
@@ -777,11 +784,18 @@ agentkit_preview::ModelProfileInput ReadModelProfile(const nlohmann::json& recor
     const auto tokens = value->get<std::uint64_t>();
     return tokens ? std::optional{tokens} : std::nullopt;
   };
+  const auto experts = record.value("experts", nlohmann::json::object());
+  const auto strength = [&experts](const char* field) {
+    using agentkit_preview::ModelStrength;
+    const auto value = experts.value(field, std::string{});
+    return value == "strong" ? ModelStrength::Strong : value == "typical" ? ModelStrength::Typical : ModelStrength::Unknown;
+  };
   return {.model = record.at("model").get<std::string>(), .base_url = record.at("base_url").get<std::string>(),
       .protocol = record.at("protocol").get<std::string>(), .provider = record.at("provider").get<std::string>(),
       .api_key = std::move(key), .image_input = record.value("image_input", false), .file_input = record.value("file_input", false),
       .reasoning_summary = record.value("reasoning_summary", false),
-      .limits = {limit("context_window"), limit("max_input_tokens"), limit("max_output_tokens")}};
+      .limits = {limit("context_window"), limit("max_input_tokens"), limit("max_output_tokens")},
+      .experts = {strength("code"), strength("reasoning"), strength("vision"), experts.value("automatic", false)}};
 }
 
 Task<void> LoadModelProfiles(const std::shared_ptr<PreviewService>& service, const File& directory,
@@ -797,10 +811,16 @@ Task<void> LoadModelProfiles(const std::shared_ptr<PreviewService>& service, con
   }
   std::ranges::sort(files.Value(), {}, &File::Name);
   for (const auto& file : files.Value()) {
-    if (!file.Name().ends_with(".json")) continue;
+    const auto name = file.Name();
+    if (!name.ends_with(".json") && !name.ends_with(".removed")) continue;
     try {
       auto raw = co_await file.ReadStringAsync();
       if (!raw.Succeeded()) throw std::runtime_error("Could not read model profile");
+      if (name.ends_with(".removed")) {
+        if (raw.Value().empty() || raw.Value().size() > 4096) throw std::invalid_argument("Invalid removed model ID");
+        service->run_settings->RetireModel({std::move(raw).Value()});
+        continue;
+      }
       const auto record = nlohmann::json::parse(raw.Value());
       auto profile = ReadModelProfile(record);
       std::optional<kit::ModelProviderRef> revision;
@@ -812,7 +832,7 @@ Task<void> LoadModelProfiles(const std::shared_ptr<PreviewService>& service, con
       auto model = MakeProfileModel(profile, ModelKeyEnvironment(profile.api_key), std::move(revision));
       if (std::ranges::find(models, model.ref, &kit::ModelRegistration::ref) == models.end()) {
         service->model_revisions.emplace(model.ref, file);
-        service->run_settings->AddModel(model, {}, profile.limits, true);
+        service->run_settings->AddModel(model, {}, profile.limits, true, profile.experts);
         models.push_back(std::move(model));
       }
     } catch (const std::exception&) {
@@ -834,10 +854,7 @@ kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewServic
   }
   if (previous && previous->version == std::numeric_limits<kit::Revision>::max())
     co_return Result::Failure({.code = kit::ErrorCode::Conflict, .message = resources->GetString(::app::strings::ui_model_edit_revision_limit)});
-  profile.model = TrimModelField(std::move(profile.model));
-  profile.base_url = TrimModelField(std::move(profile.base_url));
-  while (profile.base_url.ends_with('/')) profile.base_url.pop_back();
-  profile.api_key = TrimModelField(std::move(profile.api_key));
+  NormalizeModelProfile(profile);
   kit::ModelRegistration model;
   std::string environment;
   try {
@@ -865,6 +882,12 @@ kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewServic
       {"model", profile.model}, {"base_url", profile.base_url},
       {"protocol", profile.protocol}, {"provider", profile.provider},
       {"image_input", profile.image_input}, {"file_input", profile.file_input}, {"reasoning_summary", profile.reasoning_summary}};
+  const auto strength = [](agentkit_preview::ModelStrength value) {
+    using agentkit_preview::ModelStrength;
+    return value == ModelStrength::Strong ? "strong" : value == ModelStrength::Typical ? "typical" : "unknown";
+  };
+  record["experts"] = {{"code", strength(profile.experts.code)}, {"reasoning", strength(profile.experts.reasoning)},
+      {"vision", strength(profile.experts.vision)}, {"automatic", profile.experts.automatic}};
   if (profile.limits.context_window) record["context_window"] = *profile.limits.context_window;
   if (profile.limits.max_input_tokens) record["max_input_tokens"] = *profile.limits.max_input_tokens;
   if (profile.limits.max_output_tokens) record["max_output_tokens"] = *profile.limits.max_output_tokens;
@@ -891,7 +914,7 @@ kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewServic
     if (persist) static_cast<void>(co_await target.DeleteAsync());
     co_return Result::Failure(registered.Error());
   }
-  service->run_settings->AddModel(model, {}, profile.limits, true);
+  service->run_settings->AddModel(model, {}, profile.limits, true, profile.experts);
   if (persist) service->model_revisions.emplace(model.ref, target);
   else service->model_revisions.emplace(model.ref, std::move(profile));
   if (previous) {
@@ -911,7 +934,7 @@ kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewServic
 
 kit::Async<kit::ModelProviderRef> UpdateModelProfile(std::shared_ptr<PreviewService> service,
     kit::ModelProviderRef previous, std::string endpoint, std::optional<std::string> new_key,
-    agentkit_preview::ModelLimits limits, bool image_input) {
+    agentkit_preview::ModelLimits limits, bool image_input, agentkit_preview::ModelExpertPreferences experts) {
   using Result = kit::AgentResult<kit::ModelProviderRef>;
   const auto resources = UseService<Resources>();
   const auto found = service->model_revisions.find(previous);
@@ -934,13 +957,39 @@ kit::Async<kit::ModelProviderRef> UpdateModelProfile(std::shared_ptr<PreviewServ
   while (endpoint.ends_with('/')) endpoint.pop_back();
   if (new_key) *new_key = TrimModelField(std::move(*new_key));
   if (service->run_settings->CurrentModel(previous) == previous && endpoint == profile.base_url &&
-      (!new_key || *new_key == profile.api_key) && limits == profile.limits && image_input == profile.image_input)
+      (!new_key || *new_key == profile.api_key) && limits == profile.limits && image_input == profile.image_input &&
+      experts == profile.experts)
     co_return Result::Success(std::move(previous));
   profile.base_url = std::move(endpoint);
   if (new_key) profile.api_key = std::move(*new_key);
   profile.limits = std::move(limits);
   profile.image_input = image_input;
+  profile.experts = experts;
   co_return co_await SaveModelProfile(std::move(service), std::move(profile), std::move(previous));
+}
+
+kit::Async<void> RemoveModelProfile(std::shared_ptr<PreviewService> service, kit::ModelProviderRef model) {
+  using Result = kit::AgentResult<void>;
+  const auto resources = UseService<Resources>();
+  if (service->saving_models) co_return Result::Failure({.code = kit::ErrorCode::Busy,
+      .message = resources->GetString(::app::strings::ui_model_save_in_progress)});
+  if (service->run_settings->CurrentModel(model) != model || !service->model_revisions.contains(model))
+    co_return Result::Failure({.code = kit::ErrorCode::Conflict, .message = resources->GetString(::app::strings::ui_model_edit_stale)});
+  service->saving_models = true;
+  const auto saving = std::unique_ptr<bool, void(*)(bool*)>{&service->saving_models, [](bool* flag) { *flag = false; }};
+  const auto name = kit::NewCommandId().value;
+  const auto pending = service->model_profiles->Child(name + ".pending");
+  const auto target = service->model_profiles->Child(name + ".removed");
+  if (!co_await pending.WriteStringAsync(model.id.value) || !co_await pending.MoveToAsync(target)) {
+    static_cast<void>(co_await pending.DeleteAsync());
+    co_return Result::Failure({.code = kit::ErrorCode::PersistenceFailure, .message = resources->GetString(::app::strings::ui_model_remove_failed)});
+  }
+  service->run_settings->RetireModel(model.id);
+  auto settings = service->settings.Get();
+  agentkit_preview::ClearRetiredModelRoles(settings, *service->run_settings);
+  service->settings = std::move(settings);
+  service->code_available = service->run_settings->DefaultModel(agentkit_preview::CodeAgent).has_value();
+  co_return Result::Success();
 }
 
 std::optional<kit::ModelRegistration> ConfiguredEnvironmentModel(std::string_view slot = {}) {
@@ -1068,8 +1117,18 @@ agentkit_preview::AddModelProfile AddModelAction(const std::shared_ptr<PreviewSe
 agentkit_preview::EditModelProfile EditModelAction(const std::shared_ptr<PreviewService>& service) {
 #ifndef __EMSCRIPTEN__
   if (service->model_profiles) return [service](kit::ModelProviderRef ref, std::string endpoint,
-      std::optional<std::string> key, agentkit_preview::ModelLimits limits, bool image_input) {
-    return UpdateModelProfile(service, std::move(ref), std::move(endpoint), std::move(key), std::move(limits), image_input);
+      std::optional<std::string> key, agentkit_preview::ModelLimits limits, bool image_input,
+      agentkit_preview::ModelExpertPreferences experts) {
+    return UpdateModelProfile(service, std::move(ref), std::move(endpoint), std::move(key), std::move(limits), image_input, experts);
+  };
+#endif
+  return {};
+}
+
+agentkit_preview::RemoveModelProfile RemoveModelAction(const std::shared_ptr<PreviewService>& service) {
+#ifndef __EMSCRIPTEN__
+  if (service->model_profiles) return [service](kit::ModelProviderRef model) {
+    return RemoveModelProfile(service, std::move(model));
   };
 #endif
   return {};
@@ -1092,14 +1151,19 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
   const auto designs = files.staging.Parent()->Child("designs");
   const auto evidence = files.staging.Parent()->Child("workspace-evidence");
   const auto local_pages = evidence.Child("local-pages");
-  const bool code_available = !configured.empty() || code_model.has_value();
+  const auto selectable = [&settings](const kit::ModelRegistration& model) { return !settings->IsRetired(model.ref.id); };
+  const bool code_available = std::ranges::any_of(configured, selectable) || code_model.has_value();
   const bool release_available = code_available && test_runner.has_value();
   std::ranges::stable_sort(configured, {}, [](const auto& model) { return model.ref.version; });
-  const auto model_for = [&configured](const kit::ModelProviderRef& ref) {
-    const auto found = std::find_if(configured.rbegin(), configured.rend(), [&](const auto& model) { return model.ref.id == ref.id; });
+  const auto model_for = [&configured, &selectable](const kit::ModelProviderRef& ref) {
+    const auto found = std::find_if(configured.rbegin(), configured.rend(), [&](const auto& model) {
+      return model.ref.id == ref.id && selectable(model);
+    });
     return found == configured.rend() ? configured.end() : std::prev(found.base());
   };
-  const auto daily = preferences.daily_model ? model_for(*preferences.daily_model) : configured.begin();
+  const auto first = std::ranges::find_if(configured, selectable);
+  auto daily = preferences.daily_model ? model_for(*preferences.daily_model) : first;
+  if (daily == configured.end()) daily = first;
   const auto general = daily != configured.end() ? daily->ref : agentkit_preview::DemoModel;
   if (preferences.review_model) {
     const auto review = model_for(*preferences.review_model);
@@ -1218,7 +1282,7 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
   *runtime_ref = registered;
   using agentkit_preview::DemoModel;
   const auto code = code_model ? std::optional{code_model->ref}
-      : configured.empty() ? std::nullopt : std::optional{general == DemoModel ? configured.front().ref : general};
+      : first == configured.end() ? std::nullopt : std::optional{general == DemoModel ? first->ref : general};
   const auto selected = general.id;
   const auto instructions = [&preferences](std::string base) {
     return agentkit_preview::WithReplyPreferences(std::move(base), preferences);
@@ -1360,6 +1424,24 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
   const auto export_directory = files.exports.Path();
   std::vector<kit::AgentId> general_targets{agentkit_preview::DesignAgent, agentkit_preview::PptAgent};
   if (release_available) general_targets.push_back(agentkit_preview::CodeAgent);
+  const auto register_expert = [&](kit::AgentId id, std::string name, std::string task,
+                                    const std::optional<kit::ModelProviderRef>& preferred) {
+    const auto expert_model = settings->SelectExpertModel(id, preferred, general).value_or(DemoModel);
+    std::vector<kit::ToolId> tools{
+        agentkit_preview::ListWorkspaceFiles, agentkit_preview::SearchWorkspaceFiles, agentkit_preview::ReadWorkspaceFiles};
+#ifdef _WIN32
+    tools.insert(tools.end(), {agentkit_preview::WebSearch, agentkit_preview::WebFetch});
+#endif
+    Require(registered->RegisterAgent({.definition = {.ref = {std::move(id), 1}, .display_name = std::move(name),
+        .instructions = std::move(task) + " Work on the assigned question only. Use available read tools to verify facts, "
+            "and name the files or URLs you checked. State what you could not verify. Return a concise conclusion to the parent.",
+        .model = expert_model.id, .tools = std::move(tools), .requires_model = {.text_stream = true},
+        .budget = {.model_turns = 6, .tool_calls = 6}}}));
+  };
+  register_expert(agentkit_preview::ResearchExpert, "Research expert", "Inspect the relevant sources and report concrete findings.",
+      preferences.research_model);
+  register_expert(agentkit_preview::VerificationExpert, "Verification expert",
+      "Independently check behavior, risks and acceptance evidence.", preferences.verification_model);
   register_workspace_agent({
       .definition = {.ref = {agentkit_preview::GeneralAgent, 1}, .display_name = "General assistant",
           .instructions = instructions({}), .model = selected,
@@ -1368,12 +1450,14 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
               agentkit_preview::ExportPresentation},
           .skill_sources = {agentkit_preview::PreviewSkills},
           .content_types = std::move(general_content),
+          .delegates = {agentkit_preview::ResearchExpert, agentkit_preview::VerificationExpert},
           .collaboration_targets = std::move(general_targets),
           .capabilities = {kit::Capability::ReadGoal, kit::Capability::ManageGoal, kit::Capability::CompleteGoal,
               kit::Capability::ReadProject, kit::Capability::ManageTask, kit::Capability::DiscoverSession, kit::Capability::ReadSession,
-              kit::Capability::CreateSession, kit::Capability::SendMessage, kit::Capability::WaitForResult},
+              kit::Capability::CreateSession, kit::Capability::SendMessage, kit::Capability::WaitForResult, kit::Capability::DelegateRun},
           .requires_model = {.text_stream = true, .structured_output = true}},
-      .run = [release_available, export_directory, workspaces, settings, workspace_tests, runtime_ref](kit::RunContext run, kit::RunInput input) {
+      .run = [release_available, export_directory, workspaces, settings, workspace_tests, runtime_ref](
+                 kit::RunContext run, kit::RunInput input) {
         return agentkit_preview::RunGeneral(std::move(run), std::move(input), {}, release_available, export_directory,
             workspaces, settings, workspace_tests, *runtime_ref);
       },
@@ -1456,9 +1540,9 @@ File DefaultGanWorkDatabase() {
   return database;
 }
 
-std::optional<View> PreviewAttachmentAction(const std::shared_ptr<PreviewService>& service, const kit::AgentId& agent,
+std::optional<View> PreviewComposerAddAction(const std::shared_ptr<PreviewService>& service, const kit::AgentId& agent,
     State<kit::UserRunOptions> next, State<kit::AgentChatDraftSources> sources, kit::ModelCapabilities capabilities,
-    std::function<void()> changed = {});
+    std::function<void()> changed = {}, std::vector<MenuEntry> actions = {});
 
 std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std::optional<File> database, bool read_model_configuration,
                     std::optional<File> startup_workspace = {}, std::optional<kit::ModelRegistration> code_model = {},
@@ -1533,6 +1617,10 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
           models = ConfiguredModels();
           auto profiles = data.Child("models");
           co_await LoadModelProfiles(service, profiles, models);
+          auto applied = service->settings.Get();
+          agentkit_preview::ClearRetiredModelRoles(applied, *service->run_settings);
+          service->settings = applied;
+          service->applied_settings = std::move(applied);
           service->model_profiles = std::move(profiles);
           reviewer = ConfiguredReviewModel();
           auto executable = Environment("HUXERUI_AGENTKIT_CTEST");
@@ -1563,7 +1651,9 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
           if (!added.Succeeded()) throw std::runtime_error(added.Error().message);
           service->startup_workspace = std::move(added).Value();
         }
-        service->code_available = !models.empty() || code_model.has_value();
+        service->code_available = code_model.has_value() || std::ranges::any_of(models, [service](const auto& model) {
+          return !service->run_settings->IsRetired(model.ref.id);
+        });
         auto persisted = std::move(store.Value().sessions);
         if (adapt_store) persisted = adapt_store(std::move(persisted));
         service->attachments = std::make_shared<agentkit_preview::AttachmentImports>(data.Child("attachments"));
@@ -1584,9 +1674,9 @@ std::shared_ptr<PreviewService> InstallPreview(ApplicationContext& context, std:
               caps.image_input |= running.image_input;
               caps.file_input |= running.file_input;
             }
-            auto attachments = PreviewAttachmentAction(host, selection_agent, next, sources, caps);
+            auto additions = PreviewComposerAddAction(host, selection_agent, next, sources, caps);
             return agentkit_preview::RunSettingsControls(host->run_settings, next, selection_agent, {}, {},
-                {}, std::move(attachments), AddModelAction(host), false);
+                {}, std::move(additions), AddModelAction(host), false);
           }, [settings](const kit::RunStartBinding& binding) {
             return UseService<Resources>()->GetString(settings->ModelLabel(binding.model));
           }};
@@ -1885,6 +1975,8 @@ StringVariant PreviewAgentLabel(const kit::AgentRef& agent) {
   if (agent.id == agentkit_preview::CodeAgent) return ::app::strings::ui_code_assistant;
   if (agent.id == agentkit_preview::PptAgent) return ::app::strings::ui_ppt_assistant;
   if (agent.id == agentkit_preview::DesignAgent) return ::app::strings::ui_design_assistant;
+  if (agent.id == agentkit_preview::ResearchExpert) return ::app::strings::ui_research_expert;
+  if (agent.id == agentkit_preview::VerificationExpert) return ::app::strings::ui_verification_expert;
   if (agent.id == agentkit_preview::GeneralAgent) return ::app::strings::ui_general_assistant;
   return {};
 }
@@ -2119,31 +2211,62 @@ View PreviewConversation(kit::AgentId agent, std::shared_ptr<kit::Conversation> 
   return agentkit_preview::PreviewSideChatWorkspace(std::move(chat), std::move(conversation), selection, draft, focus);
 }
 
-std::optional<View> PreviewAttachmentAction(const std::shared_ptr<PreviewService>& service, const kit::AgentId& agent,
+std::optional<View> PreviewComposerAddAction(const std::shared_ptr<PreviewService>& service, const kit::AgentId& agent,
     State<kit::UserRunOptions> next, State<kit::AgentChatDraftSources> sources, kit::ModelCapabilities capabilities,
-    std::function<void()> changed) {
+    std::function<void()> changed, std::vector<MenuEntry> actions) {
   const auto image_model = service->run_settings->CurrentModel(service->settings->image_model);
-  if (image_model && sources->attachments.empty() &&
-      service->run_settings->Capabilities(image_model, agent).image_input) {
-    auto images = agentkit_preview::AttachmentPicker(service->attachments, sources, {.image_input = true},
-        [next, image_model, changed] {
-          auto selected = next.Get();
-          selected.model = image_model;
-          next = std::move(selected);
-          if (changed) changed();
-        });
-    if (!capabilities.file_input) return images;
-    capabilities.image_input = false;
-    return Row{std::move(images), agentkit_preview::AttachmentPicker(service->attachments, sources, capabilities)}
-        .With(Spacing(6.0F));
-  }
-  if (capabilities.image_input || capabilities.file_input) {
-    return agentkit_preview::AttachmentPicker(service->attachments, sources, capabilities);
-  }
-  return {};
+  const auto image_capabilities = image_model && sources->attachments.empty()
+      ? service->run_settings->Capabilities(image_model, agent) : kit::ModelCapabilities{};
+  if (actions.empty() && !capabilities.image_input && !capabilities.file_input && !image_capabilities.image_input) return {};
+  return agentkit_preview::ComposerAddMenu(service->attachments, sources, capabilities, image_capabilities,
+      [next, image_model, changed = std::move(changed)](bool use_image_model) {
+        if (!use_image_model || next->model == image_model) return;
+        auto selected = next.Get();
+        selected.model = image_model;
+        next = std::move(selected);
+        if (changed) changed();
+      }, std::move(actions));
 }
 
 } // namespace
+
+kit::Async<void> agentkit_preview::TestModelConnection(ModelProfileInput profile) {
+  using Result = kit::AgentResult<void>;
+#ifdef __EMSCRIPTEN__
+  co_return Result::Failure({.code = kit::ErrorCode::Unsupported});
+#else
+  NormalizeModelProfile(profile);
+  kit::ModelRegistration model;
+  try {
+    auto environment = ModelKeyEnvironment(profile.api_key);
+    const auto* token = environment.empty() ? nullptr : std::getenv(environment.c_str());
+    if (!environment.empty() && (!token || !*token))
+      co_return Result::Failure({.code = kit::ErrorCode::InvalidArgument, .provider_code = "missing_key_environment"});
+    model = MakeProfileModel(profile, std::move(environment));
+  } catch (const std::invalid_argument&) {
+    co_return Result::Failure({.code = kit::ErrorCode::InvalidArgument});
+  }
+
+  const auto deadline = std::chrono::time_point_cast<kit::Duration>(std::chrono::system_clock::now()) + std::chrono::seconds(20);
+  kit::ModelTurnRequest turn{.turn = {kit::NewCommandId().value}, .run = {kit::NewCommandId().value}, .provider = model.ref,
+      .allow_server_state = false, .items = {kit::ModelContent{kit::ModelContent::Role::User, std::string("Reply with OK.")}},
+      .deadline = deadline};
+  auto started = co_await model.provider->StartTurnAsync(std::move(turn));
+  if (!started.Succeeded()) co_return Result::Failure(started.Error());
+  auto stream = std::move(started).Value();
+  for (;;) {
+    auto next = co_await stream->ReadAsync();
+    if (!next.Succeeded()) co_return Result::Failure(next.Error());
+    if (!next.Value() || std::holds_alternative<kit::ModelFinished>(*next.Value())) break;
+    const auto* text = std::get_if<kit::ModelTextDelta>(&*next.Value());
+    if (text && !TrimModelField(text->utf8).empty()) {
+      static_cast<void>(co_await stream->StopAsync());
+      co_return Result::Success();
+    }
+  }
+  co_return Result::Failure({.code = kit::ErrorCode::ProtocolError});
+#endif
+}
 
 [[huxerui::composable]]
 View DetachedArtifactReview(std::shared_ptr<kit::Conversation> conversation, std::shared_ptr<kit::AgentRuntime> runtime,
@@ -2326,6 +2449,7 @@ View PreviewShell() {
   const auto ready = UseState(false);
   const auto folder = UseState(std::optional<kit::WorkspaceId>{});
   const auto pending_copies = UseState(std::vector<std::shared_ptr<agentkit_preview::WorktreePreview>>{});
+  const auto importing_draft_report = UseState(false);
   const auto workspace_id = folder.Get();
   const auto& current_draft = drafts.Get()->try_emplace(workspace_id).first->second;
   const auto draft = current_draft.text;
@@ -2494,7 +2618,8 @@ View PreviewShell() {
     auto start = draft_start;
     if (!start.execution_profile) start.execution_profile = default_profile;
     start.model = service->run_settings->CurrentModel(start.model);
-    if (code && !start.model) start.model = service->run_settings->DefaultModel(new_agent);
+    if (!start.model && (code || service->run_settings->HasRetiredDefault(new_agent)))
+      start.model = service->run_settings->DefaultModel(new_agent);
     entry.creating = true;
     entry.error = "";
     tasks.Launch([service, entry, input = entry.text->text, group = entry.group.Get(), role = entry.assistant.Get(),
@@ -2957,18 +3082,11 @@ View PreviewShell() {
           .draft_sources = composer.sources,
           .draft = composer.text,
           .run_controls = kit::AgentChatRunControls{composer.next,
-              [service, goal_session, conversation_action_style, next = composer.next, skills = composer.skills,
+              [service, goal_session, next = composer.next, skills = composer.skills,
                error = composer.preference_error, sources = composer.sources](
                   const kit::SessionSummary& summary, std::optional<kit::RunStartBinding> current) {
                 const auto folder = summary.workspace ? service->workspaces->Find(*summary.workspace) : std::nullopt;
-                std::vector<View> actions{
-                    ProvideEnvironment(conversation_action_style,
-                        IconButton(::app::images::goal, ::app::strings::ui_goal)
-                            .OnClick([goal_session, id = summary.id] { goal_session = id; })
-                            .With(Tooltip(::app::strings::ui_goal)).Key("conversation-goal")),
-                };
-                if (summary.agent.id == agentkit_preview::GeneralAgent || (service->imported_skills && service->imported_skills->HasEnabled()))
-                  actions.push_back(agentkit_preview::SkillPicker(service->runtime, {summary.id}, skills));
+                std::vector<View> actions;
                 auto caps = service->run_settings->Capabilities(next->model, summary.agent.id);
                 if (current) {
                   const auto active = service->run_settings->Capabilities(current->model, summary.agent.id);
@@ -2976,8 +3094,11 @@ View PreviewShell() {
                   caps.file_input |= active.file_input;
                 }
                 auto save_preference = [service, id = summary.id] { SaveComposerPreference(service, id); };
-                if (auto picker = PreviewAttachmentAction(service, summary.agent.id, next, sources, caps, save_preference))
-                  actions.push_back(std::move(*picker));
+                if (auto add = PreviewComposerAddAction(service, summary.agent.id, next, sources, caps, save_preference,
+                    {MenuItem(::app::images::goal, ::app::strings::ui_goal, [goal_session, id = summary.id] { goal_session = id; })}))
+                  actions.push_back(std::move(*add));
+                if (summary.agent.id == agentkit_preview::GeneralAgent || (service->imported_skills && service->imported_skills->HasEnabled()))
+                  actions.push_back(agentkit_preview::SkillPicker(service->runtime, {summary.id}, skills));
                 auto controls = agentkit_preview::RunSettingsControls(service->run_settings, next, summary.agent.id, summary.workspace,
                     folder ? folder->NativeFolder() : std::nullopt,
                     std::move(save_preference), Flow(std::move(actions)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center)),
@@ -3187,6 +3308,7 @@ View PreviewShell() {
     std::optional<View> controls;
     if (ready.Get()) {
       std::optional<View> draft_action;
+      std::vector<MenuEntry> add_items;
       if (new_agent == agentkit_preview::GeneralAgent || (service->imported_skills && service->imported_skills->HasEnabled())) {
         kit::SkillCatalogQuery query{new_agent, ProjectFor(workspace_id), workspace_id};
         draft_action = agentkit_preview::SkillPicker(service->runtime, std::move(query), new_skills);
@@ -3206,20 +3328,21 @@ View PreviewShell() {
         } else {
           folder_report = BrowserDraftReport(service, project, workspace, native_workspace, new_report);
           if (picker && picker->CanOpenFiles()) {
-            auto report_action = agentkit_preview::ImportReportControl(service->runtime, project,
-                [new_report](agentkit_preview::ImportedPresentationReport report) { new_report = std::move(report); }, draft_error)
-                .Key("draft-report/" + project.value);
-            if (draft_action) draft_action = Flow{std::move(*draft_action), std::move(report_action)}.With(Spacing(4.0F));
-            else draft_action = std::move(report_action);
+            add_items.emplace_back(MenuItem(::app::images::slides, ::app::strings::ui_add_report,
+                [tasks, picker, runtime = service->runtime, project, new_report, importing_draft_report, draft_error] {
+                  tasks.Launch(agentkit_preview::PickPresentationReport(picker, runtime, project,
+                      [new_report](agentkit_preview::ImportedPresentationReport report) { new_report = std::move(report); },
+                      importing_draft_report, draft_error));
+                }).Enabled(!importing_draft_report.Get()));
           }
         }
       }
       if (!new_sources->attachments.empty()) compose.push_back(kit::AgentChatAttachmentChips(new_sources));
       const auto caps = service->run_settings->Capabilities(new_start->model, new_agent);
-      if (auto picker = PreviewAttachmentAction(service, new_agent, new_start, new_sources, caps)) {
-        if (draft_action) draft_action = Flow{std::move(*draft_action), std::move(*picker)}
+      if (auto add = PreviewComposerAddAction(service, new_agent, new_start, new_sources, caps, {}, std::move(add_items))) {
+        if (draft_action) draft_action = Flow{std::move(*add), std::move(*draft_action)}
             .With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Center));
-        else draft_action = std::move(*picker);
+        else draft_action = std::move(*add);
       }
       controls = agentkit_preview::RunSettingsControls(service->run_settings, new_start, new_agent, workspace_id,
           native_workspace, {}, std::move(draft_action), AddModelAction(service), true, service->settings->file_access.full_access,
@@ -3351,7 +3474,8 @@ View PreviewShell() {
   if (compact && focus_draft.Get() && drawer_style.motion) drawer_style.motion->close = SnapSpec{};
   View settings = settings_available && showing_settings.Get()
       ? agentkit_preview::PreviewSettingsPage(service->settings, service->applied_settings, service->run_settings,
-          *service->settings_file, AddModelAction(service), EditModelAction(service), [showing_settings] { showing_settings = false; },
+          *service->settings_file, AddModelAction(service), EditModelAction(service), RemoveModelAction(service),
+          [showing_settings] { showing_settings = false; },
           [service](agentkit_preview::LocalFilePermissions permissions) -> kit::Async<void> {
             service->local_files->Apply(std::move(permissions));
             co_return co_await service->runtime->RefreshAccessAsync();

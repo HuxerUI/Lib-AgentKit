@@ -6,6 +6,7 @@
 #include "json_wire.h"
 #include "markdown_selection.h"
 #include "runtime_internal.h"
+#include "../support/token_count.h"
 
 #include <algorithm>
 #include <array>
@@ -300,16 +301,24 @@ std::optional<ModelContextUsage> ComposerContextUsage(const SessionSnapshot& sna
   return last->context_usage;
 }
 
+[[huxerui::composable]]
 View ComposerContextIndicator(ModelContextUsage usage, const ColorScheme& colors) {
   const auto label = huxerui_agentkit::strings::ui_composer_context;
   const auto ratio = usage.input_budget_tokens ?
       std::min(1.0, static_cast<double>(usage.estimated_input_tokens) / usage.input_budget_tokens) : 1.0;
   const auto percent = static_cast<unsigned>(std::floor(ratio * 100.0));
-  const auto details = usage.before_compaction_tokens
-      ? StringVariant::Format(huxerui_agentkit::strings::ui_composer_context_compacted,
-            percent, usage.estimated_input_tokens, usage.input_budget_tokens, *usage.before_compaction_tokens)
-      : StringVariant::Format(huxerui_agentkit::strings::ui_composer_context_usage,
-            percent, usage.estimated_input_tokens, usage.input_budget_tokens);
+  const auto used = detail::FormatTokenCount(usage.estimated_input_tokens);
+  const auto budget = detail::FormatTokenCount(usage.input_budget_tokens);
+  auto details = UseString(huxerui_agentkit::strings::ui_composer_context_progress, percent);
+  if (usage.context_window_tokens) {
+    details += '\n' + UseString(huxerui_agentkit::strings::ui_composer_context_window,
+        detail::FormatTokenCount(*usage.context_window_tokens, true));
+  }
+  details += '\n' + UseString(huxerui_agentkit::strings::ui_composer_context_usage, used, budget);
+  if (usage.before_compaction_tokens) {
+    details += '\n' + UseString(huxerui_agentkit::strings::ui_composer_context_compacted,
+        detail::FormatTokenCount(*usage.before_compaction_tokens));
+  }
   const auto ink = ratio >= 0.9 ? colors.primary : colors.on_surface_variant;
   return Canvas([ratio, track = colors.outline, ink](PaintContext& context, Size size) {
     constexpr auto circle = 2.0F * std::numbers::pi_v<float>;
@@ -451,6 +460,8 @@ struct ChatToolGroup {
 struct ChatActivityRows {
   std::map<RunId, ChatTurnActivity> turns;
   std::map<MessageId, RunId> footers;
+  std::map<MessageId, RunId> expert_groups;
+  std::set<RunId> pending_approvals;
   std::map<MessageId, std::vector<ChatToolGroup>> groups;
   std::map<ToolCallId, const InteractionSnapshot*> approvals;
   std::set<MessageId> outputs;
@@ -489,8 +500,10 @@ ChatActivityRows ActivityRows(const SessionSnapshot& snapshot, const ChatActivit
     if (!interaction.run) continue;
     const auto root = roots.find(*interaction.run);
     if (root != roots.end() && interaction.state == InteractionState::Pending &&
-        (std::holds_alternative<ToolApproval>(interaction.body) || std::holds_alternative<OperationApproval>(interaction.body)))
+        (std::holds_alternative<ToolApproval>(interaction.body) || std::holds_alternative<OperationApproval>(interaction.body))) {
+      rows.pending_approvals.insert(*interaction.run);
       rows.turns.at(root->second).waits_for_approval = true;
+    }
   }
   std::map<RunId, std::size_t> first_rows;
   for (std::size_t index = 0; index < snapshot.messages.size(); ++index) {
@@ -560,6 +573,10 @@ ChatActivityRows ActivityRows(const SessionSnapshot& snapshot, const ChatActivit
   }
   for (const auto& [id, turn] : rows.turns) {
     if (turn.last_message) rows.footers.emplace(*turn.last_message, id);
+    if (const auto first = first_rows.find(id); !turn.delegates.empty() && first != first_rows.end()) {
+      const auto anchor = std::ranges::lower_bound(rows.history, first->second);
+      if (anchor != rows.history.end()) rows.expert_groups.emplace(snapshot.messages[*anchor].ref.message, id);
+    }
   }
   std::optional<RunId> assistant_run;
   const auto begin_assistant = [&](const std::optional<RunId>& run, std::variant<MessageId, ToolCallId, RunId> entry) {
@@ -631,7 +648,44 @@ View ChatActivityHeader(StringVariant status, std::optional<StringVariant> time 
 }
 
 [[huxerui::composable]]
-View ChatRunActivity(RunSnapshot run, std::vector<RunSnapshot> delegates, bool waits_for_approval,
+View ChatExpertGroup(std::vector<RunSnapshot> delegates, const std::set<RunId>& pending_approvals,
+    const decltype(AgentChatOptions::agent_label)& agent_label, std::function<void()> keep_reading) {
+  using namespace huxerui_agentkit::strings;
+  const auto expanded = UseState(std::optional<bool>{});
+  const bool active = std::ranges::any_of(delegates, [](const auto& child) { return !detail::Terminal(child.state); });
+  const bool open = expanded->value_or(active);
+  const auto theme = UseTheme();
+  const auto& colors = theme.colors;
+  const TextStyle label{Font::System(12.0F).WithWeight(FontWeight::Medium), colors.on_surface_variant};
+  const auto title = StringVariant::Format(ui_parallel_experts, delegates.size());
+  std::vector<View> content{ActivityAction(Row{
+      Image(open ? huxerui_agentkit::images::chevron_down : huxerui_agentkit::images::chevron_right)
+          .Tint(colors.on_surface_variant).With(Frame{.width = 12.0F, .height = 12.0F}),
+      Text(title, TextRole::Label).Style(label),
+  }.With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Center), Frame{.min_height = 26.0F}),
+      theme, title, [expanded, open, keep_reading] { keep_reading(); expanded = !open; }, open).Key("chat-expert-toggle")};
+  if (open) {
+    for (const auto& child : delegates) {
+      auto name = agent_label ? agent_label(child.agent) : std::string{};
+      if (name.empty()) name = child.agent.id.value;
+      auto status = ActivityStateLabel(child.state);
+      if (child.state == RunState::WaitingForDependency && !child.timing) status = ui_queued;
+      if (child.state == RunState::WaitingForInput && pending_approvals.contains(child.id)) status = ui_awaiting_approval;
+      if (child.state == RunState::Running && child.model_active) status = ui_generating_reply;
+      std::vector<View> entry{Text(name + " · " + UseString(status), TextRole::Label).Style(label)};
+      const auto& result = child.result ? child.result->summary : child.failure ? child.failure->message : std::string{};
+      if (!result.empty()) entry.push_back(Text(result).Style({Font::System(13.0F), colors.on_surface_variant})
+          .LineLimit(2).Overflow(TextOverflow::Ellipsis).Key("chat-expert-conclusion"));
+      content.push_back(Column(std::move(entry)).With(Spacing(4.0F), CrossAlign(CrossAxisAlignment::Stretch),
+          Padding(EdgeInsets{.left = 18.0F})).Key("chat-expert/" + child.id.value));
+    }
+  }
+  return Column(std::move(content)).With(Spacing(6.0F), CrossAlign(CrossAxisAlignment::Stretch),
+      Padding(EdgeInsets{.top = 3.0F, .bottom = 8.0F})).Key("chat-experts");
+}
+
+[[huxerui::composable]]
+View ChatRunActivity(RunSnapshot run, bool waits_for_approval,
                     std::function<void()> keep_reading, std::function<void()> show_changes) {
   using namespace huxerui_agentkit::strings;
   const auto expanded = UseState(std::optional<bool>{});
@@ -676,7 +730,7 @@ View ChatRunActivity(RunSnapshot run, std::vector<RunSnapshot> delegates, bool w
         theme, title, std::move(activate), open).Key(std::move(key));
   };
   const bool show_wait = run.state != RunState::WaitingForInput && waiting >= Duration{1000};
-  const bool has_work = !delegates.empty() || !run.reasoning_summary.empty() || show_wait;
+  const bool has_work = !run.reasoning_summary.empty() || show_wait;
   const bool open = expanded.Get().value_or(false);
   std::optional<View> disclosure;
   if (has_work) disclosure = toggle(ui_work_activity, "chat-run-activity", open, [expanded, open] { expanded = !open; });
@@ -701,9 +755,6 @@ View ChatRunActivity(RunSnapshot run, std::vector<RunSnapshot> delegates, bool w
       if (showing) entries.push_back(Text(run.reasoning_summary).Style(note)
           .With(Padding(EdgeInsets{.bottom = 4.0F, .left = 17.0F})).Key("chat-reasoning-summary"));
     }
-    for (const auto& child : delegates)
-      entries.push_back(Text(child.agent.id.value + " · " + UseString(ActivityStateLabel(child.state)), TextRole::Label)
-          .Style(note).Key(child.id.value));
     if (show_wait) entries.push_back(Text(FormatRunTime(ui_run_input_wait, waiting), TextRole::Label).Style(note));
     content.push_back(Row{
         Canvas([line = colors.outline](PaintContext& context, Size size) {
@@ -945,7 +996,7 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
                  Revision access_revision, const std::shared_ptr<const AgentChatLinkHandler>& links,
                  const std::optional<InlineArtifactSummary>& inline_summary,
                  const decltype(AgentChatOptions::render_block)& render_block, std::optional<View> assistant_avatar,
-                 bool bubbles, bool narrow) {
+                 bool bubbles, bool narrow, bool delegated) {
   const auto& colors = theme.colors;
   const bool user = message.author == MessageAuthor::User;
   const bool agent_reply = message.author == MessageAuthor::Agent;
@@ -953,7 +1004,7 @@ View MessageView(const Message& message, const std::shared_ptr<Conversation>& co
   const bool artifact_delivery = bubbles && message.author == MessageAuthor::Tool && !message.blocks.empty() &&
       std::ranges::all_of(message.blocks, [](const ContentBlock& block) { return std::holds_alternative<ArtifactBlock>(block.body); });
   std::vector<View> content;
-  if (!bubble && !artifact_delivery) content.push_back(Text(AuthorLabel(message.author, agent))
+  if ((!bubble && !artifact_delivery) || (delegated && agent_reply)) content.push_back(Text(AuthorLabel(message.author, agent))
       .Style({Font::System(12.0F).WithWeight(FontWeight::SemiBold), colors.on_surface_variant}));
   if (steer) {
     auto status = Text(*steer == SteerState::Pending ? huxerui_agentkit::strings::ui_waiting_to_apply :
@@ -2529,6 +2580,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
     std::optional<SteerState> steer;
     std::optional<View> recover;
     std::string agent;
+    bool delegated = false;
     if (message.run) {
       const auto run = std::ranges::find(current->runs, *message.run, &RunSnapshot::id);
       if (run != current->runs.end()) {
@@ -2539,7 +2591,11 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
               Button(huxerui_agentkit::strings::ui_restore_draft).OnClick([restore, command = *found->recovery] { restore(command); })
                   .With(Enabled(vacant() && !recovering.Get())).Key("restore-supplement"));
         }
-        if (agent_label && message.author == MessageAuthor::Agent) agent = agent_label(run->agent);
+        delegated = run->parent.has_value();
+        if (message.author == MessageAuthor::Agent) {
+          if (agent_label) agent = agent_label(run->agent);
+          if (agent.empty() && delegated) agent = run->agent.id.value;
+        }
       }
     }
     std::optional<View> selection_actions;
@@ -2561,7 +2617,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
         std::move(selection_actions),
         std::move(agent), theme, current->access_revision, links, inline_summary, render_block,
         message.author == MessageAuthor::Agent ? assistant_avatar(message.ref.message, message.run) : std::nullopt,
-        bubbles, narrow)
+        bubbles, narrow, delegated)
         .Key(message.ref.message.value);
     };
     const auto reading = detail::ChatReadingPosition{"message/" + message.ref.message.value};
@@ -2582,6 +2638,10 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
       if (!artifacts.blocks.empty()) add_message(artifacts);
     } else {
       add_message(message);
+    }
+    if (const auto experts = activity->expert_groups.find(message.ref.message); experts != activity->expert_groups.end()) {
+      auto group = ChatExpertGroup(activity->turns.at(experts->second).delegates, activity->pending_approvals, agent_label, keep_reading);
+      row.push_back(bubbles ? AssistantChatLine(std::move(group), std::nullopt, narrow) : std::move(group));
     }
     if (const auto groups = activity->groups.find(message.ref.message); groups != activity->groups.end()) {
       const auto render_step = [current, conversation, anchor = std::shared_ptr<const Message>(current, &message), render_block,
@@ -2635,7 +2695,7 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
           };
         }
       }
-      auto details = ChatRunActivity(turn.run, turn.delegates, turn.waits_for_approval, keep_reading, std::move(show_changes));
+      auto details = ChatRunActivity(turn.run, turn.waits_for_approval, keep_reading, std::move(show_changes));
       row.push_back(bubbles ? AssistantChatLine(std::move(details), assistant_avatar(turn.run.id, turn.run.id), narrow).Key(turn.run.id.value)
                             : std::move(details));
     }
@@ -2778,21 +2838,13 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
       if (found == children.end()) return;
       for (const auto* run : found->second) {
         last_run_tree.insert(run->id);
-        auto status = huxerui_agentkit::strings::ui_running;
-        switch (run->state) {
-          case RunState::WaitingForInput: status = huxerui_agentkit::strings::ui_waiting_for_input; break;
-          case RunState::WaitingForReply: status = huxerui_agentkit::strings::ui_waiting_for_reply; break;
-          case RunState::WaitingForDependency:
-            status = run->waits.empty() ? huxerui_agentkit::strings::ui_queued : huxerui_agentkit::strings::ui_waiting_for_dependency;
-            break;
-          case RunState::Cancelling: status = huxerui_agentkit::strings::ui_stopping; break;
-          case RunState::Succeeded: status = huxerui_agentkit::strings::ui_completed; break;
-          case RunState::Failed: status = huxerui_agentkit::strings::ui_failed; break;
-          case RunState::Cancelled: status = huxerui_agentkit::strings::ui_cancelled; break;
-          case RunState::Running: break;
+        if (!activity) {
+          auto status = ActivityStateLabel(run->state);
+          if (run->state == RunState::Running) status = huxerui_agentkit::strings::ui_running;
+          if (run->state == RunState::WaitingForDependency && run->waits.empty()) status = huxerui_agentkit::strings::ui_queued;
+          rows.push_back(Text(role_label(run->agent) + " · " + UseString(status), TextRole::Label)
+              .With(Padding(EdgeInsets{.left = 12.0F * std::min(depth, 6U)})).Key("delegate/" + run->id.value));
         }
-        rows.push_back(Text(role_label(run->agent) + " · " + UseString(status), TextRole::Label)
-            .With(Padding(EdgeInsets{.left = 12.0F * std::min(depth, 6U)})).Key("delegate/" + run->id.value));
         visit(visit, run->id, depth + 1);
       }
     };

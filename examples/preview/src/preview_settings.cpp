@@ -4,6 +4,7 @@
 
 #include "general_workflow.h"
 #include "preview_theme.h"
+#include "../../../support/token_count.h"
 
 #include <huxerui/huxerui.h>
 #include <nlohmann/json.hpp>
@@ -214,6 +215,39 @@ View SettingsCategoryLink(SettingsCategory category, State<SettingsSection> acti
           Semantics{.role = SemanticRole::Button, .label = category.title, .selected = selected});
 }
 
+[[huxerui::composable]]
+View RemoveModelDialog(DialogContext dialog, ModelChoice model, RemoveModelProfile remove_model) {
+  const auto tasks = UseApplicationTaskScope();
+  const auto removing = UseState(false);
+  const auto failed = UseState(false);
+  const auto& colors = UseTheme().colors;
+  const auto style = UseEnvironment<ButtonStyle>();
+  const auto remove = [dialog, model, remove_model, tasks, removing, failed] {
+    if (removing.Get()) return;
+    removing = true;
+    failed = false;
+    tasks.Launch([dialog, ref = model.ref, remove_model, removing, failed]() mutable -> Task<void> {
+      auto result = co_await remove_model(std::move(ref));
+      removing = false;
+      if (result.Succeeded()) dialog.Dismiss();
+      else failed = true;
+    });
+  };
+  auto body = Column{
+      Text(StringVariant::Format(::app::strings::ui_remove_model_description, model.label))
+          .With(Foreground(colors.on_surface_variant)),
+      failed.Get() ? Text(::app::strings::ui_model_remove_failed).With(Foreground(colors.error)) : View{},
+  }.With(Spacing(8.0F), Padding(EdgeInsets::Symmetric(20.0F, 15.0F)), CrossAlign(CrossAxisAlignment::Stretch));
+  auto actions = Row{Spacer(),
+      ProvideEnvironment(PreviewSecondaryButton(style, colors), Button(::app::strings::ui_cancel)
+          .OnClick([dialog] { dialog.Dismiss(); }).With(Enabled(!removing.Get())).Key("cancel-remove-model")),
+      ProvideEnvironment(PreviewPrimaryButton(style, colors), Button(::app::strings::ui_remove_model)
+          .OnClick(remove).With(Enabled(!removing.Get())).Key("confirm-remove-model")),
+  }.With(Spacing(8.0F));
+  return PreviewFormDialog(::app::strings::ui_remove_model, std::move(body), std::move(actions), colors, 440.0F)
+      .Key("remove-model-dialog");
+}
+
 } // namespace
 
 kit::Async<PreviewSettings> ReadPreviewSettings(File file) {
@@ -247,7 +281,8 @@ kit::Async<PreviewSettings> ReadPreviewSettings(File file) {
         .palette = choice == palettes.end() ? PreviewPalette::Graphite : choice->palette, .tone = static_cast<ReplyTone>(tone),
         .instructions = std::move(instructions), .daily_model = ReadModel(doc, "daily_model"),
         .image_model = ReadModel(doc, "image_model"), .review_model = ReadModel(doc, "review_model"),
-        .image_generation_model = image_generation_model, .file_access = std::move(file_access),
+        .image_generation_model = image_generation_model, .research_model = ReadModel(doc, "research_model"),
+        .verification_model = ReadModel(doc, "verification_model"), .file_access = std::move(file_access),
         .mcp_servers = ReadMcpServers(doc.value("mcp_servers", Json::array()))});
   } catch (const std::exception&) {
     co_return Result::Failure({.code = kit::ErrorCode::InvalidArgument, .message = "The saved Preview settings are invalid."});
@@ -270,7 +305,8 @@ kit::Async<void> SavePreviewSettings(File file, PreviewSettings settings) {
       {"tone", static_cast<std::size_t>(settings.tone)}, {"instructions", std::move(settings.instructions)},
       {"daily_model", ModelRecord(settings.daily_model)}, {"image_model", ModelRecord(settings.image_model)},
       {"review_model", ModelRecord(settings.review_model)},
-      {"image_generation_model", ModelRecord(settings.image_generation_model)}, {"mcp_servers", std::move(mcp_servers)}, {"file_access", {
+      {"image_generation_model", ModelRecord(settings.image_generation_model)}, {"research_model", ModelRecord(settings.research_model)},
+      {"verification_model", ModelRecord(settings.verification_model)}, {"mcp_servers", std::move(mcp_servers)}, {"file_access", {
         {"full_access", settings.file_access.full_access}, {"directories", std::move(settings.file_access.directories)},
         {"revision", std::move(settings.file_access.revision)}}}}.dump();
   if (!co_await temporary.WriteStringAsync(std::move(contents)) || !co_await temporary.MoveToAsync(file, true)) {
@@ -299,9 +335,17 @@ ThemeSpec PreviewThemeFor(const PreviewSettings& settings, ThemeBrightness syste
   return PreviewTheme(settings.palette, brightness);
 }
 
+void ClearRetiredModelRoles(PreviewSettings& settings, const RunSettings& models) {
+  for (const auto role : {&settings.daily_model, &settings.image_model, &settings.image_generation_model, &settings.review_model,
+           &settings.research_model, &settings.verification_model}) {
+    if (*role && models.IsRetired((*role)->id)) role->reset();
+  }
+}
+
 [[huxerui::composable]]
 View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> applied,
-    std::shared_ptr<RunSettings> models, File file, AddModelProfile add_model, EditModelProfile edit_model, std::function<void()> close,
+    std::shared_ptr<RunSettings> models, File file, AddModelProfile add_model, EditModelProfile edit_model,
+    RemoveModelProfile remove_model, std::function<void()> close,
     std::function<kit::Async<void>(LocalFilePermissions)> apply_file_access, std::shared_ptr<ImportedSkillSource> imported_skills,
     std::shared_ptr<McpConnections> mcp, std::shared_ptr<kit::AgentRuntime> runtime, State<bool> busy) {
   const auto baseline = current.Get();
@@ -314,10 +358,14 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
   const auto dialog = UseDialog();
   const auto picker = UseService<FilePicker>();
   const auto tasks = UseApplicationTaskScope();
-  Lifecycle([baseline, draft_baseline, draft, instructions] {
+  Lifecycle([baseline, draft_baseline, draft, instructions, models] {
     if (draft.Get() == draft_baseline.Get()) {
       draft = baseline;
       instructions = TextEditingValue::FromText(baseline.instructions);
+    } else {
+      auto updated = draft.Get();
+      ClearRetiredModelRoles(updated, *models);
+      if (updated != draft.Get()) draft = std::move(updated);
     }
     draft_baseline = baseline;
     return [] {};
@@ -330,11 +378,12 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
   auto fields = UseEnvironment<TextFieldStyle>();
   fields.show_label = false;
   const auto secondary = PreviewSecondaryButton(UseEnvironment<ButtonStyle>(), colors);
-  const auto save = [current, draft, file, tasks, error, busy, apply_file_access, mcp] {
+  const auto save = [current, draft, file, tasks, error, busy, apply_file_access, mcp, models] {
     if (busy.Get()) return;
     busy = true;
     error = "";
-    tasks.Launch([current, draft, file, value = draft.Get(), busy, error, apply_file_access, mcp]() mutable -> Task<void> {
+    tasks.Launch([current, draft, file, value = draft.Get(), busy, error, apply_file_access, mcp, models]() mutable -> Task<void> {
+      ClearRetiredModelRoles(value, *models);
       const bool access_changed = value.file_access != current->file_access;
       if (access_changed) value.file_access.revision = kit::NewCommandId().value;
       auto saved = co_await SavePreviewSettings(file, value);
@@ -350,6 +399,7 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
           current_draft.file_access.revision = value.file_access.revision;
           draft = std::move(current_draft);
         }
+        ClearRetiredModelRoles(value, *models);
         current = std::move(value);
       } else error = saved.Error().message;
       busy = false;
@@ -357,7 +407,7 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
   };
   const auto pending_restart = current->daily_model != applied->daily_model ||
       current->review_model != applied->review_model || current->tone != applied->tone ||
-      current->instructions != applied->instructions;
+      current->instructions != applied->instructions || models->HasRetiredDefault(GeneralAgent) || models->HasRetiredDefault(CodeAgent);
   std::vector<View> content;
   std::vector<View> links;
   for (const auto& category : categories) {
@@ -392,11 +442,12 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
     std::erase_if(vision, [](const auto& item) { return !item.capabilities.image_input; });
     auto generation = choices;
     std::erase_if(generation, [](const auto& item) { return !item.editable; });
+    auto experts = models->Models(ResearchExpert);
     std::vector<View> catalog;
     if (choices.empty()) catalog.push_back(Text(::app::strings::ui_no_models_configured)
         .Style({Font::System(13.0F), colors.on_surface_variant}).With(Padding(EdgeInsets::Symmetric(0.0F, 13.0F))));
     const auto token_display = [unknown = UseString(::app::strings::ui_model_limit_unknown)](auto value) {
-      return value ? std::to_string(*value) : unknown;
+      return value ? kit::detail::FormatTokenCount(*value) : unknown;
     };
     for (const auto& model : choices) {
       const auto& limits = model.limits;
@@ -410,6 +461,12 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
       std::vector<View> row{std::move(details)};
       if (edit_model && model.editable) row.push_back(ProvideEnvironment(secondary, Button(::app::strings::ui_edit_model)
           .OnClick([dialog, model, edit_model] { ShowEditModel(dialog, model, edit_model); }).Key("settings-edit-model/" + model.ref.id.value)));
+      if (remove_model && model.editable) row.push_back(ProvideEnvironment(secondary, Button(::app::strings::ui_remove_model)
+          .OnClick([dialog, model, remove_model] {
+            ShowPreviewDialog(dialog, DialogFactory{[model, remove_model](DialogContext context) {
+              return RemoveModelDialog(std::move(context), model, remove_model);
+            }});
+          }).With(Enabled(!busy.Get())).Key("settings-remove-model/" + model.ref.id.value)));
       catalog.push_back(Row(std::move(row)).With(Padding(EdgeInsets::Symmetric(0.0F, 10.0F)),
           Spacing(12.0F), CrossAlign(CrossAxisAlignment::Center)).Key(model.ref.id.value));
     }
@@ -428,6 +485,12 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
         SettingsRow(::app::strings::ui_auto_review_model, ::app::strings::ui_use_for_automatic_approval_review,
             ModelRoleField(::app::strings::ui_auto_review_model, choices, ::app::strings::ui_use_the_host_review_policy, draft, &PreviewSettings::review_model)
                 .Key("settings-review-model"), stack_fields, colors),
+        SettingsRow(::app::strings::ui_research_expert, ::app::strings::ui_research_expert_model_help,
+            ModelRoleField(::app::strings::ui_research_expert, experts, ::app::strings::ui_automatic, draft, &PreviewSettings::research_model)
+                .Key("settings-research-model"), stack_fields, colors),
+        SettingsRow(::app::strings::ui_verification_expert, ::app::strings::ui_verification_expert_model_help,
+            ModelRoleField(::app::strings::ui_verification_expert, std::move(experts), ::app::strings::ui_automatic,
+                draft, &PreviewSettings::verification_model).Key("settings-verification-model"), stack_fields, colors),
     }, colors));
     break;
   }

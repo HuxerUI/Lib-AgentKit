@@ -581,6 +581,7 @@ Task<void> ExerciseContextConversation(TaskScope tasks, kit::ModelRegistration m
   const auto occupancy = *compacted->context_usage;
   Check(occupancy.estimated_input_tokens < *occupancy.before_compaction_tokens &&
       occupancy.estimated_input_tokens <= occupancy.input_budget_tokens &&
+      occupancy.context_window_tokens == model.context_limits.context_window &&
       occupancy.input_budget_tokens < *model.context_limits.context_window,
       "The snapshot context usage does not reflect the budget and compression");
   const auto checked = std::ranges::find(snapshot->messages, std::get<kit::MessageRef>(source->source), &kit::Message::ref);
@@ -600,6 +601,7 @@ Task<void> ExerciseContextConversation(TaskScope tasks, kit::ModelRegistration m
   Check(restored != snapshot->runs.end() && restored->context_usage &&
       restored->context_usage->estimated_input_tokens == occupancy.estimated_input_tokens &&
       restored->context_usage->input_budget_tokens == occupancy.input_budget_tokens &&
+      restored->context_usage->context_window_tokens == occupancy.context_window_tokens &&
       restored->context_usage->before_compaction_tokens == occupancy.before_compaction_tokens,
       "Restart lost context occupancy and its original compaction estimate");
   co_await send("What was the tracking code from the first archive decision? Reply with the exact code only.");

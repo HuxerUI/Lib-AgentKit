@@ -257,6 +257,7 @@ struct DelegatedRun {
   Budget budget;
   std::optional<JsonSchema> expected_result;
   bool started = false;
+  std::optional<ModelProviderRef> requested_model;
 };
 
 struct ModelHistory {
@@ -967,7 +968,8 @@ public:
 
   Async<RunStartBinding> ResolveStart(const SessionData& session, const PrincipalId& user, UserRunOptions start);
 
-  AgentResult<void> CheckInput(const SendInput& input, bool user_selection = false, bool initial_skills = false) const;
+  AgentResult<void> CheckInput(const SendInput& input, bool user_selection = false, bool initial_skills = false,
+      bool existing_attachments = false) const;
 
   Async<std::vector<StoredArtifact>> ResolveModelAttachments(const SessionData& session, ActionParty actor,
       std::vector<ArtifactRef> refs, ModelProviderRef model);
@@ -1005,7 +1007,7 @@ public:
 
   void ScheduleDelegates(SessionData& session);
 
-  Async<void> CheckDelegation(const RunExecution& parent, const DelegateRequest& request);
+  Async<void> CheckDelegation(const RunExecution& parent, const DelegateRequest& request, const ModelProviderRef& model);
 
   Async<std::vector<DelegateOutcome>> Delegate(RunId parent, CommandId command, std::vector<DelegateRequest> requests);
 

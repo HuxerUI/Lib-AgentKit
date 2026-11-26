@@ -41,12 +41,14 @@ struct WorkspaceAllocation {
 
 } // namespace
 
-AgentResult<void> RuntimeState::CheckInput(const SendInput& input, bool user_selection, bool initial_skills) const {
+AgentResult<void> RuntimeState::CheckInput(const SendInput& input, bool user_selection, bool initial_skills,
+                                            bool existing_attachments) const {
   if (input.text.size() > (1 << 20) || !ValidUtf8(input.text) ||
       (Title(input.text).empty() && input.attachments.empty() && input.staged_attachments.empty())) {
     return Fail<void>(ErrorCode::InvalidArgument, "Enter UTF-8 input within 1 MiB or attach a file");
   }
-  if ((!user_selection && !initial_skills && (!input.attachments.empty() || !input.staged_attachments.empty())) ||
+  if ((!user_selection && !initial_skills && (!input.staged_attachments.empty() ||
+          (!existing_attachments && !input.attachments.empty()))) ||
       (!user_selection && (!input.side_chat_conclusions.empty() || !input.recovered_conclusions.empty() ||
                            !input.recovered_steer_conclusions.empty()))) {
     return Fail<void>(ErrorCode::Unsupported, "This runtime does not yet resolve input references");

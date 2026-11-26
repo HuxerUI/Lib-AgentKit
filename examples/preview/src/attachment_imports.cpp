@@ -1,10 +1,12 @@
 #include <app_resources.h>
 #include <huxerui/app.h>
+#include <huxerui/theme.h>
 
 #include "attachment_imports.h"
 
 #include <algorithm>
 #include <array>
+#include <iterator>
 
 namespace agentkit_preview {
 namespace {
@@ -148,40 +150,67 @@ kit::ArtifactStore WithAttachmentImports(kit::ArtifactStore artifacts, std::shar
 }
 
 [[huxerui::composable]]
-View AttachmentPicker(std::shared_ptr<AttachmentImports> imports, State<kit::AgentChatDraftSources> sources,
-    kit::ModelCapabilities capabilities, std::function<void()> on_staged) {
+View ComposerAddMenu(std::shared_ptr<AttachmentImports> imports, State<kit::AgentChatDraftSources> sources,
+    kit::ModelCapabilities capabilities, kit::ModelCapabilities image_capabilities, std::function<void(bool)> on_staged,
+    std::vector<MenuEntry> actions) {
   const auto picker = UseService<FilePicker>();
   const auto tasks = UseTaskScope();
+  const auto menu = UseMenu();
+  const auto anchor = UseViewHandle();
   const auto busy = UseState(false);
   const auto error = UseState(std::string{});
-  if (!imports || !picker || !picker->CanOpenFiles() || (!capabilities.image_input && !capabilities.file_input)) return View{};
-  auto pick = [picker, tasks, imports, sources, capabilities, busy, error, on_staged] {
+  const auto mixed_files = UseString(::app::strings::ui_attachment_model_required);
+  const kit::ModelCapabilities accepted{.image_input = capabilities.image_input || image_capabilities.image_input,
+      .file_input = capabilities.file_input};
+  const auto pick = [picker, tasks, imports, sources, capabilities, image_capabilities, accepted, busy, error, on_staged, mixed_files] {
     if (busy.Get()) return;
     busy = true;
     error = "";
-    tasks.Launch([picker, imports, sources, capabilities, busy, error, on_staged]() -> Task<void> {
+    tasks.Launch([picker, imports, sources, capabilities, image_capabilities, accepted, busy, error, on_staged, mixed_files]() -> Task<void> {
       FilePickerFilter filter{.name = "Model attachments"};
       for (const auto& [ext, mime] : formats) {
-        if (!Supports(capabilities, mime)) continue;
+        if (!Supports(accepted, mime)) continue;
         filter.extensions.emplace_back(ext);
         if (std::ranges::find(filter.content_types, mime) == filter.content_types.end()) filter.content_types.emplace_back(mime);
       }
       auto selected = co_await picker->OpenFilesAsync(std::move(filter));
-      bool added = false;
+      std::vector<std::shared_ptr<const kit::AgentChatAttachment>> attachments;
+      bool has_image = false;
+      bool has_file = false;
       for (auto& file : selected) {
-        auto staged = co_await imports->Stage(std::move(file), capabilities);
+        const auto type = MediaType(file);
+        auto staged = co_await imports->Stage(std::move(file), accepted);
         if (!staged.Succeeded()) { error = staged.Error().message; continue; }
-        auto draft = sources.Get();
-        draft.attachments.push_back(std::move(staged).Value());
-        sources = std::move(draft);
-        added = true;
+        has_image |= type.starts_with("image/");
+        has_file |= !type.starts_with("image/");
+        attachments.push_back(std::move(staged).Value());
       }
-      if (added && on_staged) on_staged();
       busy = false;
+      if (attachments.empty()) co_return;
+      const bool use_image_model = has_image && image_capabilities.image_input && (!has_file || image_capabilities.file_input);
+      if (!use_image_model && ((has_image && !capabilities.image_input) || (has_file && !capabilities.file_input))) {
+        error = mixed_files;
+        co_return;
+      }
+      auto draft = sources.Get();
+      std::ranges::move(attachments, std::back_inserter(draft.attachments));
+      sources = std::move(draft);
+      if (on_staged) on_staged(use_image_model);
     });
   };
-  auto control = Button(on_staged ? ::app::strings::ui_attach_images : ::app::strings::ui_attach_files).OnClick(std::move(pick))
-      .With(Enabled(!busy.Get())).Key(on_staged ? "attach-images" : "attach-files");
+  auto entries = actions;
+  if (imports && picker && picker->CanOpenFiles() && (accepted.image_input || accepted.file_input))
+    entries.insert(entries.begin(), MenuItem(::app::images::folder, ::app::strings::ui_attach_files, pick));
+  if (entries.empty()) return View{};
+  const auto label = ::app::strings::ui_composer_add;
+  auto style = UseEnvironment<IconButtonStyle>();
+  style.icon_size = 18.0F;
+  style.minimum_interactive_size = 34.0F;
+  style.state_layer_size = 30.0F;
+  auto control = ProvideEnvironment(style, IconButton(::app::images::add, label)
+      .OnClick([menu, anchor, entries = std::move(entries)] {
+        menu.Show(anchor, entries, {.placement = {AnchorSide::Above, AnchorAlignment::Start}});
+      }).With(anchor, Tooltip(label), Enabled(!busy.Get())).Key("composer-add"));
   if (error->empty()) return control;
   return Column{std::move(control), Text(error.Get(), TextRole::Label)}.With(Spacing(4.0F));
 }
