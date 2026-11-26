@@ -784,10 +784,10 @@ agentkit_preview::ModelProfileInput ReadModelProfile(const nlohmann::json& recor
     const auto tokens = value->get<std::uint64_t>();
     return tokens ? std::optional{tokens} : std::nullopt;
   };
-  const auto experts = record.value("experts", nlohmann::json::object());
-  const auto strength = [&experts](const char* field) {
+  const auto strengths = record.value("strengths", record.value("experts", nlohmann::json::object()));
+  const auto strength = [&strengths](const char* field) {
     using agentkit_preview::ModelStrength;
-    const auto value = experts.value(field, std::string{});
+    const auto value = strengths.value(field, std::string{});
     return value == "strong" ? ModelStrength::Strong : value == "typical" ? ModelStrength::Typical : ModelStrength::Unknown;
   };
   return {.model = record.at("model").get<std::string>(), .base_url = record.at("base_url").get<std::string>(),
@@ -795,7 +795,7 @@ agentkit_preview::ModelProfileInput ReadModelProfile(const nlohmann::json& recor
       .api_key = std::move(key), .image_input = record.value("image_input", false), .file_input = record.value("file_input", false),
       .reasoning_summary = record.value("reasoning_summary", false),
       .limits = {limit("context_window"), limit("max_input_tokens"), limit("max_output_tokens")},
-      .experts = {strength("code"), strength("reasoning"), strength("vision"), experts.value("automatic", false)}};
+      .strengths = {strength("code"), strength("reasoning"), strength("vision")}};
 }
 
 Task<void> LoadModelProfiles(const std::shared_ptr<PreviewService>& service, const File& directory,
@@ -832,7 +832,7 @@ Task<void> LoadModelProfiles(const std::shared_ptr<PreviewService>& service, con
       auto model = MakeProfileModel(profile, ModelKeyEnvironment(profile.api_key), std::move(revision));
       if (std::ranges::find(models, model.ref, &kit::ModelRegistration::ref) == models.end()) {
         service->model_revisions.emplace(model.ref, file);
-        service->run_settings->AddModel(model, {}, profile.limits, true, profile.experts);
+        service->run_settings->AddModel(model, {}, profile.limits, true, profile.strengths);
         models.push_back(std::move(model));
       }
     } catch (const std::exception&) {
@@ -886,8 +886,8 @@ kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewServic
     using agentkit_preview::ModelStrength;
     return value == ModelStrength::Strong ? "strong" : value == ModelStrength::Typical ? "typical" : "unknown";
   };
-  record["experts"] = {{"code", strength(profile.experts.code)}, {"reasoning", strength(profile.experts.reasoning)},
-      {"vision", strength(profile.experts.vision)}, {"automatic", profile.experts.automatic}};
+  record["strengths"] = {{"code", strength(profile.strengths.code)}, {"reasoning", strength(profile.strengths.reasoning)},
+      {"vision", strength(profile.strengths.vision)}};
   if (profile.limits.context_window) record["context_window"] = *profile.limits.context_window;
   if (profile.limits.max_input_tokens) record["max_input_tokens"] = *profile.limits.max_input_tokens;
   if (profile.limits.max_output_tokens) record["max_output_tokens"] = *profile.limits.max_output_tokens;
@@ -914,7 +914,7 @@ kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewServic
     if (persist) static_cast<void>(co_await target.DeleteAsync());
     co_return Result::Failure(registered.Error());
   }
-  service->run_settings->AddModel(model, {}, profile.limits, true, profile.experts);
+  service->run_settings->AddModel(model, {}, profile.limits, true, profile.strengths);
   if (persist) service->model_revisions.emplace(model.ref, target);
   else service->model_revisions.emplace(model.ref, std::move(profile));
   if (previous) {
@@ -934,7 +934,7 @@ kit::Async<kit::ModelProviderRef> SaveModelProfile(std::shared_ptr<PreviewServic
 
 kit::Async<kit::ModelProviderRef> UpdateModelProfile(std::shared_ptr<PreviewService> service,
     kit::ModelProviderRef previous, std::string endpoint, std::optional<std::string> new_key,
-    agentkit_preview::ModelLimits limits, bool image_input, agentkit_preview::ModelExpertPreferences experts) {
+    agentkit_preview::ModelLimits limits, bool image_input, agentkit_preview::ModelStrengths strengths) {
   using Result = kit::AgentResult<kit::ModelProviderRef>;
   const auto resources = UseService<Resources>();
   const auto found = service->model_revisions.find(previous);
@@ -958,13 +958,13 @@ kit::Async<kit::ModelProviderRef> UpdateModelProfile(std::shared_ptr<PreviewServ
   if (new_key) *new_key = TrimModelField(std::move(*new_key));
   if (service->run_settings->CurrentModel(previous) == previous && endpoint == profile.base_url &&
       (!new_key || *new_key == profile.api_key) && limits == profile.limits && image_input == profile.image_input &&
-      experts == profile.experts)
+      strengths == profile.strengths)
     co_return Result::Success(std::move(previous));
   profile.base_url = std::move(endpoint);
   if (new_key) profile.api_key = std::move(*new_key);
   profile.limits = std::move(limits);
   profile.image_input = image_input;
-  profile.experts = experts;
+  profile.strengths = strengths;
   co_return co_await SaveModelProfile(std::move(service), std::move(profile), std::move(previous));
 }
 
@@ -1118,8 +1118,8 @@ agentkit_preview::EditModelProfile EditModelAction(const std::shared_ptr<Preview
 #ifndef __EMSCRIPTEN__
   if (service->model_profiles) return [service](kit::ModelProviderRef ref, std::string endpoint,
       std::optional<std::string> key, agentkit_preview::ModelLimits limits, bool image_input,
-      agentkit_preview::ModelExpertPreferences experts) {
-    return UpdateModelProfile(service, std::move(ref), std::move(endpoint), std::move(key), std::move(limits), image_input, experts);
+      agentkit_preview::ModelStrengths strengths) {
+    return UpdateModelProfile(service, std::move(ref), std::move(endpoint), std::move(key), std::move(limits), image_input, strengths);
   };
 #endif
   return {};
@@ -1132,6 +1132,29 @@ agentkit_preview::RemoveModelProfile RemoveModelAction(const std::shared_ptr<Pre
   };
 #endif
   return {};
+}
+
+std::span<const agentkit_preview::ExpertProfile> GanWorkExperts() {
+  using namespace agentkit_preview;
+  using namespace ::app::strings;
+  static const auto profiles = [] {
+    const std::vector<kit::ToolId> files{ListWorkspaceFiles, SearchWorkspaceFiles, ReadWorkspaceFiles};
+    auto sources = files;
+#ifdef _WIN32
+    sources.insert(sources.end(), {WebSearch, WebFetch});
+#endif
+    return std::array{
+        ExpertProfile{{"ganwork.expert.research"}, "Research expert", ui_research_expert,
+            "Find relevant source material and report concrete evidence.", sources},
+        ExpertProfile{{"ganwork.expert.verification"}, "Verification expert", ui_verification_expert,
+            "Independently check behavior, risks and acceptance evidence.", sources},
+        ExpertProfile{{"ganwork.expert.code-review"}, "Code review expert", ui_code_review_expert,
+            "Inspect implementation, test coverage and likely regressions. Cite the relevant files.", files},
+        ExpertProfile{{"ganwork.expert.documentation"}, "Documentation expert", ui_documentation_expert,
+            "Check documentation, examples and terminology against the current implementation.", files},
+    };
+  }();
+  return profiles;
 }
 
 std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<kit::SessionStore> store,
@@ -1424,24 +1447,17 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
   const auto export_directory = files.exports.Path();
   std::vector<kit::AgentId> general_targets{agentkit_preview::DesignAgent, agentkit_preview::PptAgent};
   if (release_available) general_targets.push_back(agentkit_preview::CodeAgent);
-  const auto register_expert = [&](kit::AgentId id, std::string name, std::string task,
-                                    const std::optional<kit::ModelProviderRef>& preferred) {
-    const auto expert_model = settings->SelectExpertModel(id, preferred, general).value_or(DemoModel);
-    std::vector<kit::ToolId> tools{
-        agentkit_preview::ListWorkspaceFiles, agentkit_preview::SearchWorkspaceFiles, agentkit_preview::ReadWorkspaceFiles};
-#ifdef _WIN32
-    tools.insert(tools.end(), {agentkit_preview::WebSearch, agentkit_preview::WebFetch});
-#endif
-    Require(registered->RegisterAgent({.definition = {.ref = {std::move(id), 1}, .display_name = std::move(name),
-        .instructions = std::move(task) + " Work on the assigned question only. Use available read tools to verify facts, "
+  const auto experts = GanWorkExperts();
+  std::vector<kit::AgentId> delegates;
+  for (const auto& expert : experts) {
+    const auto model = settings->SelectDelegateModel(general, false, {.tool_calls = !expert.tools.empty()}).value_or(DemoModel);
+    Require(registered->RegisterAgent({.definition = {.ref = {expert.id, 1}, .display_name = std::string(expert.name),
+        .instructions = std::string(expert.instructions) + " Work on the assigned question only. Use available read tools to verify facts, "
             "and name the files or URLs you checked. State what you could not verify. Return a concise conclusion to the parent.",
-        .model = expert_model.id, .tools = std::move(tools), .requires_model = {.text_stream = true},
+        .model = model.id, .tools = expert.tools, .requires_model = {.text_stream = true},
         .budget = {.model_turns = 6, .tool_calls = 6}}}));
-  };
-  register_expert(agentkit_preview::ResearchExpert, "Research expert", "Inspect the relevant sources and report concrete findings.",
-      preferences.research_model);
-  register_expert(agentkit_preview::VerificationExpert, "Verification expert",
-      "Independently check behavior, risks and acceptance evidence.", preferences.verification_model);
+    delegates.push_back(expert.id);
+  }
   register_workspace_agent({
       .definition = {.ref = {agentkit_preview::GeneralAgent, 1}, .display_name = "General assistant",
           .instructions = instructions({}), .model = selected,
@@ -1450,22 +1466,22 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
               agentkit_preview::ExportPresentation},
           .skill_sources = {agentkit_preview::PreviewSkills},
           .content_types = std::move(general_content),
-          .delegates = {agentkit_preview::ResearchExpert, agentkit_preview::VerificationExpert},
+          .delegates = std::move(delegates),
           .collaboration_targets = std::move(general_targets),
           .capabilities = {kit::Capability::ReadGoal, kit::Capability::ManageGoal, kit::Capability::CompleteGoal,
               kit::Capability::ReadProject, kit::Capability::ManageTask, kit::Capability::DiscoverSession, kit::Capability::ReadSession,
               kit::Capability::CreateSession, kit::Capability::SendMessage, kit::Capability::WaitForResult, kit::Capability::DelegateRun},
           .requires_model = {.text_stream = true, .structured_output = true}},
-      .run = [release_available, export_directory, workspaces, settings, workspace_tests, runtime_ref](
+      .run = [release_available, export_directory, workspaces, settings, workspace_tests, runtime_ref, experts](
                  kit::RunContext run, kit::RunInput input) {
         return agentkit_preview::RunGeneral(std::move(run), std::move(input), {}, release_available, export_directory,
-            workspaces, settings, workspace_tests, *runtime_ref);
+            workspaces, settings, workspace_tests, *runtime_ref, experts);
       },
-      .restore = [release_available, export_directory, workspaces, settings, workspace_tests, runtime_ref](
+      .restore = [release_available, export_directory, workspaces, settings, workspace_tests, runtime_ref, experts](
                      kit::RunContext run, kit::RunInput input, kit::RunResume resume) {
         return agentkit_preview::RunGeneral(
             std::move(run), std::move(input), std::move(resume.checkpoint), release_available, export_directory,
-            workspaces, settings, workspace_tests, *runtime_ref);
+            workspaces, settings, workspace_tests, *runtime_ref, experts);
       }});
   Require(agentkit_preview::RegisterDesignTools(registered, designs));
   register_specialist(
@@ -1975,8 +1991,9 @@ StringVariant PreviewAgentLabel(const kit::AgentRef& agent) {
   if (agent.id == agentkit_preview::CodeAgent) return ::app::strings::ui_code_assistant;
   if (agent.id == agentkit_preview::PptAgent) return ::app::strings::ui_ppt_assistant;
   if (agent.id == agentkit_preview::DesignAgent) return ::app::strings::ui_design_assistant;
-  if (agent.id == agentkit_preview::ResearchExpert) return ::app::strings::ui_research_expert;
-  if (agent.id == agentkit_preview::VerificationExpert) return ::app::strings::ui_verification_expert;
+  const auto experts = GanWorkExperts();
+  if (const auto expert = std::ranges::find(experts, agent.id, &agentkit_preview::ExpertProfile::id); expert != experts.end())
+    return expert->label;
   if (agent.id == agentkit_preview::GeneralAgent) return ::app::strings::ui_general_assistant;
   return {};
 }

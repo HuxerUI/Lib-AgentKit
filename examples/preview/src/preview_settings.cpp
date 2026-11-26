@@ -281,8 +281,7 @@ kit::Async<PreviewSettings> ReadPreviewSettings(File file) {
         .palette = choice == palettes.end() ? PreviewPalette::Graphite : choice->palette, .tone = static_cast<ReplyTone>(tone),
         .instructions = std::move(instructions), .daily_model = ReadModel(doc, "daily_model"),
         .image_model = ReadModel(doc, "image_model"), .review_model = ReadModel(doc, "review_model"),
-        .image_generation_model = image_generation_model, .research_model = ReadModel(doc, "research_model"),
-        .verification_model = ReadModel(doc, "verification_model"), .file_access = std::move(file_access),
+        .image_generation_model = image_generation_model, .file_access = std::move(file_access),
         .mcp_servers = ReadMcpServers(doc.value("mcp_servers", Json::array()))});
   } catch (const std::exception&) {
     co_return Result::Failure({.code = kit::ErrorCode::InvalidArgument, .message = "The saved Preview settings are invalid."});
@@ -305,8 +304,8 @@ kit::Async<void> SavePreviewSettings(File file, PreviewSettings settings) {
       {"tone", static_cast<std::size_t>(settings.tone)}, {"instructions", std::move(settings.instructions)},
       {"daily_model", ModelRecord(settings.daily_model)}, {"image_model", ModelRecord(settings.image_model)},
       {"review_model", ModelRecord(settings.review_model)},
-      {"image_generation_model", ModelRecord(settings.image_generation_model)}, {"research_model", ModelRecord(settings.research_model)},
-      {"verification_model", ModelRecord(settings.verification_model)}, {"mcp_servers", std::move(mcp_servers)}, {"file_access", {
+      {"image_generation_model", ModelRecord(settings.image_generation_model)},
+      {"mcp_servers", std::move(mcp_servers)}, {"file_access", {
         {"full_access", settings.file_access.full_access}, {"directories", std::move(settings.file_access.directories)},
         {"revision", std::move(settings.file_access.revision)}}}}.dump();
   if (!co_await temporary.WriteStringAsync(std::move(contents)) || !co_await temporary.MoveToAsync(file, true)) {
@@ -336,8 +335,7 @@ ThemeSpec PreviewThemeFor(const PreviewSettings& settings, ThemeBrightness syste
 }
 
 void ClearRetiredModelRoles(PreviewSettings& settings, const RunSettings& models) {
-  for (const auto role : {&settings.daily_model, &settings.image_model, &settings.image_generation_model, &settings.review_model,
-           &settings.research_model, &settings.verification_model}) {
+  for (const auto role : {&settings.daily_model, &settings.image_model, &settings.image_generation_model, &settings.review_model}) {
     if (*role && models.IsRetired((*role)->id)) role->reset();
   }
 }
@@ -442,7 +440,6 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
     std::erase_if(vision, [](const auto& item) { return !item.capabilities.image_input; });
     auto generation = choices;
     std::erase_if(generation, [](const auto& item) { return !item.editable; });
-    auto experts = models->Models(ResearchExpert);
     std::vector<View> catalog;
     if (choices.empty()) catalog.push_back(Text(::app::strings::ui_no_models_configured)
         .Style({Font::System(13.0F), colors.on_surface_variant}).With(Padding(EdgeInsets::Symmetric(0.0F, 13.0F))));
@@ -485,12 +482,6 @@ View PreviewSettingsPage(State<PreviewSettings> current, State<PreviewSettings> 
         SettingsRow(::app::strings::ui_auto_review_model, ::app::strings::ui_use_for_automatic_approval_review,
             ModelRoleField(::app::strings::ui_auto_review_model, choices, ::app::strings::ui_use_the_host_review_policy, draft, &PreviewSettings::review_model)
                 .Key("settings-review-model"), stack_fields, colors),
-        SettingsRow(::app::strings::ui_research_expert, ::app::strings::ui_research_expert_model_help,
-            ModelRoleField(::app::strings::ui_research_expert, experts, ::app::strings::ui_automatic, draft, &PreviewSettings::research_model)
-                .Key("settings-research-model"), stack_fields, colors),
-        SettingsRow(::app::strings::ui_verification_expert, ::app::strings::ui_verification_expert_model_help,
-            ModelRoleField(::app::strings::ui_verification_expert, std::move(experts), ::app::strings::ui_automatic,
-                draft, &PreviewSettings::verification_model).Key("settings-verification-model"), stack_fields, colors),
     }, colors));
     break;
   }

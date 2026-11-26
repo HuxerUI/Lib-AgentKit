@@ -179,7 +179,7 @@ bool SupportsImageInput(std::string_view protocol) {
 }
 
 void RunSettings::AddModel(const kit::ModelRegistration& registration, std::string label, ModelLimits limits, bool editable,
-    ModelExpertPreferences experts) {
+    ModelStrengths strengths) {
   if (std::ranges::find(models_, registration.ref, &ModelChoice::ref) != models_.end()) return;
   const auto& endpoint = registration.endpoint;
   auto name = label.empty() ? endpoint.model : std::move(label);
@@ -195,7 +195,7 @@ void RunSettings::AddModel(const kit::ModelRegistration& registration, std::stri
   const auto caps = registration.provider->Capabilities();
   if (limits == ModelLimits{}) limits = registration.context_limits;
   models_.push_back({registration.ref, name, std::move(name), registration.ref != DemoModel,
-      caps.text_stream && caps.structured_output, caps, std::move(location), endpoint, limits, editable, experts});
+      caps.text_stream && caps.structured_output, caps, std::move(location), endpoint, limits, editable, strengths});
   auto& version = model_versions_[registration.ref.id];
   version = std::max(version, registration.ref.version);
   model_revision_ = model_revision_.Get() + 1;
@@ -240,11 +240,9 @@ std::optional<kit::ModelProviderRef> RunSettings::CurrentModel(std::optional<kit
 std::vector<ModelChoice> RunSettings::Models(const kit::AgentId& agent) const {
   static_cast<void>(model_revision_.Get());
   std::vector<ModelChoice> result;
-  const bool expert = agent == ResearchExpert || agent == VerificationExpert;
   std::ranges::copy_if(models_, std::back_inserter(result), [&](const ModelChoice& choice) {
     return !retired_models_.contains(choice.ref.id) && choice.ref.version == model_versions_.at(choice.ref.id) &&
-        (expert ? choice.ref != DemoModel && choice.capabilities.text_stream && choice.capabilities.tool_calls :
-            choice.suitable && (agent != CodeAgent || choice.code));
+        choice.suitable && (agent != CodeAgent || choice.code);
   });
   for (auto& choice : result) {
     if (std::ranges::count(result, choice.name, &ModelChoice::name) > 1) choice.label += separator + choice.endpoint;
@@ -252,35 +250,33 @@ std::vector<ModelChoice> RunSettings::Models(const kit::AgentId& agent) const {
   return result;
 }
 
-std::optional<kit::ModelProviderRef> RunSettings::SelectExpertModel(const kit::AgentId& expert,
-    const std::optional<kit::ModelProviderRef>& preferred, const kit::ModelProviderRef& parent,
-    kit::ModelCapabilities required, std::size_t task_bytes) const {
+std::optional<kit::ModelProviderRef> RunSettings::SelectDelegateModel(const kit::ModelProviderRef& parent,
+    bool coding, kit::ModelCapabilities required, std::size_t task_bytes) const {
   const auto enough_context = [input = task_bytes / 3 + 2048](const ModelLimits& limits) {
     return (!limits.max_input_tokens || *limits.max_input_tokens >= input) &&
         (!limits.context_window || *limits.context_window >= input + 512);
   };
   const auto eligible = [&](const ModelChoice& choice) {
     const auto& caps = choice.capabilities;
-    return choice.ref != DemoModel && caps.text_stream && caps.tool_calls &&
+    return caps.text_stream && (!required.tool_calls || caps.tool_calls) &&
         (!required.image_input || caps.image_input) && (!required.file_input || caps.file_input) && enough_context(choice.limits);
   };
   const auto rank = [&](const ModelChoice& choice) {
-    const auto& strengths = choice.experts;
-    const bool research = expert == ResearchExpert;
+    const auto& strengths = choice.strengths;
     return std::tuple{required.image_input ? strengths.vision : ModelStrength::Unknown,
-        research ? strengths.code : strengths.reasoning, research ? strengths.reasoning : strengths.code,
-        choice.limits.context_window.value_or(0), choice.ref == parent};
+        coding ? strengths.code : strengths.reasoning, coding ? strengths.reasoning : strengths.code,
+        choice.ref == parent, choice.limits.context_window.value_or(0)};
   };
-  const auto choices = Models(expert);
+  static_cast<void>(model_revision_.Get());
   const ModelChoice* best = nullptr;
-  for (const auto& choice : choices) {
-    if (!eligible(choice)) continue;
-    if (preferred && choice.ref.id == preferred->id) return choice.ref;
-    if (choice.experts.automatic && (!best || rank(choice) > rank(*best))) best = &choice;
+  for (const auto& choice : models_) {
+    if (choice.ref == DemoModel || retired_models_.contains(choice.ref.id) ||
+        choice.ref.version != model_versions_.at(choice.ref.id) || !eligible(choice)) continue;
+    if (!best || rank(choice) > rank(*best)) best = &choice;
   }
   if (best) return best->ref;
   const auto current = std::ranges::find(models_, parent, &ModelChoice::ref);
-  if (current != models_.end() && !IsRetired(parent.id) && eligible(*current)) return parent;
+  if (current != models_.end() && parent != DemoModel && !IsRetired(parent.id) && eligible(*current)) return parent;
   return {};
 }
 
@@ -779,7 +775,7 @@ View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile
   const auto clear_key = UseState(false);
   const auto limits = UseState(EditLimits(current.limits));
   const auto image_input = UseState(current.capabilities.image_input);
-  const auto experts = UseState(current.experts);
+  const auto strengths = UseState(current.strengths);
   const auto saving = UseState(false);
   const auto error = UseState(std::string{});
   const auto tasks = UseApplicationTaskScope();
@@ -788,7 +784,7 @@ View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile
   auto fields = UseEnvironment<TextFieldStyle>();
   fields.show_label = false;
   const auto invalid_limits = UseString(::app::strings::ui_model_token_limit_invalid);
-  const auto save = [dialog, current, edit_model, endpoint, key, clear_key, limits, image_input, experts, saving, error, tasks, invalid_limits] {
+  const auto save = [dialog, current, edit_model, endpoint, key, clear_key, limits, image_input, strengths, saving, error, tasks, invalid_limits] {
     if (saving.Get() || TrimModelField(endpoint->text).empty()) return;
     ModelLimits updated_limits;
     try { updated_limits = ReadLimits(limits.Get()); }
@@ -800,8 +796,8 @@ View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile
     saving = true;
     error = "";
     tasks.Launch([dialog, edit_model, ref = current.ref, url = endpoint->text, updated_key = std::move(updated_key),
-                  updated_limits, images = image_input.Get(), preferences = experts.Get(), key, saving, error]() mutable -> Task<void> {
-      auto result = co_await edit_model(std::move(ref), std::move(url), std::move(updated_key), updated_limits, images, preferences);
+                  updated_limits, images = image_input.Get(), updated_strengths = strengths.Get(), key, saving, error]() mutable -> Task<void> {
+      auto result = co_await edit_model(std::move(ref), std::move(url), std::move(updated_key), updated_limits, images, updated_strengths);
       saving = false;
       if (!result.Succeeded()) { error = result.Error().message; co_return; }
       key = TextEditingValue::FromText({});
@@ -830,14 +826,14 @@ View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile
   if (SupportsImageInput(current.connection.protocol))
     content.push_back(Checkbox(::app::strings::ui_image_input, image_input.Get())
         .OnChanged([image_input](bool on) { image_input = on; }).With(Enabled(ready)).Key("edit-model-image-input"));
-  const auto strength = [experts, ready, color](StringResource label, ModelStrength ModelExpertPreferences::* field, const char* id) {
+  const auto strength = [strengths, ready, color](StringResource label, ModelStrength ModelStrengths::* field, const char* id) {
     const std::array options{::app::strings::ui_model_limit_unknown, ::app::strings::ui_model_strength_typical,
         ::app::strings::ui_model_strength_strong};
-    auto picker = Select(options, static_cast<std::size_t>(experts.Get().*field), [](StringResource value) { return Text(value); })
-        .Label(label).OnChanged([experts, field](std::size_t index) {
-          auto value = experts.Get();
+    auto picker = Select(options, static_cast<std::size_t>(strengths.Get().*field), [](StringResource value) { return Text(value); })
+        .Label(label).OnChanged([strengths, field](std::size_t index) {
+          auto value = strengths.Get();
           value.*field = static_cast<ModelStrength>(index);
-          experts = value;
+          strengths = value;
         }).With(Enabled(ready)).Key(id);
     return PreviewLabeledField(label, std::move(picker), color).With(Grow());
   };
@@ -845,16 +841,10 @@ View EditModelDialog(DialogContext dialog, ModelChoice current, EditModelProfile
   content.push_back(Text(::app::strings::ui_model_strengths, TextRole::Label)
       .Style({Font::System(14.0F).WithWeight(FontWeight::SemiBold), color.on_surface}));
   content.push_back(Row{
-      strength(::app::strings::ui_model_strength_code, &ModelExpertPreferences::code, "edit-model-strength-code"),
-      strength(::app::strings::ui_model_strength_reasoning, &ModelExpertPreferences::reasoning, "edit-model-strength-reasoning"),
-      strength(::app::strings::ui_image_understanding, &ModelExpertPreferences::vision, "edit-model-strength-vision"),
+      strength(::app::strings::ui_model_strength_code, &ModelStrengths::code, "edit-model-strength-code"),
+      strength(::app::strings::ui_model_strength_reasoning, &ModelStrengths::reasoning, "edit-model-strength-reasoning"),
+      strength(::app::strings::ui_image_understanding, &ModelStrengths::vision, "edit-model-strength-vision"),
   }.With(Spacing(8.0F)));
-  content.push_back(Checkbox(::app::strings::ui_model_expert_automatic, experts->automatic)
-      .OnChanged([experts](bool on) {
-        auto value = experts.Get();
-        value.automatic = on;
-        experts = value;
-      }).With(Enabled(ready)).Key("edit-model-expert-automatic"));
   if (!saves_direct_api_keys && !key->text.empty() && !key->text.starts_with("${"))
     content.push_back(Text(::app::strings::ui_direct_keys_are_available_until_preview_closes, TextRole::Label));
   if (!error->empty()) content.push_back(Text(error.Get()).With(Foreground(color.error)).Key("edit-model-error"));

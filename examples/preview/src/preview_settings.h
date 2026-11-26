@@ -22,8 +22,6 @@ struct PreviewSettings {
   std::optional<huxerui::agentkit::ModelProviderRef> image_model;
   std::optional<huxerui::agentkit::ModelProviderRef> review_model;
   std::optional<huxerui::agentkit::ModelProviderRef> image_generation_model;
-  std::optional<huxerui::agentkit::ModelProviderRef> research_model;
-  std::optional<huxerui::agentkit::ModelProviderRef> verification_model;
   LocalFilePermissions file_access;
   std::vector<McpServer> mcp_servers;
 

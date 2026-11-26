@@ -100,15 +100,28 @@ def verify(executable, fixture):
             text = json.dumps(messages)
             if "Classify this request" in text:
                 phase, content = "route", '{"route":"expert-team"}'
-            elif "Plan two independent" in text:
-                phase, content = "plan", json.dumps(
-                    {"research": "Find research evidence.", "verification": "Check verification evidence.", "parent_action": False})
-            elif "Find research evidence." in text and "Inspect the relevant sources" in text:
-                phase, content = "research", "Research evidence."
+            elif "Plan independent" in text:
+                if not all(f"ganwork.expert.{name}" in text for name in ("research", "verification", "code-review", "documentation")):
+                    self.send_error(400, "Missing expert profiles")
+                    return
+                assignments = ([("documentation", "Check documentation evidence.", "reasoning")]
+                               if "documentation-only expert pass" in text else [
+                                   ("code-review", "Review the code evidence.", "code"),
+                                   ("verification", "Check verification evidence.", "reasoning")])
+                phase, content = "plan", json.dumps({
+                    "assignments": [{"expert": f"ganwork.expert.{name}", "task": task, "focus": focus,
+                                     "include_attachments": False} for name, task, focus in assignments],
+                    "parent_action": False})
+            elif "Review the code evidence." in text and "Inspect implementation" in text:
+                phase, content = "code-review", "Code evidence."
             elif "Check verification evidence." in text and "Independently check behavior" in text:
                 phase, content = "verification", "Verification evidence."
-            elif "Research evidence." in text and "Verification evidence." in text:
+            elif "Check documentation evidence." in text and "Check documentation, examples" in text:
+                phase, content = "documentation", "Documentation evidence."
+            elif "Code evidence." in text and "Verification evidence." in text:
                 phase, content = "conclusion", "Both experts reported evidence."
+            elif "Documentation evidence." in text:
+                phase, content = "conclusion", "The documentation expert reported evidence."
             else:
                 self.send_error(400)
                 return
@@ -134,8 +147,10 @@ def verify(executable, fixture):
     if probes != ["rejected", "verified", "verified"]:
         raise RuntimeError(f"Unexpected connection checks: {probes}")
     if sorted(expert_calls) != sorted([
-            ("route", "expert-verification"), ("plan", "expert-verification"), ("research", "expert-research"),
-            ("verification", "expert-verification"), ("conclusion", "expert-verification")]):
+            ("route", "expert-verification"), ("plan", "expert-verification"), ("code-review", "expert-research"),
+            ("verification", "expert-verification"), ("conclusion", "expert-verification"),
+            ("route", "expert-verification"), ("plan", "expert-verification"), ("documentation", "expert-verification"),
+            ("conclusion", "expert-verification")]):
         raise RuntimeError(f"Unexpected expert model calls: {expert_calls}")
     return 0
 

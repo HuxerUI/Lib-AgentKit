@@ -9876,25 +9876,27 @@ void VerifyModelEditing(const File& root, const std::string& server) {
     field(ui, "model-limit-1", "258K");
     field(ui, "model-limit-2", "8192");
     select_last(ui, "edit-model-strength-reasoning", "edit-model-fields");
-    TapControl(ui, UiSelector::Key("edit-model-expert-automatic"), "Expert selection switch", "edit-model-fields");
+    if (ui.Find(UiSelector::Key("edit-model-expert-automatic")).Exists())
+      throw std::runtime_error("The model editor still exposes an expert routing switch");
     ui.Find(UiSelector::Key("update-model")).Tap();
     Wait(ui, [&] { return !ui.Find(UiSelector::Key("edit-model-dialog")).Exists(); }, "The capability and context edit did not save");
     const auto profile = read_profiles().at(3);
     if (profile.at("context_window") != 1500000 || profile.at("max_input_tokens") != 258000 ||
         profile.at("max_output_tokens") != 8192 || profile.at("image_input") != true ||
-        profile.at("experts").at("reasoning") != "strong" || profile.at("experts").at("automatic") != true)
-      throw std::runtime_error("The model revision did not save token counts, image support and expert preferences");
+        profile.at("strengths").at("reasoning") != "strong" || profile.contains("experts"))
+      throw std::runtime_error("The model revision did not save token counts, image support and model strengths");
     select_last(ui, "settings-image-model");
     select_last(ui, "settings-image-generation-model");
-    select_last(ui, "settings-research-model");
-    select_last(ui, "settings-verification-model");
+    if (ui.Find(UiSelector::Key("settings-research-model")).Exists() ||
+        ui.Find(UiSelector::Key("settings-verification-model")).Exists())
+      throw std::runtime_error("Model settings still bind individual experts");
     ui.Find(UiSelector::Key("settings-save")).Tap();
     const auto file = root.Child("settings.json");
     Wait(ui, [&] { return file.Exists(); }, "Image model roles were not saved");
     const auto settings = nlohmann::json::parse(file.ReadString().Value());
     const auto expected = nlohmann::json{{"id", first.id.value}, {"version", 3}};
     if (settings.at("image_model") != expected || settings.at("image_generation_model") != expected ||
-        settings.at("research_model") != expected || settings.at("verification_model") != expected ||
+        settings.contains("research_model") || settings.contains("verification_model") ||
         settings.contains("image_endpoint"))
       throw std::runtime_error("Image roles did not persist the selected model revision");
   }
@@ -9937,11 +9939,13 @@ void VerifyModelEditing(const File& root, const std::string& server) {
   profile["base_url"] = server + "/expert/v1";
   profile["profile_id"] = research.id.value;
   profile["model"] = "expert-research";
+  profile.erase("strengths");
   profile["experts"] = {{"automatic", true}, {"code", "strong"}};
   WriteFixture(profiles.Child("research.json"), profile.dump());
   profile["profile_id"] = verification.id.value;
   profile["model"] = "expert-verification";
-  profile["experts"] = {{"automatic", true}, {"reasoning", "strong"}};
+  profile.erase("experts");
+  profile["strengths"] = {{"reasoning", "strong"}};
   WriteFixture(profiles.Child("verification.json"), profile.dump());
   WriteFixture(expert_data.Child("settings.json"),
       nlohmann::json{{"daily_model", {{"id", verification.id.value}, {"version", verification.version}}}}.dump());
@@ -9953,17 +9957,27 @@ void VerifyModelEditing(const File& root, const std::string& server) {
     const auto app = UseApplication();
     try {
       const auto runtime = LiveTake(std::move(started));
-      const auto created = LiveTake(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
-          .options = {.agent = agentkit_preview::GeneralAgent, .title = "Expert routing acceptance"},
-          .initial = kit::SendInput{.text = "Use the parallel expert team for an independent research and verification pass."}}));
-      auto session = LiveTake(co_await runtime->Sessions().OpenAsync(std::get<kit::SessionCreated>(created.outcome).session));
-      auto observing = co_await LiveObserve(session);
-      co_await LiveRunCompleted(session);
-      const auto snapshot = session->Snapshot();
-      if (snapshot->runs.size() != 3 || snapshot->runs[0].model != verification || snapshot->runs[1].model != research ||
-          snapshot->runs[2].model != verification || snapshot->runs[1].state != kit::RunState::Succeeded ||
-          snapshot->runs[2].state != kit::RunState::Succeeded)
-        throw std::runtime_error("Automatic expert routing did not bind both models by role");
+      for (const bool code_review : {true, false}) {
+        const auto created = LiveTake(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), {
+            .options = {.agent = agentkit_preview::GeneralAgent, .title = "Expert routing acceptance"},
+            .initial = kit::SendInput{.text = code_review ? "Request code review and independent verification." :
+                "Request a documentation-only expert pass."}}));
+        auto session = LiveTake(co_await runtime->Sessions().OpenAsync(std::get<kit::SessionCreated>(created.outcome).session));
+        auto observing = co_await LiveObserve(session);
+        co_await LiveRunCompleted(session);
+        const auto snapshot = session->Snapshot();
+        if (snapshot->runs.size() != (code_review ? 3U : 2U) || snapshot->runs.front().model != verification ||
+            !std::ranges::all_of(snapshot->runs, [](const auto& run) { return run.state == kit::RunState::Succeeded; }))
+          throw std::runtime_error("The parent did not run the planned set of experts");
+        const auto model_for = [&](const char* id) {
+          const auto child = std::ranges::find_if(snapshot->runs, [&](const auto& run) { return run.agent.id.value == id; });
+          return child == snapshot->runs.end() ? kit::ModelProviderRef{} : child->model;
+        };
+        if (code_review ? model_for("ganwork.expert.code-review") != research ||
+                model_for("ganwork.expert.verification") != verification :
+            model_for("ganwork.expert.documentation") != verification)
+          throw std::runtime_error("Automatic routing did not bind suitable models to the selected expert assignments");
+      }
       LiveTake(co_await runtime->CloseAsync());
     } catch (...) { failure = std::current_exception(); }
     app.Quit();
