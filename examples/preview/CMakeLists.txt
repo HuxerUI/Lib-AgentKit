@@ -56,6 +56,9 @@ huxerui_use_library(ganwork
         PATH "${CMAKE_CURRENT_SOURCE_DIR}/../.."
 )
 if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
+    target_compile_definitions(ganwork PRIVATE
+            $<$<CONFIG:Debug>:AGENTKIT_PREVIEW_DEBUG=1>
+    )
     target_link_libraries(ganwork PRIVATE nlohmann_json::nlohmann_json)
     if (WIN32)
         target_link_libraries(ganwork PRIVATE crypt32 winhttp)
