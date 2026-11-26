@@ -1,0 +1,30 @@
+[package]
+namespace   = "huxerui"
+name        = "agentkit"
+version     = "0.1.0"
+standard    = "c++23"
+license     = "MIT"
+repo        = "https://github.com/HuxerUI/Lib-AgentKit"
+description = "AI agent runtime, MCP/tools/skills orchestration, and conversation UI components for HuxerUI"
+
+[package.metadata.huxerui]
+library   = "HuxerUI::AgentKit"
+namespace = "huxerui::agentkit"
+id        = "org.huxerui.lib.agentkit"
+resources = "resources"
+
+[dependencies]
+huxerui.huxerui    = "0.5.5"
+huxerui.markdown   = "0.3.1"
+huxerui.richeditor = "0.1.1"
+nlohmann.json      = "3.12.0"
+
+[targets.agentkit]
+kind = "lib"
+
+[lib]
+path = "modules/agentkit.cppm"
+
+[build]
+sources      = []
+include_dirs = ["include"]
