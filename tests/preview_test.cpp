@@ -1958,6 +1958,119 @@ void SendNewConversation(UiTest& preview, std::string title) {
   send.Tap();
 }
 
+void VerifyConversationCollaboration(const File& root) {
+  using namespace agentkit_preview;
+  const auto workspace = root.Child("release-app");
+  const auto sdk = root.Child("release-sdk");
+  const kit::WorkspaceId sdk_id{kit::NewCommandId().value};
+  if (!workspace.CreateDirectories() || !sdk.CreateDirectories() || !root.Child("workspaces").CreateDirectories())
+    throw std::runtime_error("Could not create the collaboration workspaces");
+  WriteFixture(root.Child("workspaces").Child(sdk_id.value + ".workspace"), sdk.Path());
+  const auto database = root.Child("sessions.sqlite3");
+  constexpr auto sender = "Release coordination";
+  constexpr auto local = "Protocol compatibility verification";
+  constexpr auto remote = "Protocol SDK maintainer";
+  bool done = false;
+  std::exception_ptr failure;
+  auto drive = [&](auto started, auto workspace_id, auto project) -> Task<void> {
+    const auto app = UseApplication();
+    try {
+      auto runtime = LiveTake(std::move(started));
+      if (!workspace_id) throw std::runtime_error("The collaboration workspace was not registered");
+      auto local_chat = co_await LiveConversation(runtime, project, *workspace_id, GeneralAgent, local,
+          "This conversation owns protocol compatibility verification for the app release. Store the exact compatibility "
+          "verification code LOCAL-VERIFY-5921 in this conversation. Reply with the code.");
+      auto watch_local = co_await LiveObserve(local_chat);
+      co_await LiveRunCompleted(local_chat, 90s);
+      const kit::ProjectId sdk_project{"preview.workspace/" + sdk_id.value};
+      auto sdk_chat = co_await LiveConversation(runtime, sdk_project, sdk_id, GeneralAgent, remote,
+          "This conversation owns the protocol SDK. Store the exact SDK migration code REMOTE-SDK-2746 in this conversation. "
+          "Reply with the code.");
+      auto watch_sdk = co_await LiveObserve(sdk_chat);
+      co_await LiveRunCompleted(sdk_chat, 90s);
+      auto source = co_await LiveConversation(runtime, project, *workspace_id, GeneralAgent, sender,
+          "Give me a short release handoff in this chat, including a brief checklist and the independently verified protocol "
+          "compatibility code. The code is known only to the existing project conversation responsible for protocol "
+          "compatibility verification. Obtain its actual code from that owner. Keep this test entirely in chat without creating files.");
+      auto watch_source = co_await LiveObserve(source);
+
+      const auto check = [&](const std::shared_ptr<kit::Conversation>& receiver, std::string_view token) -> Task<void> {
+        co_await LiveRunCompleted(source, 180s);
+        co_await LiveRunCompleted(receiver, 90s);
+        const auto from = source->Snapshot();
+        const auto to = receiver->Snapshot();
+        const auto& attempt = from->runs.back();
+        if (attempt.model == DemoModel) throw std::runtime_error("The sender did not use an actual model");
+        const auto delivery = std::ranges::find_if(to->inbox, [&](const auto& item) {
+          return item.from.run == attempt.id && item.from.session == from->summary.id && !item.in_reply_to &&
+              item.delivery == kit::DeliveryState::Delivered && item.request == kit::RequestState::Replied;
+        });
+        if (delivery == to->inbox.end() || !delivery->target_run)
+          throw std::runtime_error("No automatic delivery with a durable reply was recorded for the intended conversation");
+        const auto recipient = std::ranges::find(to->runs, *delivery->target_run, &kit::RunSnapshot::id);
+        if (recipient == to->runs.end() || recipient->model == DemoModel || recipient->work_request != delivery->id)
+          throw std::runtime_error("The receiving Run was not started with the real model and original request");
+        const auto record = LiveTake(co_await runtime->Collaboration().ReadMessageAsync(delivery->id));
+        if (!record.reply || record.reply->summary.find(token) == std::string::npos)
+          throw std::runtime_error("The actual reply omitted the receiving conversation's token");
+        const auto contains = [&](const kit::SessionSnapshot& snapshot, const kit::RunId& run, std::string_view value,
+                                  kit::MessageAuthor author) {
+          return std::ranges::any_of(snapshot.messages, [&](const auto& message) {
+            return message.run == run && message.author == author && std::ranges::any_of(message.blocks, [&](const auto& block) {
+              const auto* text = std::get_if<kit::TextBlock>(&block.body);
+              return text && text->text.find(value) != std::string::npos;
+            });
+          });
+        };
+        const auto resources = UseService<Resources>();
+        if (!contains(*from, attempt.id, token, kit::MessageAuthor::Agent) ||
+            !contains(*from, attempt.id, resources->GetString(::app::strings::ui_collaboration_dispatched), kit::MessageAuthor::Tool) ||
+            !contains(*from, attempt.id, resources->GetString(::app::strings::ui_collaboration_completed), kit::MessageAuthor::Tool) ||
+            !contains(*to, recipient->id, resources->GetString(::app::strings::ui_collaboration_received), kit::MessageAuthor::Tool))
+          throw std::runtime_error("The source or receiving timeline did not record the collaboration");
+        std::cout << "Verified " << to->summary.title << " (" << attempt.model.id.value << ") "
+                  << token << " and timeline; " << delivery->id.value << '\n';
+      };
+      co_await check(local_chat, "LOCAL-VERIFY-5921");
+
+      LiveTake(co_await sdk_chat->SendAsync(kit::NewCommandId(), {.text = "approval"}));
+      const auto pending = co_await LiveInteraction(sdk_chat, "Confirm preview action");
+      LiveTake(co_await source->SendAsync(kit::NewCommandId(), {.text =
+          "Please collaborate with the conversation \"Protocol SDK maintainer\" in the release-sdk workspace on this request. "
+          "Ask that exact conversation for its stored SDK migration code and report it here in chat. Do not create files."}));
+      const auto source_run = source->Snapshot()->summary.active_run;
+      const auto deadline = std::chrono::steady_clock::now() + 120s;
+      bool queued = false;
+      do {
+        if (const auto view = sdk_chat->Snapshot()) {
+          queued = std::ranges::any_of(view->inbox, [&](const auto& item) {
+            return item.from.run == source_run && item.delivery == kit::DeliveryState::Queued && !item.target_run;
+          });
+        }
+        if (!queued) co_await Delay(25ms);
+      } while (!queued && std::chrono::steady_clock::now() < deadline);
+      if (!queued) throw std::runtime_error("Named cross-workspace work did not queue while the target was busy");
+      co_await LiveApprove(sdk_chat, pending);
+      co_await check(sdk_chat, "REMOTE-SDK-2746");
+      const auto stores = LiveTake(co_await OpenPreviewStoresAsync(database));
+      const auto navigation = LiveTake(co_await stores.navigation->LoadAsync(PreviewUser));
+      if (!navigation.collaboration_links.empty()) throw std::runtime_error("A named request created a permanent workspace link");
+      std::cout << "Named cross-workspace request queued while the target awaited approval; no permanent link was created\n";
+      LiveTake(co_await runtime->CloseAsync());
+      done = true;
+    } catch (...) { failure = std::current_exception(); }
+    app.Quit();
+  };
+  const Application application{[]() -> View { return Spacer(); },
+      {.window = {.title = "GanWork Collaboration Acceptance", .activatable = false},
+       .quit_on_last_window_closed = false,
+       .application_hooks = {MakeConfiguredPreviewTestInstaller(database, workspace,
+           File(AGENTKIT_PREVIEW_CTEST), std::move(drive))}}};
+  static_cast<void>(RunApplication());
+  if (failure) std::rethrow_exception(failure);
+  if (!done) throw std::runtime_error("The native collaboration acceptance did not finish");
+}
+
 auto NavigationGroupLabel(UiTest& ui, const char* label) {
   return ui.Find(UiSelector::Key("session-directory")).Find(UiSelector::AllOf(UiSelector::Type<Text>(), UiSelector::Text(label)));
 }
@@ -10530,6 +10643,13 @@ int main(int argc, char** argv) {
       std::error_code error;
       std::filesystem::remove_all(root, error);
       std::cout << "Preview detached review binding and approval passed\n";
+      return 0;
+    } catch (const std::exception& error) { std::cerr << error.what() << "\nFixture: " << root.string() << '\n'; return 1; }
+  }
+  if (argc == 3 && std::string_view(argv[1]) == "--conversation-collaboration") {
+    const auto root = std::filesystem::absolute(std::filesystem::u8path(argv[2]));
+    try {
+      VerifyConversationCollaboration(File(root.u8string()));
       return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << "\nFixture: " << root.string() << '\n'; return 1; }
   }

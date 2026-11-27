@@ -239,6 +239,7 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HU
             examples/preview/src/design.cpp
             examples/preview/src/design_view.cpp
             examples/preview/src/fork_review_view.cpp
+            examples/preview/src/conversation_collaboration.cpp
             examples/preview/src/git_process.cpp
             examples/preview/src/goal_view.cpp
             examples/preview/src/general_workflow.cpp

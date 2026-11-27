@@ -44,6 +44,16 @@ inline kit::AgentResult<NavigationPreferences> DecodeNavigation(const nlohmann::
     }
     navigation.last_assistant.value = document.value("last_assistant", std::string{});
     navigation.auto_review_new_conversations = document.value("auto_review_new_conversations", false);
+    if (const auto links = document.find("collaboration_links"); links != document.end()) {
+      if (!links->is_array()) return invalid();
+      for (const auto& link : *links) {
+        if (!link.is_array() || link.size() != 2) return invalid();
+        kit::WorkspaceId a{link.at(0).get<std::string>()};
+        kit::WorkspaceId b{link.at(1).get<std::string>()};
+        if (a.value.empty() || b.value.empty() || a == b) return invalid();
+        navigation.collaboration_links.insert(WorkspaceLink(std::move(a), std::move(b)));
+      }
+    }
   } catch (const nlohmann::json::exception&) {
     return invalid();
   }
@@ -59,7 +69,10 @@ inline nlohmann::json EncodeNavigation(const NavigationPreferences& navigation) 
   }
   auto sessions = nlohmann::json::object();
   for (const auto& [id, group] : navigation.memberships) sessions[id.value] = group;
+  auto links = nlohmann::json::array();
+  for (const auto& [a, b] : navigation.collaboration_links) links.push_back({a.value, b.value});
   return {{"groups", std::move(groups)}, {"sessions", std::move(sessions)},
-      {"last_assistant", navigation.last_assistant.value}, {"auto_review_new_conversations", navigation.auto_review_new_conversations}};
+      {"last_assistant", navigation.last_assistant.value}, {"auto_review_new_conversations", navigation.auto_review_new_conversations},
+      {"collaboration_links", std::move(links)}};
 }
 } // namespace agentkit_preview::storage

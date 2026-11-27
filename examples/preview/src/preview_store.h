@@ -4,6 +4,8 @@
 #include <huxerui/agentkit/store.h>
 #include <huxerui/file.h>
 
+#include <set>
+
 namespace agentkit_preview {
 
 class ComposerPreferences {
@@ -29,8 +31,14 @@ struct NavigationPreferences {
   std::map<huxerui::agentkit::SessionId, std::string> memberships;
   huxerui::agentkit::AgentId last_assistant;
   bool auto_review_new_conversations = false;
+  std::set<std::pair<huxerui::agentkit::WorkspaceId, huxerui::agentkit::WorkspaceId>> collaboration_links;
   bool operator==(const NavigationPreferences&) const = default;
 };
+
+inline auto WorkspaceLink(huxerui::agentkit::WorkspaceId a, huxerui::agentkit::WorkspaceId b) {
+  if (b < a) std::swap(a, b);
+  return std::pair{std::move(a), std::move(b)};
+}
 
 using NavigationEdit = std::function<huxerui::agentkit::AgentResult<void>(NavigationPreferences&)>;
 

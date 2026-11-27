@@ -6,6 +6,7 @@
 #include "attachment_imports.h"
 #include "code_tests.h"
 #include "code_workflow.h"
+#include "conversation_collaboration.h"
 #include "design.h"
 #include "fork_review_view.h"
 #include "goal_view.h"
@@ -1249,7 +1250,8 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
               .code = kit::ErrorCode::PermissionDenied, .message = "Choose a native workspace for this conversation"});
         }
         const bool needs_confirmation = request.capability == kit::Capability::ExecuteTool &&
-            request.tool && tool != agentkit_preview::GeneratePresentation && tool != agentkit_preview::ReadCodeFiles &&
+            request.tool && tool != agentkit_preview::CollaborationActivity &&
+            tool != agentkit_preview::GeneratePresentation && tool != agentkit_preview::ReadCodeFiles &&
             tool != agentkit_preview::ReadWorkspaceFiles && tool != agentkit_preview::ListWorkspaceFiles &&
             tool != agentkit_preview::SearchWorkspaceFiles &&
             tool != agentkit_preview::ReadDesign && tool != agentkit_preview::PublishDesign &&
@@ -1330,12 +1332,16 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
   const auto catalogs = service && service->mcp ? service->mcp->Register(registered, preferences.mcp_servers)
                                                : std::vector<kit::ToolCatalogId>{};
   const bool workspace_tests = test_runner.has_value() && (code || can_add_models);
+  Require(agentkit_preview::RegisterCollaborationActivity(*registered));
   const auto register_workspace_agent = [&](kit::AgentRegistration agent) {
     auto tools = agentkit_preview::WorkspaceModelTools(workspace_tests);
     agent.definition.tools.insert(agent.definition.tools.end(), tools.begin(), tools.end());
     if (service && service->imported_skills) agent.definition.skill_sources.push_back(agentkit_preview::ImportedSkills);
     agent.definition.tool_catalogs = catalogs;
-    Require(registered->RegisterAgent(std::move(agent)));
+    Require(registered->RegisterAgent(agentkit_preview::WithConversationCollaboration(registered, std::move(agent), [host] {
+      const auto service = host.lock();
+      return service ? service->navigation.Get() : agentkit_preview::NavigationPreferences{};
+    }, workspaces, settings, workspace_tests)));
   };
   using SpecialistWorkflow = std::function<kit::Async<kit::RunCompletion>(
       kit::RunContext, kit::RunInput, std::optional<kit::RunCheckpoint>)>;
@@ -2974,12 +2980,8 @@ View PreviewShell() {
   const auto heading_snapshot = selected->conversation && !showing_pending.Get() && comparison->showing && comparison->origin.conversation
       ? comparison->origin.conversation->Snapshot() : active_snapshot;
   const auto current_folder = heading_snapshot ? heading_snapshot->summary.workspace : workspace_id;
-  const auto folder_name = [](const agentkit_preview::CodeWorkspace& entry) {
-    if (entry.root.empty()) return entry.browser_name;
-    auto name = entry.root.filename().u8string();
-    if (name.empty()) name = entry.root.u8string();
-    return std::string(name.begin(), name.end());
-  };
+  const auto folder_name = agentkit_preview::WorkspaceDisplayName;
+  const auto workspace_collaboration_menu = UseMenu();
   const auto new_group = [dialogs, service, current_folder, folder_name, workspace_expansion] {
     const auto workspace = current_folder ? service->workspaces->Find(*current_folder) : std::nullopt;
     const auto scope = workspace ? current_folder : std::nullopt;
@@ -3024,6 +3026,28 @@ View PreviewShell() {
       auto folder_row = NavigationAction(std::move(title), open ? NavigationSymbol::Down : NavigationSymbol::Right,
           toggle, true, false, {}, open, 34.0F)
           .With(Tooltip(std::move(tooltip))).Key("workspace/" + entry.id.value);
+      if (folders.size() > 1) {
+        folder_row = std::move(folder_row).On<ViewEvents::ContextMenuRequested>(
+            [workspace_collaboration_menu, service, id = entry.id](Point location) {
+          std::vector<MenuEntry> choices;
+          const auto links = service->navigation->collaboration_links;
+          for (const auto& other : service->workspaces->Folders()) {
+            if (other.id == id) continue;
+            const auto link = agentkit_preview::WorkspaceLink(id, other.id);
+            const bool active = links.contains(link);
+            const auto label = StringVariant::Format(active ? ::app::strings::ui_collaboration_unlink_0 :
+                ::app::strings::ui_collaboration_link_0, agentkit_preview::WorkspaceDisplayName(other));
+            choices.emplace_back(MenuItem(label, [service, link, active] {
+              EditNavigation(service, [link, active](auto& stored) {
+                if (active) stored.collaboration_links.erase(link);
+                else stored.collaboration_links.insert(link);
+                return kit::AgentResult<void>::Success();
+              });
+            }));
+          }
+          if (!choices.empty()) workspace_collaboration_menu.ShowAt(location, std::move(choices));
+        });
+      }
       auto add = agentkit_preview::PreviewChromeAction(::app::images::add, new_label, create, theme)
           .Key("workspace-new/" + entry.id.value);
       std::vector<View> branch{NavigationRowWithAction(std::move(folder_row), std::move(add))};
@@ -3141,6 +3165,7 @@ View PreviewShell() {
       options.review_attachment_label = agentkit_preview::CodeReviewAttachmentLabel;
       options.tool_label = [resources](const kit::ToolRef& tool) -> std::string {
         using namespace agentkit_preview;
+        if (tool.id == CollaborationActivity) return resources->GetString(::app::strings::ui_collaboration_activity);
         if (tool.id == ReadCodeFiles || tool.id == ReadWorkspaceFiles) return resources->GetString(::app::strings::ui_activity_read_files);
         if (tool.id == ListWorkspaceFiles) return resources->GetString(::app::strings::ui_activity_list_files);
         if (tool.id == SearchWorkspaceFiles) return resources->GetString(::app::strings::ui_activity_search_files);
