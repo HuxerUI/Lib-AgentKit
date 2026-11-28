@@ -24,6 +24,7 @@
 #include "report_chart.h"
 #include "side_chat.h"
 #include "chat_chrome.h"
+#include "run_plan.h"
 #include "run_settings.h"
 #include "preview_settings.h"
 #include "preview_store.h"
@@ -1251,6 +1252,7 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
         }
         const bool needs_confirmation = request.capability == kit::Capability::ExecuteTool &&
             request.tool && tool != agentkit_preview::CollaborationActivity &&
+            tool != agentkit_preview::UpdateRunPlan &&
             tool != agentkit_preview::GeneratePresentation && tool != agentkit_preview::ReadCodeFiles &&
             tool != agentkit_preview::ReadWorkspaceFiles && tool != agentkit_preview::ListWorkspaceFiles &&
             tool != agentkit_preview::SearchWorkspaceFiles &&
@@ -1333,9 +1335,12 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
                                                : std::vector<kit::ToolCatalogId>{};
   const bool workspace_tests = test_runner.has_value() && (code || can_add_models);
   Require(agentkit_preview::RegisterCollaborationActivity(*registered));
+  Require(agentkit_preview::RegisterRunPlan(*registered));
   const auto register_workspace_agent = [&](kit::AgentRegistration agent) {
     auto tools = agentkit_preview::WorkspaceModelTools(workspace_tests);
     agent.definition.tools.insert(agent.definition.tools.end(), tools.begin(), tools.end());
+    agent.definition.tools.push_back(agentkit_preview::UpdateRunPlan);
+    agent.definition.content_types.push_back(agentkit_preview::RunPlanContent);
     if (service && service->imported_skills) agent.definition.skill_sources.push_back(agentkit_preview::ImportedSkills);
     agent.definition.tool_catalogs = catalogs;
     Require(registered->RegisterAgent(agentkit_preview::WithConversationCollaboration(registered, std::move(agent), [host] {
@@ -1351,8 +1356,10 @@ std::shared_ptr<kit::AgentRuntime> MakeRuntime(TaskScope tasks, std::shared_ptr<
                      kit::RunContext run, kit::RunInput input,
                      std::optional<kit::RunCheckpoint> checkpoint) -> kit::Async<kit::RunCompletion> {
       using Result = kit::AgentResult<kit::RunCompletion>;
-      if (checkpoint && checkpoint->stage == agentkit_preview::WorkspaceAnswerStage && checkpoint->schema_version == 1)
-        co_return co_await agentkit_preview::AnswerWithWorkspaceTools(run, checkpoint->state == kit::JsonValue{true}, true);
+      if (checkpoint && checkpoint->stage == agentkit_preview::WorkspaceAnswerStage &&
+          (checkpoint->schema_version == 1 || checkpoint->schema_version == 2))
+        co_return co_await agentkit_preview::AnswerWithWorkspaceTools(run, checkpoint->state == kit::JsonValue{true}, true,
+            {}, checkpoint->schema_version == 2);
       const bool user_request = input.trigger == kit::RunTrigger::UserInput || input.trigger == kit::RunTrigger::Retry ||
           input.trigger == kit::RunTrigger::Regenerate;
       if (!checkpoint && user_request && !input.artifact_action) {
@@ -3158,8 +3165,15 @@ View PreviewShell() {
           .draft_skills = composer.skills,
           .review_request = selection.review, .interaction_request = selection.interaction,
           .agent_label = [resources](const kit::AgentRef& ref) { return resources->GetString(PreviewAgentLabel(ref)); }};
-      options.render_block = [service](const kit::Message& message, const kit::ContentBlock& block,
-          std::shared_ptr<kit::Conversation> conversation) {
+      options.render_block = [service, select_session](const kit::Message& message, const kit::ContentBlock& block,
+          std::shared_ptr<kit::Conversation> conversation) -> std::optional<View> {
+        if (const auto* custom = std::get_if<kit::CustomBlock>(&block.body);
+            custom && custom->type == agentkit_preview::RunPlanContent && message.run) {
+          return agentkit_preview::RunPlanCard(*message.run, custom->data, std::move(conversation), service->runtime,
+              [select_session](kit::SessionId owner, kit::InteractionId request) {
+                select_session(std::move(owner), std::nullopt, std::move(request));
+              });
+        }
         return RenderPreviewBlock(*service, message, block, std::move(conversation));
       };
       options.review_attachment_label = agentkit_preview::CodeReviewAttachmentLabel;
@@ -3250,7 +3264,8 @@ View PreviewShell() {
       const auto run = snapshot && snapshot->summary.active_run ? snapshot->summary.run_state : std::nullopt;
       return agentkit_preview::SessionWorkspace(selection.conversation,
           ProvideEnvironment(preview_chat_layout,
-              ProvideEnvironment(agentkit_preview::ChatChrome{std::move(chrome)}, std::move(chat))),
+              ProvideEnvironment(kit::AgentChatInlineToolUpdates{{agentkit_preview::UpdateRunPlan}},
+                  ProvideEnvironment(agentkit_preview::ChatChrome{std::move(chrome)}, std::move(chat)))),
           service->runtime, run,
           goal_session.Get() == selection.id, [goal_session] { goal_session = kit::SessionId{}; },
           [select_session](kit::PendingApproval approval) {

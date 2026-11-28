@@ -465,6 +465,7 @@ struct ChatActivityRows {
   std::map<MessageId, std::vector<ChatToolGroup>> groups;
   std::map<ToolCallId, const InteractionSnapshot*> approvals;
   std::set<MessageId> outputs;
+  std::map<MessageId, std::size_t> inline_updates;
   std::vector<std::size_t> history;
   std::set<std::variant<MessageId, ToolCallId, RunId>> assistant_starts;
 };
@@ -482,7 +483,8 @@ const ToolApproval* InlineToolApproval(const InteractionSnapshot& interaction) {
       ? approval : nullptr;
 }
 
-ChatActivityRows ActivityRows(const SessionSnapshot& snapshot, const ChatActivityFeed* feed, bool group_tools) {
+ChatActivityRows ActivityRows(const SessionSnapshot& snapshot, const ChatActivityFeed* feed, bool group_tools,
+                             const std::vector<ToolId>& inline_tools) {
   ChatActivityRows rows;
   std::map<RunId, RunId> roots;
   for (const auto& visible : snapshot.runs) {
@@ -512,16 +514,34 @@ ChatActivityRows ActivityRows(const SessionSnapshot& snapshot, const ChatActivit
     const auto root = roots.find(*message.run);
     if (root != roots.end()) first_rows.try_emplace(root->second, index);
   }
+  std::map<MessageId, std::pair<RunId, ToolId>> update_messages;
   for (const auto& tool : snapshot.tools) {
+    if (std::ranges::find(inline_tools, tool.tool.id) != inline_tools.end()) {
+      if (tool.output_message) update_messages.emplace(tool.output_message->message, std::pair{tool.run, tool.tool.id});
+      continue;
+    }
     const auto root = roots.find(tool.run);
     if (tool.registered_sequence && tool.output_message && root != roots.end() && first_rows.contains(root->second))
       rows.outputs.insert(tool.output_message->message);
   }
+  std::set<MessageId> superseded_updates;
+  if (!update_messages.empty()) {
+    std::map<std::pair<RunId, ToolId>, MessageId> anchors;
+    for (std::size_t index = 0; index < snapshot.messages.size(); ++index) {
+      const auto& id = snapshot.messages[index].ref.message;
+      const auto update = update_messages.find(id);
+      if (update == update_messages.end()) continue;
+      const auto [anchor, first] = anchors.try_emplace(update->second, id);
+      rows.inline_updates.insert_or_assign(anchor->second, index);
+      if (!first) superseded_updates.insert(id);
+    }
+  }
   const auto visible_message = [&](const Message& message) {
-    return !rows.outputs.contains(message.ref.message) || std::ranges::any_of(message.blocks, ShowsToolOutputInHistory);
+    return !superseded_updates.contains(message.ref.message) &&
+        (!rows.outputs.contains(message.ref.message) || std::ranges::any_of(message.blocks, ShowsToolOutputInHistory));
   };
   std::vector<std::size_t> visible_anchors;
-  if (group_tools) {
+  if (group_tools || !superseded_updates.empty()) {
     visible_anchors.reserve(snapshot.messages.size());
     std::size_t anchor = 0;
     for (std::size_t index = 0; index < snapshot.messages.size(); ++index) {
@@ -531,7 +551,10 @@ ChatActivityRows ActivityRows(const SessionSnapshot& snapshot, const ChatActivit
   }
   std::set<ToolCallId> placed;
   std::vector<const ToolCallSnapshot*> ordered_tools;
-  for (const auto& tool : snapshot.tools) if (tool.registered_sequence) ordered_tools.push_back(&tool);
+  for (const auto& tool : snapshot.tools) {
+    if (tool.registered_sequence && std::ranges::find(inline_tools, tool.tool.id) == inline_tools.end())
+      ordered_tools.push_back(&tool);
+  }
   std::ranges::stable_sort(ordered_tools, {}, [](const auto* tool) { return *tool->registered_sequence; });
   for (const auto* entry : ordered_tools) {
     const auto& visible = *entry;
@@ -546,7 +569,7 @@ ChatActivityRows ActivityRows(const SessionSnapshot& snapshot, const ChatActivit
     auto index = first->second;
     const auto next = std::ranges::upper_bound(snapshot.messages, *tool.registered_sequence, {}, &Message::sequence);
     if (next != snapshot.messages.begin()) index = static_cast<std::size_t>(next - snapshot.messages.begin() - 1);
-    if (group_tools && visible_anchors[index] >= first->second) index = visible_anchors[index];
+    if (!visible_anchors.empty() && visible_anchors[index] >= first->second) index = visible_anchors[index];
     const auto& anchor = snapshot.messages[index].ref.message;
     auto& groups = rows.groups[anchor];
     if (!group_tools || groups.empty() || groups.back().calls.front().run != tool.run) groups.emplace_back();
@@ -2530,8 +2553,9 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
   // Project tool events against the message snapshot from the same committed position.
   const bool matching_events = activity_access && feed && feed->conversation == conversation &&
       feed->access == *activity_access && feed->through == current->event_sequence;
+  const auto inline_tools = UseEnvironment<AgentChatInlineToolUpdates>();
   const auto activity = activity_access ? std::make_shared<const ChatActivityRows>(
-      ActivityRows(*current, matching_events ? feed.get() : nullptr, layout_style.chat_bubbles)) : nullptr;
+      ActivityRows(*current, matching_events ? feed.get() : nullptr, layout_style.chat_bubbles, inline_tools.tools)) : nullptr;
   const auto count = (activity ? activity->history.size() : current->messages.size()) + earlier;
   const auto request = history_scroll.Get();
   std::optional<std::size_t> scroll_item;
@@ -2632,7 +2656,9 @@ static View ConversationChatView(std::shared_ptr<Conversation> conversation, Age
       row.push_back(Column{std::move(view)}.With(CrossAlign(CrossAxisAlignment::Stretch),
           Padding(EdgeInsets{.top = 2.0F, .bottom = 10.0F})));
     };
-    if (activity->outputs.contains(message.ref.message)) {
+    if (const auto update = activity->inline_updates.find(message.ref.message); update != activity->inline_updates.end()) {
+      add_message(current->messages[update->second]);
+    } else if (activity->outputs.contains(message.ref.message)) {
       auto artifacts = message;
       std::erase_if(artifacts.blocks, [](const auto& block) { return !ShowsToolOutputInHistory(block); });
       if (!artifacts.blocks.empty()) add_message(artifacts);

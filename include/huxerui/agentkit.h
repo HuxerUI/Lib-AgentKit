@@ -207,6 +207,19 @@ struct AgentChatLayoutStyle {
   bool operator==(const AgentChatLayoutStyle&) const = default;
 };
 
+/// @brief Presents tools that publish complete snapshots as a single updating transcript entry per tool and Run.
+/// Enable AgentChatLayoutStyle::show_run_activity and use render_block for the tool's committed content.
+struct AgentChatInlineToolUpdates {
+  /// Tool IDs whose later output replaces the first visible output in the view.
+  std::vector<ToolId> tools;
+
+  /// Uses ordinary tool activity by default.
+  static AgentChatInlineToolUpdates Default() { return {}; }
+
+  /// Compares the installed tool IDs.
+  bool operator==(const AgentChatInlineToolUpdates&) const = default;
+};
+
 /// @brief Lets an application supply the header for a visible artifact review.
 /// Provide around AgentChat() when the app owns review navigation and actions.
 struct AgentChatReviewHeader {

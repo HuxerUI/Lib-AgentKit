@@ -5,6 +5,7 @@
 #include "general_workflow.h"
 #include "preview_json.h"
 #include "run_settings.h"
+#include "run_plan.h"
 
 #include <app_resources.h>
 #include <algorithm>
@@ -309,7 +310,7 @@ kit::Async<std::optional<Json>> Plan(kit::RunContext run, kit::AgentId agent, co
     state.push_back({{"session", target->at("session")}, {"title", target->at("title")}, {"task", task.at("task")}, {"named", named}});
   }
   if (state.empty()) co_return Result::Success(std::nullopt);
-  co_return Result::Success(Json{{"source", source->id.value}, {"dispatches", std::move(state)},
+  co_return Result::Success(Json{{"source", source->id.value}, {"dispatches", std::move(state)}, {"run_plan", true},
       {"own_task", planned.value("own_task", std::string{})}});
 }
 
@@ -318,7 +319,7 @@ kit::Async<void> SaveDispatch(kit::RunContext run, const Json& state) {
 }
 
 kit::Async<kit::RunCompletion> Answer(kit::RunContext run, bool tools, bool tests_configured, std::string instruction) {
-  if (tools) co_return co_await AnswerWithWorkspaceTools(run, tests_configured, true, std::move(instruction));
+  if (tools) co_return co_await AnswerWithWorkspaceTools(run, tests_configured, true, std::move(instruction), false);
   auto answer = co_await run.CompleteAsync({.instruction = std::move(instruction)});
   if (!answer.Succeeded()) co_return Completion::Failure(answer.Error());
   co_return Completion::Success({.summary = std::move(answer.Value().text), .artifacts = std::move(answer.Value().artifacts)});
@@ -328,6 +329,14 @@ kit::Async<kit::RunCompletion> Dispatch(kit::RunContext run, Json state,
     const std::function<NavigationPreferences()>& navigation, const CodeWorkspaces& workspaces, const RunSettings& settings,
     const kit::AgentId& agent, bool tests_configured) {
   auto& assignments = state.at("dispatches");
+  const bool show_plan = state.value("run_plan", false);
+  const auto resources = UseService<Resources>();
+  std::vector<RunPlanStep> progress{
+      {resources->GetString(strings::ui_run_plan_dispatch), "in_progress"},
+      {resources->GetString(strings::ui_run_plan_collect), "pending"},
+      {resources->GetString(strings::ui_run_plan_synthesize), "pending"},
+  };
+  if (show_plan) co_await RecordRunPlan(run, "collaboration-dispatch", progress);
   if (std::ranges::any_of(assignments, [](const Json& item) { return !item.contains("message") && !item.contains("outcome"); })) {
     auto sessions = co_await VisibleSessions(run);
     if (!sessions.Succeeded()) co_return Completion::Failure(sessions.Error());
@@ -371,6 +380,12 @@ kit::Async<kit::RunCompletion> Dispatch(kit::RunContext run, Json state,
     if (!noted.Succeeded()) co_return Completion::Failure(noted.Error());
   }
 
+  if (show_plan) {
+    const auto accepted = std::ranges::count_if(assignments, [](const Json& item) { return item.contains("message"); });
+    progress[0].status = static_cast<std::size_t>(accepted) == assignments.size() ? "completed" : "blocked";
+    progress[1].status = "in_progress";
+    co_await RecordRunPlan(run, "collaboration-collect", progress);
+  }
   const bool tools = settings.Capabilities(run.Model(), agent).tool_calls;
   const auto own_task = state.value("own_task", std::string{});
   if (!own_task.empty() && !state.contains("local")) {
@@ -410,7 +425,18 @@ kit::Async<kit::RunCompletion> Dispatch(kit::RunContext run, Json state,
     instructions += local.contains("failure") ? "\nEarlier local work failed: " + local.at("failure").get<std::string>() :
         "\nThe independent work above has already been executed. Use its result from the transcript and do not repeat it.";
   }
+  if (show_plan) {
+    const auto received = std::ranges::count_if(assignments, [](const Json& item) { return item.value("succeeded", false); });
+    progress[1].status = static_cast<std::size_t>(received) == assignments.size() ? "completed" : "blocked";
+    progress[1].detail = resources->GetString(StringVariant::Format(strings::ui_run_plan_reports_0_1, received, assignments.size()));
+    progress[2].status = "in_progress";
+    co_await RecordRunPlan(run, "collaboration-synthesize", progress);
+  }
   auto result = co_await Answer(run, tools, tests_configured, std::move(instructions));
+  if (show_plan && result.Succeeded()) {
+    progress[2].status = "completed";
+    co_await RecordRunPlan(run, "collaboration-finished", progress);
+  }
   if (result.Succeeded() && state.contains("local") && !state.at("local").contains("failure")) {
     for (const auto& ref : ReplyFromPayload(state.at("local")).artifacts)
       if (std::ranges::find(result.Value().artifacts, ref) == result.Value().artifacts.end()) result.Value().artifacts.push_back(ref);

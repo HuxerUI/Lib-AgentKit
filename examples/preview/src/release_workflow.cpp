@@ -1,4 +1,5 @@
 #include "release_workflow.h"
+#include "run_plan.h"
 
 #include "code_tools.h"
 #include "design.h"
@@ -6,6 +7,8 @@
 #include "workspace_evidence.h"
 #include "workflow_sessions.h"
 
+#include <app_resources.h>
+#include <huxerui/app.h>
 #include <array>
 
 namespace agentkit_preview {
@@ -196,7 +199,7 @@ kit::Async<kit::RunCompletion> RunWorkspaceRelease(kit::RunContext run, kit::Goa
   }
 
   auto phase = checkpoint ? checkpoint->stage : std::string("release-design");
-  if (checkpoint && (checkpoint->schema_version != 1 ||
+  if (checkpoint && ((checkpoint->schema_version != 1 && checkpoint->schema_version != 2) ||
       (phase != "release-design" && phase != "release-code" && phase != "release-deck"))) {
     co_return Fail<kit::RunCompletion>(kit::ErrorCode::Unsupported, "Unknown release checkpoint");
   }
@@ -215,24 +218,48 @@ kit::Async<kit::RunCompletion> RunWorkspaceRelease(kit::RunContext run, kit::Goa
       {{design_task.Value(), design.output}, {code_task.Value(), code.output}});
   if (!deck_task.Succeeded()) co_return Completion::Failure(deck_task.Error());
 
+  const bool show_plan = !checkpoint || checkpoint->schema_version == 2;
+  const auto version = show_plan ? 2U : 1U;
+  const auto resources = huxerui::UseService<huxerui::Resources>();
+  std::vector<RunPlanStep> progress{
+      {resources->GetString(::app::strings::ui_run_plan_release_design), "in_progress"},
+      {resources->GetString(::app::strings::ui_run_plan_release_implementation), "pending"},
+      {resources->GetString(::app::strings::ui_run_plan_release_deck), "pending"},
+  };
   if (phase == "release-design") {
+    if (show_plan) co_await RecordRunPlan(run, "release-design", progress);
     auto drafted = co_await ExecuteStage(run, project, workspace, design_task.Value(), design);
     if (!drafted.Succeeded()) co_return Completion::Failure(drafted.Error());
     for (const auto& ref : drafted.Value()) sources.push_back(Encode(ref));
     phase = "release-code";
-    auto saved = co_await run.SaveCheckpointAsync({.stage = phase, .schema_version = 1, .state = JsonValue{sources}});
+    auto saved = co_await run.SaveCheckpointAsync({.stage = phase, .schema_version = version, .state = JsonValue{sources}});
     if (!saved.Succeeded()) co_return Completion::Failure(saved.Error());
   }
   if (phase == "release-code") {
+    if (show_plan) {
+      progress[0].status = "completed";
+      progress[1].status = "in_progress";
+      co_await RecordRunPlan(run, "release-code", progress);
+    }
     auto implemented = co_await ExecuteStage(run, project, workspace, code_task.Value(), code);
     if (!implemented.Succeeded()) co_return Completion::Failure(implemented.Error());
     for (const auto& ref : implemented.Value()) sources.push_back(Encode(ref));
-    auto saved = co_await run.SaveCheckpointAsync({.stage = "release-deck", .schema_version = 1, .state = JsonValue{sources}});
+    auto saved = co_await run.SaveCheckpointAsync({.stage = "release-deck", .schema_version = version, .state = JsonValue{sources}});
     if (!saved.Succeeded()) co_return Completion::Failure(saved.Error());
   }
 
+  if (show_plan) {
+    progress[0].status = "completed";
+    progress[1].status = "completed";
+    progress[2].status = "in_progress";
+    co_await RecordRunPlan(run, "release-deck", progress);
+  }
   auto exported = co_await ExecuteStage(run, project, workspace, deck_task.Value(), presentation, deck);
   if (!exported.Succeeded()) co_return Completion::Failure(exported.Error());
+  if (show_plan) {
+    progress[2].status = "completed";
+    co_await RecordRunPlan(run, "release-delivered", progress);
+  }
   std::vector<kit::ArtifactRef> artifacts;
   for (const auto& source : sources) artifacts.push_back(Decode(source));
   artifacts.insert(artifacts.end(), exported.Value().begin(), exported.Value().end());

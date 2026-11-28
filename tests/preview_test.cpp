@@ -32,6 +32,7 @@
 #include "../examples/preview/src/report_chart.h"
 #include "../examples/preview/src/release_skill.h"
 #include "../examples/preview/src/run_settings.h"
+#include "../examples/preview/src/run_plan.h"
 #include "../examples/preview/src/preview_store.h"
 #include "../examples/preview/src/workspace_evidence.h"
 
@@ -1321,11 +1322,11 @@ Task<void> RunConfiguredChartReview(const std::shared_ptr<kit::AgentRuntime>& ru
 
 Task<std::shared_ptr<kit::Conversation>> LiveConversation(const std::shared_ptr<kit::AgentRuntime>& runtime,
     const kit::ProjectId& project, const kit::WorkspaceId& workspace, kit::AgentId agent, std::string title,
-    std::optional<std::string> initial = {}, bool wait_for_creation = false) {
+    std::optional<std::string> initial = {}, bool wait_for_creation = false, std::optional<kit::ModelProviderRef> model = {}) {
   if (initial) {
     kit::CreateSessionRequest request{
         .options = {.agent = agent, .project = project, .workspace = workspace, .title = std::move(title)},
-        .initial = kit::SendInput{.text = std::move(*initial)}};
+        .initial = kit::SendInput{.text = std::move(*initial)}, .user_start = {.model = std::move(model)}};
     auto created = LiveTake(co_await runtime->Sessions().CreateAsync(kit::NewCommandId(), std::move(request)));
     co_return LiveTake(co_await runtime->Sessions().OpenAsync(std::get<kit::SessionCreated>(created.outcome).session));
   }
@@ -7523,6 +7524,202 @@ private:
   std::shared_ptr<std::atomic<int>> released_;
 };
 
+constexpr auto plan_before = "function(normalize output value)\n  string(STRIP \"${value}\" result)\n  set(${output} \"${result}\" PARENT_SCOPE)\nendfunction()\n";
+constexpr auto plan_after = "function(normalize output value)\n  string(STRIP \"${value}\" result)\n  string(TOLOWER \"${result}\" result)\n  set(${output} \"${result}\" PARENT_SCOPE)\nendfunction()\n";
+
+class RunPlanModel final : public kit::ModelProvider {
+public:
+  kit::ModelCapabilities Capabilities() const override {
+    return {.text_stream = true, .tool_calls = true, .structured_output = true};
+  }
+
+  kit::Async<std::unique_ptr<kit::ModelTurnStream>> StartTurnAsync(kit::ModelTurnRequest request) override {
+    using Result = kit::AgentResult<std::unique_ptr<kit::ModelTurnStream>>;
+    using nlohmann::json;
+    std::vector<kit::ModelEvent> events;
+    auto finish = kit::ModelFinishReason::Completed;
+    if (request.output_schema) {
+      events.emplace_back(kit::ModelStructuredOutput{agentkit_preview::DecodeJson({{"route", "answer"}})});
+    } else {
+      const auto plan = [](const char* read, const char* edit, const char* verify) {
+        return json{{"steps", json::array({
+            {{"title", "Inspect normalizer"}, {"status", read}},
+            {{"title", "Implement lowercase normalization"}, {"status", edit}},
+            {{"title", "Run verification"}, {"status", verify}},
+        })}};
+      };
+      const std::array names{"update_plan", "read_files", "update_plan", "apply_patch", "update_plan", "run_tests", "update_plan"};
+      const std::array arguments{
+          plan("in_progress", "pending", "pending"),
+          json{{"paths", {"normalize.cmake", "verify.cmake"}}},
+          plan("completed", "in_progress", "pending"),
+          json{{"changes", json::array({{{"path", "normalize.cmake"}, {"before", plan_before}, {"after", plan_after},
+              {"design_nodes", json::array()}, {"editor_version", ""}}})}},
+          plan("completed", "completed", "in_progress"),
+          json::object(),
+          plan("completed", "completed", "completed"),
+      };
+      std::size_t index = 0;
+      for (const auto& item : request.items) {
+        const auto* result = std::get_if<kit::ModelToolResult>(&item);
+        if (!result) continue;
+        if (result->error) co_return Result::Failure(*result->error);
+        ++index;
+      }
+      if (index < names.size()) {
+        const auto call = "plan-fixture-" + std::to_string(index);
+        events.emplace_back(kit::ModelToolStarted{call, names[index]});
+        events.emplace_back(kit::ModelToolArguments{call, arguments[index].dump()});
+        events.emplace_back(kit::ModelToolFinished{call});
+        finish = kit::ModelFinishReason::ToolCalls;
+      } else {
+        events.emplace_back(kit::ModelTextDelta{"The normalizer was updated and the test passed."});
+      }
+    }
+    events.emplace_back(kit::ModelFinished{finish, {}});
+    co_return Result::Success(std::make_unique<WorkspaceToolStream>(std::move(events)));
+  }
+};
+
+void VerifyTaskPlan(const File& root, const kit::AgentId& agent, bool live) {
+  using namespace agentkit_preview;
+  const auto workspace = root.Child("workspace");
+  const auto source = workspace.Child("normalize.cmake");
+  if (workspace.Exists() || !workspace.CreateDirectories()) throw std::runtime_error("Use a fresh task plan fixture");
+  WriteFixture(source, plan_before);
+  WriteFixture(workspace.Child("verify.cmake"), "include(\"${CMAKE_CURRENT_LIST_DIR}/normalize.cmake\")\n"
+      "normalize(actual \"  MiXeD Label  \")\n"
+      "if(NOT actual STREQUAL \"mixed label\")\n  message(FATAL_ERROR \"Wrong normalization: ${actual}\")\nendif()\n");
+  WriteFixture(workspace.Child("CTestTestfile.cmake"),
+      "add_test(check-normalize \"" AGENTKIT_PREVIEW_CMAKE "\" \"-P\" \"verify.cmake\")\n");
+  const auto database = root.Child("sessions.sqlite3");
+  const kit::ModelRegistration fixture{{{"run-plan-fixture"}, 1}, {"test", "run-plan", "script", {}}, std::make_shared<RunPlanModel>()};
+  const auto model = live ? std::nullopt : std::optional{fixture.ref};
+  constexpr auto title = "Normalize workspace names";
+  constexpr auto prompt = "Inspect normalize.cmake and verify.cmake. Change the normalize function to trim the input and "
+      "convert it to lowercase, keeping the existing function signature. Only edit normalize.cmake, using apply_patch. "
+      "After applying the change, execute the existing CTest suite with run_tests. Summarize the verified result.";
+  kit::RunId original;
+  kit::InteractionId original_approval;
+  for (const bool reopen : {false, true}) {
+    bool allow_close = false;
+    bool done = false;
+    bool verified = false;
+    std::size_t completed_steps = 0;
+    std::optional<kit::InteractionId> approval;
+    std::optional<kit::InteractionId> tests;
+    std::exception_ptr failure;
+    const auto drive = [&](auto started, auto workspace_id, auto project) -> Task<void> {
+      const auto app = UseApplication();
+      try {
+        auto runtime = LiveTake(std::move(started));
+        if (!workspace_id) throw std::runtime_error("The code workspace is unavailable");
+        auto chat = co_await LiveConversation(runtime, project, *workspace_id, agent, title,
+            reopen ? std::nullopt : std::optional<std::string>{prompt}, false, model);
+        auto watch = co_await LiveObserve(chat);
+        auto patch = co_await LiveInteraction(chat, "Review workspace changes", {}, 120s);
+        const auto before = chat->Snapshot();
+        if (!patch.run || !before->summary.active_run || patch.run != before->summary.active_run ||
+            (model ? before->runs.back().model != *model : before->runs.back().model == DemoModel))
+          throw std::runtime_error("The patch was not attached to the active code task");
+        if (!reopen) {
+          original = *patch.run;
+          original_approval = patch.id;
+        } else if (*patch.run != original || patch.id != original_approval) {
+          throw std::runtime_error("The code approval or Run changed after restart");
+        }
+        approval = patch.id;
+        if (reopen) {
+          if (live) co_await LiveApprove(chat, patch);
+          auto testing = co_await LiveInteraction(chat, "Run workspace tests", {}, 120s);
+          if (testing.run != original) throw std::runtime_error("Validation ran under a different task");
+          tests = testing.id;
+          if (live) co_await LiveApprove(chat, testing);
+          co_await LiveRunCompleted(chat, 120s);
+          const auto after = chat->Snapshot();
+          const auto successful = [&](const kit::ToolId& tool) {
+            return std::ranges::count_if(after->tools, [&](const auto& call) {
+              return call.run == original && call.tool.id == tool && call.state == kit::ToolCallState::Succeeded;
+            });
+          };
+          if (after->runs.size() != 1 || successful(ReadWorkspaceFiles) < 1 || successful(ApplyWorkspacePatch) != 1 ||
+              successful(RunWorkspaceTests) != 1 || successful(UpdateRunPlan) < 3)
+            throw std::runtime_error("The restored task missed a verified phase or repeated the patch");
+          for (const auto& message : after->messages) {
+            if (message.run != original) continue;
+            for (const auto& block : message.blocks) {
+              if (const auto* plan = std::get_if<kit::CustomBlock>(&block.body); plan && plan->type == RunPlanContent) {
+                const auto data = EncodeJson(plan->data);
+                const auto& steps = data.at("steps");
+                completed_steps = std::ranges::all_of(steps, [](const auto& step) { return step.at("status") == "completed"; })
+                    ? steps.size() : 0;
+              }
+            }
+          }
+          if (!completed_steps) throw std::runtime_error("The model did not close the task plan after the test passed");
+          const auto contents = source.ReadString();
+          if (!contents.Succeeded() || contents.Value().find("string(TOLOWER") == std::string::npos)
+            throw std::runtime_error("The source change was not applied");
+          verified = true;
+          std::cout << "Task plan verified using " << after->runs.back().model.id.value << " with " << successful(UpdateRunPlan)
+                    << " committed updates and the original approval after restart\n";
+        }
+        while (!live && !allow_close) co_await Delay(20ms);
+        if (!reopen) CheckText(source, plan_before);
+        LiveTake(co_await runtime->CloseAsync());
+      } catch (...) { failure = std::current_exception(); }
+      done = true;
+      if (live) app.Quit();
+    };
+    const File ctest(AGENTKIT_PREVIEW_CTEST);
+    auto hook = live ? MakeConfiguredPreviewTestInstaller(database, workspace, ctest, drive) :
+        MakeCodeTestInstaller(database, workspace, fixture, ctest, {}, drive);
+    if (live) {
+      const Application application{[]() -> View { return Spacer(); },
+          {.window = {.title = "GanWork Task Plan Acceptance", .activatable = false},
+           .quit_on_last_window_closed = false, .application_hooks = {std::move(hook)}}};
+      static_cast<void>(RunApplication());
+      if (failure) std::rethrow_exception(failure);
+      if (!done || !approval || (reopen && !verified)) throw std::runtime_error("The native task plan acceptance did not finish");
+      continue;
+    }
+    const Application application{App, {.application_hooks = {std::move(hook)}}};
+    UiTest ui(application, {.viewport = {1160.0F, 1040.0F}});
+    Wait(ui, [&] { return approval || done; }, "The change did not request approval", 140s);
+    if (failure) std::rethrow_exception(failure);
+    CheckText(source, plan_before);
+    TapControl(ui, UiSelector::Key("pending-session-title/" + std::string(title)), "Open the code task", "session-directory");
+    const auto board = ui.Find(UiSelector::Key("run-plan-toggle"));
+    const auto patch_link = ui.Find(UiSelector::Key("run-plan-approval/" + approval->value));
+    Wait(ui, [&] { return board.Count() == 1 && patch_link.Exists() && patch_link.One().in_viewport; },
+        "The inline task plan did not show a single card with the pending approval");
+    if (reopen) {
+      patch_link.Tap();
+      auto request = ui.Find(UiSelector::Key("interaction-review-content"));
+      Wait(ui, [&] { return request.Exists() && request.Find(UiSelector::Key(approval->value)).Exists(); },
+          "The plan did not open the exact pending patch review");
+      TapFormButton(ui, "Approve");
+      TapFormButton(ui, "Back to conversation");
+      Wait(ui, [&] { return tests || done; }, "The restored code task did not request verification", 140s);
+      if (failure) std::rethrow_exception(failure);
+      TapControl(ui, UiSelector::Key("run-plan-approval/" + tests->value), "Open verification from the plan", "agent-chat-history");
+      TapFormButton(ui, "Approve");
+      TapFormButton(ui, "Back to conversation");
+      Wait(ui, [&] { return verified || done; }, "The restored code task did not complete", 140s);
+      if (failure) std::rethrow_exception(failure);
+      const auto summary = std::to_string(completed_steps) + " of " + std::to_string(completed_steps) + " complete";
+      Wait(ui, [&] { return board.Count() == 1 && !ui.Find(UiSelector::Key("run-plan-step-status")).Exists() &&
+          ShowsText(ui, summary); }, "The completed plan did not collapse to a single summary");
+      board.Tap();
+      Wait(ui, [&] { return ui.Find(UiSelector::Key("run-plan-step-status")).Count() == completed_steps; },
+          "The completed plan could not reopen all its steps");
+    }
+    allow_close = true;
+    Wait(ui, [&] { return done; }, "The task plan runtime did not close");
+    if (failure) std::rethrow_exception(failure);
+  }
+}
+
 void VerifyWorkspaceTools(const File& root) {
   const auto workspace = root.Child("workspace");
   const auto config = workspace.Child("src").Child("config.txt");
@@ -10462,6 +10659,22 @@ int main(int argc, char** argv) {
       VerifyReopenedCodeTimeline(File(std::filesystem::absolute(std::filesystem::u8path(argv[2])).u8string()));
       return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+  }
+  if ((argc == 2 || argc == 3) &&
+      (std::string_view(argv[1]) == "--code-task-plan" || std::string_view(argv[1]) == "--general-task-plan")) {
+    const auto root = argc == 3 ? std::filesystem::absolute(std::filesystem::u8path(argv[2])) :
+        std::filesystem::temp_directory_path() / ("ganwork-task-plan-" + kit::NewCommandId().value);
+    try {
+      const auto& agent = std::string_view(argv[1]) == "--general-task-plan" ? agentkit_preview::GeneralAgent : agentkit_preview::CodeAgent;
+      VerifyTaskPlan(File(root.u8string()), agent, argc == 3);
+      if (argc == 2) {
+        std::error_code error;
+        const auto temporary = std::filesystem::canonical(std::filesystem::temp_directory_path(), error);
+        const auto resolved = error ? std::filesystem::path{} : std::filesystem::canonical(root, error);
+        if (!error && resolved == temporary / root.filename()) std::filesystem::remove_all(resolved, error);
+      }
+      return 0;
+    } catch (const std::exception& error) { std::cerr << error.what() << "\nFixture: " << root.string() << '\n'; return 1; }
   }
   if ((argc == 2 || argc == 3) && std::string_view(argv[1]) == "--workspace-tools") {
     const auto path = argc == 3 ? std::filesystem::absolute(std::filesystem::u8path(argv[2])) :

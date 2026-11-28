@@ -249,6 +249,7 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HU
             examples/preview/src/markdown_images.cpp
             examples/preview/src/release_skill.cpp
             examples/preview/src/report_chart.cpp
+            examples/preview/src/run_plan.cpp
             examples/preview/src/model_catalog.cpp
             examples/preview/src/run_settings.cpp
             examples/preview/src/preview_settings.cpp
@@ -302,6 +303,8 @@ if (HUXERUI_AGENTKIT_BUILD_TESTS AND HUXERUI_AGENTKIT_BUILD_PREVIEW_TESTS AND HU
     add_test(NAME huxerui_agentkit_localization_tests COMMAND huxerui_agentkit_preview_tests --localization)
     add_test(NAME huxerui_agentkit_code_turn_activity_tests COMMAND huxerui_agentkit_preview_tests --code-turn-activity)
     add_test(NAME huxerui_agentkit_workspace_tools_tests COMMAND huxerui_agentkit_preview_tests --workspace-tools)
+    add_test(NAME huxerui_agentkit_code_task_plan_tests COMMAND huxerui_agentkit_preview_tests --code-task-plan)
+    add_test(NAME huxerui_agentkit_general_task_plan_tests COMMAND huxerui_agentkit_preview_tests --general-task-plan)
     add_test(NAME huxerui_agentkit_local_files_tests COMMAND huxerui_agentkit_preview_tests --local-files)
     if (HUXERUI_AGENTKIT_TEST_BROWSER)
         add_test(NAME huxerui_agentkit_goal_completion_revision_tests COMMAND huxerui_agentkit_preview_tests --goal-completion-revision)

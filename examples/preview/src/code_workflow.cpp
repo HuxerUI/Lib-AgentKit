@@ -273,8 +273,9 @@ kit::Async<kit::RunCompletion> VerifyImplementation(kit::RunContext run, kit::Co
 kit::Async<kit::RunCompletion> RunCode(
     kit::RunContext context, kit::RunInput input, std::optional<kit::RunCheckpoint> checkpoint, bool tests_configured,
     std::weak_ptr<kit::AgentRuntime> runtime, std::shared_ptr<CodeWorkspaces> workspaces, std::shared_ptr<RunSettings> settings) {
-  if (checkpoint && checkpoint->stage == WorkspaceAnswerStage && checkpoint->schema_version == 1)
-    co_return co_await AnswerWithWorkspaceTools(context, checkpoint->state == JsonValue{true}, true);
+  if (checkpoint && checkpoint->stage == WorkspaceAnswerStage &&
+      (checkpoint->schema_version == 1 || checkpoint->schema_version == 2))
+    co_return co_await AnswerWithWorkspaceTools(context, checkpoint->state == JsonValue{true}, true, {}, checkpoint->schema_version == 2);
   if (!checkpoint && !input.work_request && !input.artifact_action && input.trigger != kit::RunTrigger::ForkComparison) {
     auto allowed = co_await AllowsWorkspaceTools(context, CodeAgent, runtime, *settings);
     if (!allowed.Succeeded()) co_return Completion::Failure(allowed.Error());
